@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-core.config/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "host_label", "state_root", "backup_root", "prompt_injection", "targets", "capability_overrides"],
+  "properties": {
+    "schema": {"const": "agent-core.config/1"},
+    "host_label": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "state_root": {"type": "string", "minLength": 1},
+    "backup_root": {"type": "string", "minLength": 1},
+    "prompt_injection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lines"],
+      "properties": {"lines": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}
+    },
+    "targets": {"type": "array", "minItems": 1},
+    "capability_overrides": {"type": "array"}
+  }
+}

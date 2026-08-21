@@ -1,0 +1,6 @@
+{
+  "schema": "capability-manifest/1",
+  "capabilities": [
+    {"id": "skill:custom-check", "kind": "skill", "source": "skills/custom-check", "requirement": "optional", "runtimes": ["claude-code", "codex"], "trusted": true}
+  ]
+}

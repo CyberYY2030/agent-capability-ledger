@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lessons-hook-heartbeat/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "runtime", "stage", "status", "retrieval_invoked", "result_nonempty", "validation_ran", "source_mtime_sha256", "hook_sha256", "observed_utc"],
+  "properties": {
+    "schema": {"const": "lessons-hook-heartbeat/1"},
+    "runtime": {"enum": ["claude-code", "codex"]},
+    "stage": {"enum": ["prompt", "pretool", "completion"]},
+    "status": {"enum": ["pass", "warning"]},
+    "retrieval_invoked": {"const": true},
+    "result_nonempty": {"type": "boolean"},
+    "validation_ran": {"type": "boolean"},
+    "source_mtime_sha256": {"type": ["string", "null"]},
+    "hook_sha256": {"type": ["string", "null"]},
+    "observed_utc": {"type": "string", "format": "date-time"}
+  }
+}

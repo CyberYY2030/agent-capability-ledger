@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "install-snapshot/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "objects", "hook_bindings"],
+  "properties": {
+    "schema": {"const": "install-snapshot/1"},
+    "objects": {"type": "array", "items": {"type": "object"}},
+    "hook_bindings": {"type": "array", "items": {"type": "object"}}
+  }
+}

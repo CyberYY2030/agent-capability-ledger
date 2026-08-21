@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "privacy-rules/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "rules"],
+  "properties": {
+    "schema": {"const": "privacy-rules/1"},
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["literal", "regex"]},
+          "value": {"type": "string", "minLength": 1},
+          "pattern": {"type": "string", "minLength": 1},
+          "case_sensitive": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

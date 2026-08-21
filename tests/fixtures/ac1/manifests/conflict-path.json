@@ -1,0 +1,7 @@
+{
+  "schema": "capability-manifest/1",
+  "capabilities": [
+    {"id": "skill:different-id", "kind": "skill", "source": "skills/dispatching-task-cards", "requirement": "optional", "runtimes": ["codex"], "trusted": true}
+  ]
+}
+

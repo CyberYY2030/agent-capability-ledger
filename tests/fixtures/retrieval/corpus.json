@@ -1,0 +1,25 @@
+{
+  "schema": "lesson-retrieval-corpus/1",
+  "entries": [
+    {"id":"L-101","scope":"project","status":"pending","rule":"Freeze build acceptance before implementation.","sink":"checks/build-acceptance.md","trigger":"approved build task","when":"{\"tasks\":[\"build\"]}"},
+    {"id":"L-102","scope":"project","status":"checklist","rule":"Find the first divergence before fixing symptoms.","sink":"checks/first-divergence.md","trigger":"diagnostic fix task","when":"{\"tasks\":[\"fix\"]}"},
+    {"id":"L-103","scope":"profile","status":"pending","rule":"Audit against frozen claims and evidence.","sink":"checks/audit-evidence.md","trigger":"independent audit task","when":"{\"tasks\":[\"audit\"]}"},
+    {"id":"L-104","scope":"profile","status":"enforced","rule":"Separate verified research from inference.","sink":"checks/research-provenance.md","trigger":"source research task","when":"{\"tasks\":[\"research\"]}"},
+    {"id":"L-105","scope":"global","status":"pending","rule":"Shape the smallest maintainable interface.","sink":"checks/interface-shape.md","trigger":"interface shaping task","when":"{\"tasks\":[\"shape\"]}"},
+    {"id":"L-106","scope":"project","status":"pending","rule":"Inspect every consumer of agent core changes.","sink":"checks/agent-core-consumers.md","trigger":"agent core path changed","when":"{\"paths\":[\"agent_core/**\"]}"},
+    {"id":"L-107","scope":"profile","status":"checklist","rule":"Verify documentation commands still exist.","sink":"checks/docs-commands.md","trigger":"documentation path changed","when":"{\"paths\":[\"docs/**\"]}"},
+    {"id":"L-108","scope":"global","status":"enforced","rule":"Keep fixtures independent from implementation.","sink":"checks/fixture-independence.md","trigger":"test fixture path changed","when":"{\"paths\":[\"tests/fixtures/**\"]}"},
+    {"id":"L-109","scope":"project","status":"pending","rule":"Review staged scope before committing.","sink":"checks/commit-scope.md","trigger":"git commit command","when":"{\"cmds\":[\"git commit\"]}"},
+    {"id":"L-110","scope":"profile","status":"checklist","rule":"Read the exact pytest failure before retrying.","sink":"checks/pytest-failure.md","trigger":"pytest command","when":"{\"cmds\":[\"pytest\"]}"},
+    {"id":"L-111","scope":"global","status":"enforced","rule":"Use isolated targets for cargo verification.","sink":"checks/cargo-target.md","trigger":"cargo test command","when":"{\"cmds\":[\"cargo test\"]}"},
+    {"id":"L-112","scope":"project","status":"pending","rule":"Search every consumer of a shared constant.","sink":"checks/shared-constant.md","trigger":"shared constant change","when":"{\"text\":[\"shared constant\"]}"},
+    {"id":"L-113","scope":"profile","status":"checklist","rule":"Keep the privacy gate fail closed.","sink":"checks/privacy-gate.md","trigger":"privacy gate change","when":"{\"text\":[\"privacy gate\"]}"},
+    {"id":"L-114","scope":"global","status":"enforced","rule":"Prevent line ending rewrites from hiding diffs.","sink":"checks/line-ending.md","trigger":"line ending normalization","when":"{\"text\":[\"line ending\"]}"},
+    {"id":"L-115","scope":"project","status":"checklist","rule":"Preserve private audit evidence outside public history.","sink":"checks/audit-boundary.md","trigger":"audit evidence handling","when":"{\"paths\":[\"audit/**\"],\"tasks\":[\"audit\"]}"},
+    {"id":"L-116","scope":"project","status":"pending","rule":"Compare deterministic output byte for byte.","sink":"checks/deterministic-output.md","trigger":"reproducible bytes stable output","when":null},
+    {"id":"L-117","scope":"profile","status":"checklist","rule":"Freeze corpus checksums before tuning.","sink":"checks/frozen-corpus.md","trigger":"frozen corpus checksum proof","when":null},
+    {"id":"L-118","scope":"global","status":"enforced","rule":"Record runtime payload fields from evidence.","sink":"checks/runtime-payload.md","trigger":"runtime event payload schema","when":null},
+    {"id":"L-119","scope":"project","status":"pending","rule":"Budget retrieval output by characters.","sink":"checks/character-budget.md","trigger":"character budget omitted marker","when":null},
+    {"id":"L-120","scope":"profile","status":"checklist","rule":"Resolve only declared lesson stores.","sink":"checks/scoped-routing.md","trigger":"scoped ledger source routing","when":null}
+  ]
+}

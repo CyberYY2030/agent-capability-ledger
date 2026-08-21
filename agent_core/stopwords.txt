@@ -1,0 +1,27 @@
+# One normalized term per line. Keep this table deterministic and model-free.
+a
+an
+and
+are
+be
+for
+from
+in
+is
+of
+on
+or
+please
+that
+the
+this
+to
+was
+with
+一下
+这个
+那个
+我们
+进行
+需要
+请帮

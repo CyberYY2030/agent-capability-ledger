@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "engine-pin/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "artifact_sha256", "config_path"],
+  "properties": {
+    "schema": {"const": "engine-pin/1"},
+    "version": {"type": "string", "minLength": 1},
+    "artifact_sha256": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+    "config_path": {"type": "string", "minLength": 1}
+  }
+}

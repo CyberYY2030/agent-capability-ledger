@@ -1,0 +1,13 @@
+{
+  "schema": "agent-core.config/1",
+  "host_label": "laptop",
+  "state_root": "<STATE>",
+  "backup_root": "<HOST_DATA>/backups",
+  "prompt_injection": {"lines": ["Load relevant lessons for the current stage."]},
+  "targets": [
+    {"id": "runtime-a", "runtime": "claude-code", "root": "<RUNTIME_A>", "rules_target": "RULES.md", "lessons_target": "LESSONS.md", "case_law_target": "CASE_LAW.md", "skills_root": "skills", "hook_target": "hooks/prompt.sh"},
+    {"id": "runtime-b", "runtime": "codex", "root": "<RUNTIME_B>", "rules_target": "RULES.md", "lessons_target": "LESSONS.md", "case_law_target": "CASE_LAW.md", "skills_root": "skills", "hook_target": "hooks/prompt.sh"},
+    {"id": "runtime-c", "runtime": "generic", "root": "<RUNTIME_C>", "rules_target": "RULES.md", "lessons_target": "LESSONS.md", "case_law_target": "CASE_LAW.md", "skills_root": "skills", "hook_target": "hooks/prompt.sh"}
+  ],
+  "capability_overrides": []
+}

@@ -1,0 +1,103 @@
+{
+  "schema": "verifier/1",
+  "verifiers": [
+    {
+      "id": "synthetic-contract",
+      "positive": {
+        "argv": ["<PYTHON>", "tests/enforcement/verifier_probe.py", "positive", "tests/enforcement/positive.txt"]
+      },
+      "negative": {
+        "argv": ["<PYTHON>", "tests/enforcement/verifier_probe.py", "negative", "tests/enforcement/negative.txt"]
+      },
+      "cwd_ref": "state",
+      "timeout_sec": 10,
+      "consumers": [
+        {
+          "path": "tests/enforcement/consumer.txt",
+          "consumer_probe": {
+            "argv": ["<PYTHON>", "tests/enforcement/verifier_probe.py", "consumer", "tests/enforcement/consumer.txt", "L-1"]
+          }
+        }
+      ],
+      "enforcement_scope": ["tests/enforcement/**"]
+    },
+    {
+      "id": "seed-task-card",
+      "positive": {
+        "argv": ["<PYTHON>", "templates/verify_template.py", "task-card", "templates/task-card.md"]
+      },
+      "negative": {
+        "argv": ["<PYTHON>", "templates/verify_template.py", "task-card", "templates/fixtures/task-card.invalid.md"]
+      },
+      "cwd_ref": "engine",
+      "timeout_sec": 10,
+      "consumers": [
+        {
+          "path": "templates/task-card.md",
+          "consumer_probe": {
+            "argv": ["<PYTHON>", "templates/verify_template.py", "contains", "templates/task-card.md", "L-2"]
+          }
+        },
+        {
+          "path": "templates/task-card.md",
+          "consumer_probe": {
+            "argv": ["<PYTHON>", "templates/verify_template.py", "contains", "templates/task-card.md", "L-6"]
+          }
+        },
+        {
+          "path": "templates/task-card.md",
+          "consumer_probe": {
+            "argv": ["<PYTHON>", "templates/verify_template.py", "contains", "templates/task-card.md", "L-8"]
+          }
+        }
+      ],
+      "enforcement_scope": ["templates/task-card.md", "templates/verify_template.py"]
+    },
+    {
+      "id": "seed-audit-checklist",
+      "positive": {
+        "argv": ["<PYTHON>", "templates/verify_template.py", "audit-checklist", "templates/audit-checklist.md"]
+      },
+      "negative": {
+        "argv": ["<PYTHON>", "templates/verify_template.py", "audit-checklist", "templates/fixtures/audit-checklist.invalid.md"]
+      },
+      "cwd_ref": "engine",
+      "timeout_sec": 10,
+      "consumers": [
+        {
+          "path": "templates/audit-checklist.md",
+          "consumer_probe": {
+            "argv": ["<PYTHON>", "templates/verify_template.py", "contains", "templates/audit-checklist.md", "L-7"]
+          }
+        }
+      ],
+      "enforcement_scope": ["templates/audit-checklist.md", "templates/verify_template.py"]
+    },
+    {
+      "id": "seed-shared-literal",
+      "positive": {
+        "argv": ["<PYTHON>", "templates/check_shared_literal.py", "--root", "templates/fixtures/literal-clean.txt", "--literal", "LEGACY_LIMIT"]
+      },
+      "negative": {
+        "argv": ["<PYTHON>", "templates/check_shared_literal.py", "--root", "templates/fixtures/literal-dirty.txt", "--literal", "LEGACY_LIMIT"]
+      },
+      "cwd_ref": "engine",
+      "timeout_sec": 10,
+      "consumers": [
+        {
+          "path": "templates/check_shared_literal.py",
+          "consumer_probe": {
+            "argv": ["<PYTHON>", "templates/check_shared_literal.py", "--root", "templates/check_shared_literal.py", "--literal", "L-1", "--expect", "present"]
+          }
+        },
+        {
+          "path": "templates/check_shared_literal.py",
+          "consumer_probe": {
+            "argv": ["<PYTHON>", "templates/check_shared_literal.py", "--root", "templates/check_shared_literal.py", "--literal", "L-4", "--expect", "present"]
+          }
+        }
+      ],
+      "enforcement_scope": ["templates/check_shared_literal.py", "templates/fixtures/literal-*.txt"]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema": "hook-fragment/1",
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "\"{{HOOK_TARGET}}\" prompt"}]}
+    ],
+    "PreToolUse": [
+      {"hooks": [{"type": "command", "command": "\"{{HOOK_TARGET}}\" pretool"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "\"{{HOOK_TARGET}}\" completion"}]}
+    ]
+  }
+}

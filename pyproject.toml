@@ -1,0 +1,10 @@
+[project]
+name = "agent-core"
+version = "0.1.0.dev0"
+requires-python = ">=3.11"
+
+[project.scripts]
+agent-core = "agent_core.cli:main"
+
+[tool.setuptools]
+packages = ["agent_core"]

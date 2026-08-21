@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "verifier/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "verifiers"],
+  "properties": {
+    "schema": {"const": "verifier/1"},
+    "verifiers": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/verifier"}
+    }
+  },
+  "$defs": {
+    "argv": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "consumer_probe"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "consumer_probe": {"$ref": "#/$defs/argv"}
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "positive", "negative", "cwd_ref", "timeout_sec", "consumers", "enforcement_scope"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$"},
+        "positive": {"$ref": "#/$defs/argv"},
+        "negative": {"$ref": "#/$defs/argv"},
+        "cwd_ref": {"enum": ["state", "engine"]},
+        "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 120},
+        "consumers": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/consumer"}},
+        "enforcement_scope": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+      }
+    }
+  }
+}

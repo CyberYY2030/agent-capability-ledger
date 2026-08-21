@@ -1,0 +1,291 @@
+{
+  "artifact_sha256": "uOGa_dWQJ8sKS5DrRAhaLgEcBdCel1blpas9jXfRZIw",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "xx0jnfkXJvxRnG63LTGOxlggYnIysveWIZ6H3PNdCrQ"
+    },
+    {
+      "path": "NOTICE",
+      "sha256": "gQ36z1LGXdBTfxIY68QuW4dHcNZCvLwgeXand08cZYg"
+    },
+    {
+      "path": "agent_core/__init__.py",
+      "sha256": "mXEg50gMJBrtvqmQJpP5jfHLAxaFa0lVVrcM4k-S9M8"
+    },
+    {
+      "path": "agent_core/capture.py",
+      "sha256": "S21e2MmnWeMmtlZmnomu1tm4sTS3p5kBLQDMGqGG0_I"
+    },
+    {
+      "path": "agent_core/cli.py",
+      "sha256": "d6zJZoWLAr4HS0EE-w4ztzY3DWY8PrNG0lvF_QWYBO4"
+    },
+    {
+      "path": "agent_core/config.py",
+      "sha256": "tmqcqa2GHoNdJCGwKtu-F34vDoXg8G000nxlc_l3DCg"
+    },
+    {
+      "path": "agent_core/docs_contract.py",
+      "sha256": "ysYn4XZwQ73uQQJ99BUVnCLlsqQrC9X9NA-uhlxrE6o"
+    },
+    {
+      "path": "agent_core/doctor.py",
+      "sha256": "oUNcN0tNFaFZTzCi99St5sbY_qe7BNYhTcT6AP-X2bs"
+    },
+    {
+      "path": "agent_core/fingerprint.py",
+      "sha256": "zwrHLWlrfFvDfIbEvEMMlgyuNZFYqgvbvORp1SZwwVA"
+    },
+    {
+      "path": "agent_core/freshness.py",
+      "sha256": "C2siL960H85MzvphE4FZaUCxoe1qOs8QKYOCELIbDFM"
+    },
+    {
+      "path": "agent_core/installer.py",
+      "sha256": "Z8jK1dM2GlfYK86TE1_uzIJ-0uSQJBTJTbvQEAZ9wQw"
+    },
+    {
+      "path": "agent_core/launcher.py",
+      "sha256": "Fw_Fxf1hX85HXq1j11avMfsx0_fDghRXmr2c5N0woUg"
+    },
+    {
+      "path": "agent_core/ledger.py",
+      "sha256": "XuNmibW0oi-vogXNcXgwCcciWBooIhqyyY_I1FvyCA0"
+    },
+    {
+      "path": "agent_core/match.py",
+      "sha256": "FEqTsa2Pf4L45uBtm_aaeCYxKABvIHJPlTBJ76kpdTI"
+    },
+    {
+      "path": "agent_core/migrate.py",
+      "sha256": "fPIrTYPpmd14dRHtKR9RQgPskfbTM1oxjKJzj_7lYFw"
+    },
+    {
+      "path": "agent_core/privacy.py",
+      "sha256": "rtJf5eySgo7kjTgLjpEbyNxh1_wS34RkJTrGX1huJbo"
+    },
+    {
+      "path": "agent_core/project.py",
+      "sha256": "SNTAHb8dYSNlkqJXDgnDsVmu711FViiErYc1PcH3Qh8"
+    },
+    {
+      "path": "agent_core/project_promote.py",
+      "sha256": "PJ0inGVhnDIs8edH-TpNEvI9lp9b_x-ZLwxG6lpayDI"
+    },
+    {
+      "path": "agent_core/promote.py",
+      "sha256": "tu_GpXdYNH4SsRn3n2ZRQJmqlsDhBgQI9mdLHSA0oOQ"
+    },
+    {
+      "path": "agent_core/provenance.py",
+      "sha256": "ILRApDqK5XnupQJ04L_MwxnyanQnym9KeCsmWB74MVQ"
+    },
+    {
+      "path": "agent_core/repository.py",
+      "sha256": "g_f87RtzGCTHLc0FfDnIbNZd5VNsFDaqnngBJQjFLhs"
+    },
+    {
+      "path": "agent_core/retire.py",
+      "sha256": "aZh54FEbycRmVwKeFmLgAEAcA4CrGts8mGrD2_9WLLE"
+    },
+    {
+      "path": "agent_core/runtime_config.py",
+      "sha256": "JSk_uHOuMOt9vd2SVkgvsegmSkcwicWTuWPSIDzi8mc"
+    },
+    {
+      "path": "agent_core/schema/agent-core-lock-1.json",
+      "sha256": "tC0Ljods_tyCBi9NuKQtuydPWzNFeBF0GY6VVqixmAY"
+    },
+    {
+      "path": "agent_core/schema/agent-core.config-1.json",
+      "sha256": "R97Ia_n0lqC37siGYNb6P0-pVDFyU1wJocPs8vZU1qQ"
+    },
+    {
+      "path": "agent_core/schema/capability-fingerprint-1.json",
+      "sha256": "v_F1L0Zf6Ybh7CJbHGcTOiVMeHl0U3GAGW9YPqaRrDQ"
+    },
+    {
+      "path": "agent_core/schema/capability-manifest-1.json",
+      "sha256": "m_9lGem0NBhKgAdjc5YpwjIvUH-jTiXvxaAkSMmk6WQ"
+    },
+    {
+      "path": "agent_core/schema/engine-pin-1.json",
+      "sha256": "Lc6HjLu_cZUUaHksYa3qIP8WiTG2wuGyg8IcAEGErYg"
+    },
+    {
+      "path": "agent_core/schema/evidence-1.json",
+      "sha256": "CGeorewsHBAXgjMXV3LcneWUA2SXyMGMc-3rDFnAfVg"
+    },
+    {
+      "path": "agent_core/schema/install-receipt-1.json",
+      "sha256": "dlHXw_vydIrIP51-2IOs5M_m2-uqhEB5tnj0OO5OdHQ"
+    },
+    {
+      "path": "agent_core/schema/install-snapshot-1.json",
+      "sha256": "tkDixaZhAmVXIbWsTEGR_SF7Neafbh6pGLpV1l8jpjA"
+    },
+    {
+      "path": "agent_core/schema/lessons-hook-heartbeat-1.json",
+      "sha256": "_9-zmAAflHaaVIbFgvuK_ADQsWM8nNOZm7w06vfS8tY"
+    },
+    {
+      "path": "agent_core/schema/lessons-ledger-2.json",
+      "sha256": "_ns3sgFg3BtzjoOgmrla_GzR9l5lKaq3RgJEyvmrrjE"
+    },
+    {
+      "path": "agent_core/schema/privacy-allowlist-1.json",
+      "sha256": "9ZvM4DfPm1l6HdOrw7PhzokczRrpjrCU4IYEn2RbJVA"
+    },
+    {
+      "path": "agent_core/schema/privacy-rules-1.json",
+      "sha256": "aDs2FKoEbeLpl-5QqLgq5EWhrPmA7pb4f_V9ODlmgIM"
+    },
+    {
+      "path": "agent_core/schema/publication-identity-1.json",
+      "sha256": "U9yKXY4TGMHwDVeQhYvlr-_wcLDhfxwrR1ZNA1fCYJk"
+    },
+    {
+      "path": "agent_core/schema/release-manifest-1.json",
+      "sha256": "K-yZ9CClHmgWcLuRTJfNQOTIuzN89Jx0P59ZLl8vB_E"
+    },
+    {
+      "path": "agent_core/schema/verifier-1.json",
+      "sha256": "6srNIuvFCD3gvN3GlUXraPMBmNxPc8UrMhcpigb8gu0"
+    },
+    {
+      "path": "agent_core/state.py",
+      "sha256": "_ewsjVYAHl1DgI3d0c6LXoXPa_3nyrarBBmJTjH25QM"
+    },
+    {
+      "path": "agent_core/stopwords.txt",
+      "sha256": "loXuD06SqSH-PdDLGRs0bElovT7cCOi6dfOkj4SPvWo"
+    },
+    {
+      "path": "agent_core/sync.py",
+      "sha256": "LkOc2IS6_s8weoq0Lk-_oTrE5GSi8hEtYg6kh7pSsRM"
+    },
+    {
+      "path": "agent_core/upgrade.py",
+      "sha256": "N8UTT79PSeWoZNVurW5D2KNvq7lk6si98CHf6fhkMkQ"
+    },
+    {
+      "path": "enforcement/check_active_ledger_roundtrip.py",
+      "sha256": "Ql_8-1gNs0uVUIfNcpc3-W3j-0c5A0DkDUuoAjBfX1I"
+    },
+    {
+      "path": "enforcement/verifiers.json",
+      "sha256": "SLiSxFoPVBLDw4N_BV1_2-qAV2qi6Nh9mrZBXslQ-MI"
+    },
+    {
+      "path": "examples/host.example.json",
+      "sha256": "RvNa8canpRr1x6ejAjq9uHnnDVtDFL4DNInF8RxfQz8"
+    },
+    {
+      "path": "examples/manifest.custom.example.yaml",
+      "sha256": "cTEdwrydxA-F7hX4w8b7Z6MMJNQDoqhgBYVg4-tpp8o"
+    },
+    {
+      "path": "examples/rules.global.example.md",
+      "sha256": "OXgezbTNmXfu3g_q4KozU5SWwbt-xQZG8oj5ja0VFbM"
+    },
+    {
+      "path": "install.ps1",
+      "sha256": "N6yw86EAxB1Wk_o23-1DEpPNon-JtvnZ6oLq6jw101w"
+    },
+    {
+      "path": "install.sh",
+      "sha256": "bHnVV94VQX_YLRCwQfBuUWuCtzcRAe79MYEl3eSiUJw"
+    },
+    {
+      "path": "manifest.yaml",
+      "sha256": "pwbTudOx7gWcMUB9v9hYVOG0E6LmVhKis0QGRVNFmrY"
+    },
+    {
+      "path": "privacy_rules.default.json",
+      "sha256": "_MGHZRcos_UTKKkRVLkmXH132bCoYtG-2X7K7_1MGmA"
+    },
+    {
+      "path": "runtimes/claude-code/head.md",
+      "sha256": "W1GIkeMOrkp_nM8Krq8HJ1hXWxn7aPK7XHbCfLkZRYE"
+    },
+    {
+      "path": "runtimes/claude-code/hook.fragment.json",
+      "sha256": "yrQETkA8egl6v6GoffCGn1Lrzg_6vP20YaP6mD8Oecw"
+    },
+    {
+      "path": "runtimes/codex/head.md",
+      "sha256": "eXU-qIlkcJxUGKfw0FPC99Jf-m9qi5hxAXhTAAYsYUo"
+    },
+    {
+      "path": "runtimes/codex/hook.fragment.json",
+      "sha256": "yrQETkA8egl6v6GoffCGn1Lrzg_6vP20YaP6mD8Oecw"
+    },
+    {
+      "path": "runtimes/generic/head.md",
+      "sha256": "ml72sd8_3VLaAeMpmeVsnLG-OSxuLKrIoEd6k1jmL2k"
+    },
+    {
+      "path": "runtimes/generic/user_prompt.sh",
+      "sha256": "BLBcWlRYA_dNMeopM1GIIXNSyooC9ni5rhoB4t6YOKo"
+    },
+    {
+      "path": "seed/CASE_LAW.md",
+      "sha256": "YW1LqswkzhcY8olkFI0-mwsiZRdb6kTJrMh_Cl2lSBI"
+    },
+    {
+      "path": "seed/LESSONS.md",
+      "sha256": "qHiXv5tcc7xiAv-UVPfOxG40Bm3UEcEK6GRuAi1XBl0"
+    },
+    {
+      "path": "seed/profiles/example-domain/LESSONS.md",
+      "sha256": "8ilOAqE21iN5mOv_AMWLV_4lMnjNzlKD-YW8d10P8fk"
+    },
+    {
+      "path": "skills/adversarial-audit/SKILL.md",
+      "sha256": "BtvqtRmk3ssAh5jcshwic-tJTvFS_sEFKgLPduIQSnI"
+    },
+    {
+      "path": "skills/dispatching-task-cards/SKILL.md",
+      "sha256": "GwgvMqoRkCuTSOEa5JrQAhfos673jj4Y0ChAmv-Z9QI"
+    },
+    {
+      "path": "skills/first-divergence-debugging/SKILL.md",
+      "sha256": "S9JKMxyGOI9g-a05hK3bpvGGAxJCLgQBE-jl8i6rgvo"
+    },
+    {
+      "path": "templates/audit-checklist.md",
+      "sha256": "ny4JvlTg7tg1U-vWUlM8e1Rb_ys8NhjQt0zooBg4SBg"
+    },
+    {
+      "path": "templates/check_shared_literal.py",
+      "sha256": "Xf3OoCac6q3qmmA5cCPAd9nJplSRwmyAWRPQiKoutfk"
+    },
+    {
+      "path": "templates/fixtures/audit-checklist.invalid.md",
+      "sha256": "UNlS7N1ghA0qvQKC5iq0bfub3OP1IyGtgEMO7kuvECs"
+    },
+    {
+      "path": "templates/fixtures/literal-clean.txt",
+      "sha256": "BiCfVTYjzsPpJH6lAvS1-lhwoBiL6y6DJ4iQYgOrF8M"
+    },
+    {
+      "path": "templates/fixtures/literal-dirty.txt",
+      "sha256": "apYZWAQKb1ZczbjYs7IY8iove6AhQqOvRpaJsn6wbhA"
+    },
+    {
+      "path": "templates/fixtures/task-card.invalid.md",
+      "sha256": "gWa68dXzt10A6Fpq6U-Ll6SC6QWmX8YVR4EvQk80I4I"
+    },
+    {
+      "path": "templates/task-card.md",
+      "sha256": "IIOv4gMlpVV7Bvfzg9oWgAVbcQsdxmMLsl0yInhPDf4"
+    },
+    {
+      "path": "templates/verify_template.py",
+      "sha256": "h_gj7p29kvOKBxWgN2EQxtmozlTOYKP5lTuIPKAVvHQ"
+    }
+  ],
+  "schema": "release-manifest/1",
+  "version": "0.1.0.dev0"
+}

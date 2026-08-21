@@ -1,0 +1,13 @@
+{
+  "schema": "privacy-rules/1",
+  "rules": [
+    {"id": "absolute_windows_path", "kind": "regex", "pattern": "(?i)(?<![A-Z0-9_])[A-Z]:[\\\\/][^\\s\\\"'<>|]+"},
+    {"id": "absolute_unix_path", "kind": "regex", "pattern": "(?<![A-Za-z0-9_:])/(?:Users|home|private|var|tmp)/[^\\s\\\"'<>]+"},
+    {"id": "home_reference", "kind": "regex", "pattern": "(?i)(?:\u007e[/\\\\]|\u0025USERPROFILE\u0025|\u0025HOME\u0025|\\\u0024HOME(?![A-Z0-9_])|\\\u0024\\{HOME\\})"},
+    {"id": "email_address", "kind": "regex", "pattern": "(?i)(?<![A-Z0-9_])[A-Z0-9._%+\\-]+@[A-Z0-9.\\-]+\\.[A-Z]{2,}(?![A-Z0-9_])"},
+    {"id": "credential_token", "kind": "regex", "pattern": "(?i)(?<![A-Z0-9_])(?:gh[pousr]_[A-Z0-9]{20,}|sk-[A-Z0-9]{20,}|xox[baprs]-[A-Z0-9\\-]{20,})(?![A-Z0-9_])"},
+    {"id": "machine_name", "kind": "regex", "pattern": "(?i)(?<![A-Z0-9_])(?:DESKTOP-[A-Z0-9\\-]{4,}|[A-Z0-9][A-Z0-9\\-]{1,}-MacBook-(?:Air|Pro)(?:-[A-Z0-9\\-]+)?|[A-Z0-9][A-Z0-9\\-]{2,}\\.local)(?![A-Z0-9_])"},
+    {"id": "private_key_content", "kind": "regex", "pattern": "-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----"},
+    {"id": "long_hex", "kind": "regex", "pattern": "(?i)(?<![A-Z0-9_])[A-F0-9]{40,}(?![A-Z0-9_])"}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "capability-fingerprint/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "host", "engine_version", "schema_version", "state_revision", "capabilities"],
+  "properties": {
+    "schema": {"const": "capability-fingerprint/1"},
+    "host": {"type": "string"},
+    "engine_version": {"type": "string"},
+    "schema_version": {"type": "string"},
+    "state_revision": {"type": "string"},
+    "capabilities": {"type": "array"}
+  }
+}

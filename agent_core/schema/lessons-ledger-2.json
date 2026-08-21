@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lessons-ledger/2",
+  "description": "Single-line Markdown ledger entries. Version 2 keeps every version 1 entry valid and adds optional when, verifier, last_verified, evidence, from, and supersedes fields."
+}

@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+agent-core text eol=lf
+*.cmd text eol=crlf

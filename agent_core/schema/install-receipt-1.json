@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "install-receipt/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "engine_version", "artifact_sha256", "config_sha256", "state_lock_sha256", "snapshot_path", "objects", "hook_bindings"],
+  "properties": {
+    "schema": {"const": "install-receipt/1"},
+    "engine_version": {"type": "string", "minLength": 1},
+    "artifact_sha256": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+    "config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "state_lock_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "snapshot_path": {"type": "string", "minLength": 1},
+    "objects": {"type": "array", "items": {"type": "object"}},
+    "hook_bindings": {"type": "array", "items": {"type": "object"}}
+  }
+}

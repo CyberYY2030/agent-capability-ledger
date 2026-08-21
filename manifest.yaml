@@ -1,0 +1,11 @@
+{
+  "schema": "capability-manifest/1",
+  "capabilities": [
+    {"id": "rule:global-example", "kind": "rule", "source": "examples/rules.global.example.md", "requirement": "required", "runtimes": ["claude-code", "codex", "generic"], "trusted": true},
+    {"id": "checker:lessons-ledger", "kind": "checker", "source": "agent_core/ledger.py", "requirement": "required", "runtimes": ["claude-code", "codex", "generic"], "trusted": true},
+    {"id": "hook:prompt-router", "kind": "hook", "source": "runtimes/generic/user_prompt.sh", "requirement": "required", "runtimes": ["claude-code", "codex", "generic"], "trusted": true},
+    {"id": "skill:adversarial-audit", "kind": "skill", "source": "skills/adversarial-audit", "requirement": "required", "runtimes": ["claude-code", "codex"], "trusted": true},
+    {"id": "skill:dispatching-task-cards", "kind": "skill", "source": "skills/dispatching-task-cards", "requirement": "required", "runtimes": ["claude-code", "codex"], "trusted": true},
+    {"id": "skill:first-divergence-debugging", "kind": "skill", "source": "skills/first-divergence-debugging", "requirement": "required", "runtimes": ["claude-code", "codex"], "trusted": true}
+  ]
+}

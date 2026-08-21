@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-core-lock/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["engine_version", "engine_source", "schema_version", "pinned_at"],
+  "properties": {
+    "engine_version": {"type": "string", "minLength": 1},
+    "engine_source": {"type": "string", "minLength": 1},
+    "schema_version": {"const": "lessons-ledger/2"},
+    "pinned_at": {"type": "string", "format": "date-time"}
+  }
+}

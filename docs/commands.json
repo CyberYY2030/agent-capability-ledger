@@ -1,0 +1,141 @@
+{
+  "schema": "commands/2",
+  "steps": [
+    {
+      "id": "state_init",
+      "section": "quickstart",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "state", "init", "--path", "{{init_state}}", "--apply", "--git-name", "{{git_name}}", "--git-email", "{{git_email}}"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PASS revision=[0-9a-f]{40}$",
+      "capture": {},
+      "example_output": ["APPLIED operation=state-init path=<INIT_STATE>", "PASS revision=<SHA>"],
+      "omit": []
+    },
+    {
+      "id": "state_attach",
+      "section": "quickstart",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "state", "attach", "--path", "{{state}}", "--config", "{{config}}", "--confirm-private-remote", "--apply"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PASS revision=[0-9a-f]{40} receipt=.+$",
+      "capture": {},
+      "example_output": ["APPLIED operation=state-attach config=<CONFIG>", "PASS revision=<SHA> receipt=<CONFIG>.state-binding.json"],
+      "omit": []
+    },
+    {
+      "id": "install",
+      "section": "quickstart",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "install", "--config", "{{config}}", "--state", "{{state}}", "--source", "{{engine}}", "--artifact-manifest", "{{manifest}}", "--apply"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PASS artifact_sha256=.+ receipt=.+$",
+      "capture": {},
+      "example_output": ["PASS artifact_sha256=<ARTIFACT_SHA256> receipt=<HOST_DATA>/install-receipt.json"],
+      "omit": [{"line": "APPLIED install version=0.1.0.dev0 objects=21 hook_bindings=2", "reason": "keep the quickstart focused on the verified receipt"}]
+    },
+    {
+      "id": "capture",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "lessons", "capture", "--config", "{{config}}", "--state", "{{state}}", "--control-root", "{{control}}", "--workspace", "{{engine}}", "--agent", "codex", "--rule", "当 shared constant changes，先检查旧字面量消费者", "--trigger", "shared constant changes", "--cost", "duplicate integration work", "--sink", "rules/global.md", "--scope", "global", "--evidence", "synthetic:documented-lifecycle", "--when", "{\"text\":[\"shared constant\"]}"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^CAPTURED .+[\\\\/](desk-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32})\\.md$",
+      "capture": {"candidate": "(?m)^CAPTURED .+[\\\\/](desk-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32})\\.md$"},
+      "example_output": ["CAPTURED <STATE>/inbox/<CANDIDATE>.md"],
+      "omit": []
+    },
+    {
+      "id": "publish_plan",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "candidate", "publish", "--state", "{{state}}", "--control-root", "{{control}}", "--id", "{{candidate}}"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PLAN operation=publish candidate=.+$",
+      "capture": {"publish_remote_sha": "(?m)^EXPECTED_REMOTE_SHA ([0-9a-f]{40})$", "publish_plan_hash": "(?m)^PLAN_HASH ([0-9a-f]{64})$"},
+      "example_output": ["PLAN operation=publish candidate=<CANDIDATE>", "EXPECTED_REMOTE_SHA <PUBLISH_REMOTE_SHA>", "PLAN_HASH <PUBLISH_PLAN_HASH>"],
+      "omit": []
+    },
+    {
+      "id": "publish_apply",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "candidate", "publish", "--state", "{{state}}", "--control-root", "{{control}}", "--id", "{{candidate}}", "--apply", "--plan-hash", "{{publish_plan_hash}}", "--expected-remote-sha", "{{publish_remote_sha}}"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PASS remote_sha=[0-9a-f]{40} rollback=.+$",
+      "capture": {"published_sha": "(?m)^PASS remote_sha=([0-9a-f]{40}) rollback=.+$"},
+      "example_output": ["PASS remote_sha=<SHA> rollback=<ROLLBACK_ID>"],
+      "omit": []
+    },
+    {
+      "id": "promote_plan",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "promote", "--state", "{{state}}", "--control-root", "{{control}}", "--id", "{{candidate}}", "--reviewed-against", "{{published_sha}}"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PLAN operation=promote candidate=.+$",
+      "capture": {"promote_remote_sha": "(?m)^EXPECTED_REMOTE_SHA ([0-9a-f]{40})$", "promote_plan_hash": "(?m)^PLAN_HASH ([0-9a-f]{64})$"},
+      "example_output": ["PLAN operation=promote candidate=<CANDIDATE>", "EXPECTED_REMOTE_SHA <PROMOTE_REMOTE_SHA>", "PLAN_HASH <PROMOTE_PLAN_HASH>"],
+      "omit": [{"line": "BASE_DIFF <CANDIDATE_DIFF>", "reason": "the rendered lifecycle shows the transaction tokens rather than Git diffstat noise"}]
+    },
+    {
+      "id": "promote_apply",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "promote", "--state", "{{state}}", "--control-root", "{{control}}", "--id", "{{candidate}}", "--reviewed-against", "{{published_sha}}", "--apply", "--plan-hash", "{{promote_plan_hash}}", "--expected-remote-sha", "{{promote_remote_sha}}"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PASS remote_sha=[0-9a-f]{40} rollback=.+$",
+      "capture": {},
+      "example_output": ["PASS remote_sha=<SHA> rollback=<ROLLBACK_ID>"],
+      "omit": []
+    },
+    {
+      "id": "sync",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "sync", "--config", "{{config}}", "--state", "{{state}}", "--apply"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PASS ",
+      "capture": {},
+      "example_output": ["PASS backup_created=True"],
+      "omit": [
+        {"line": "PLAN target=claude-code runtime=claude-code", "reason": "the lifecycle text already names both synthetic runtime targets"},
+        {"line": "PLAN target=codex runtime=codex", "reason": "the lifecycle text already names both synthetic runtime targets"},
+        {"line": "BACKUP files=16", "reason": "the example emphasizes the verified backup result rather than fixture counts"},
+        {"line": "APPLIED writes=16 targets=2", "reason": "the example emphasizes the verified backup result rather than fixture counts"}
+      ]
+    },
+    {
+      "id": "match",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "lessons", "match", "--ledger", "{{ledger}}", "--stage", "prompt", "--text", "We are changing a shared constant; find old literal consumers", "--explain"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^LESSON L-[0-9]+: ",
+      "capture": {},
+      "example_output": ["LESSON <LESSON_ID>: 当 shared constant changes，先检查旧字面量消费者. sink=rules/global.md MATCH predicate=text value=\"constant\" query=\"We are changing a shared constant; find old literal consumers\""],
+      "omit": []
+    },
+    {
+      "id": "retire_report",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "lessons", "retire", "--workspace", "{{state}}", "--control-root", "{{control}}", "--report"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^(?:NOT_READY|READY_TO_CHECKLIST|BROKEN_SINK|WARN) ",
+      "capture": {},
+      "example_output": ["NOT_READY <LESSON_ID> missing_sink_reference"],
+      "omit": [
+        {"line": "BROKEN_SINK EXAMPLE-1 checks/synthetic-fixtures.md", "reason": "unrelated frozen seed sink status is outside this lifecycle example"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/check_shared_literal.py", "reason": "unrelated frozen seed sink status is outside this lifecycle example"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/task-card.md", "reason": "unrelated frozen seed sink status is outside this lifecycle example"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/audit-checklist.md", "reason": "unrelated frozen seed sink status is outside this lifecycle example"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/check_shared_literal.py", "reason": "a second frozen seed entry has the same sink status"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/audit-checklist.md", "reason": "a second frozen seed entry has the same sink status"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/task-card.md", "reason": "a second frozen seed entry has the same sink status"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/audit-checklist.md", "reason": "a third frozen seed entry has the same sink status"},
+        {"line": "BROKEN_SINK <LESSON_ID> templates/task-card.md", "reason": "a third frozen seed entry has the same sink status"}
+      ]
+    }
+  ]
+}

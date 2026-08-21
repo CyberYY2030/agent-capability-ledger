@@ -1,0 +1,7 @@
+{
+  "schema": "capability-manifest/1",
+  "capabilities": [
+    {"id": "skill:user-check", "kind": "skill", "source": "skills/user-check", "requirement": "optional", "runtimes": ["claude-code", "codex"], "trusted": true}
+  ]
+}
+

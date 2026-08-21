@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "publication-identity/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "name", "email"],
+  "properties": {
+    "schema": {"const": "publication-identity/1"},
+    "name": {"type": "string", "minLength": 1},
+    "email": {"type": "string", "minLength": 3}
+  }
+}

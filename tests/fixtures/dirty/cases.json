@@ -1,0 +1,13 @@
+{
+  "schema": "privacy-fixture-fragments/1",
+  "cases": [
+    {"rule_id": "absolute_windows_path", "parts": ["C", ":\\\\", "Users", "\\\\ExampleOwner\\\\private\\\\ledger.md"]},
+    {"rule_id": "absolute_unix_path", "parts": ["/", "Users", "/", "example-owner", "/", "private", "/", "ledger.md"]},
+    {"rule_id": "home_reference", "parts": ["~", "/", ".private-state", "/", "config.json"]},
+    {"rule_id": "email_address", "parts": ["owner", "@", "example", ".invalid"]},
+    {"rule_id": "credential_token", "parts": ["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"]},
+    {"rule_id": "machine_name", "parts": ["DESKTOP-", "DEMO1234"]},
+    {"rule_id": "private_key_content", "parts": ["-----BEGIN OPENSSH ", "PRIVATE KEY-----"]},
+    {"rule_id": "long_hex", "parts": ["0123456789abcdef", "0123456789abcdef", "0123456789abcdef", "0123456789abcdef"]}
+  ]
+}
