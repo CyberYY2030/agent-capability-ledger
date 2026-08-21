@@ -9,7 +9,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from agent_core import state as state_module
 from agent_core.config import ConfigError
 from agent_core.installer import build_release_manifest, plan_install
 from agent_core.state import (
@@ -150,6 +152,39 @@ class BindingTests(unittest.TestCase):
         self.assertIn(f"EXPECTED_REMOTE_SHA {standalone_sha}", standalone_plan)
         self.assertEqual(standalone_plan[-1], "DRY_RUN writes=0")
         self.assertEqual((standalone_config.read_bytes(), binding_receipt_path(standalone_config).read_bytes()), standalone_before)
+
+    def test_attach_fetch_config_and_lock_drift_fail_remote_race_without_writes(self) -> None:
+        canonical, config, _remote = self._canonical("attach-race")
+        receipt_path = binding_receipt_path(config)
+        original_validate = state_module._validate_attach
+        cases = ((2, True), (3, False))
+        for changed_index, keep_receipt in cases:
+            with self.subTest(changed_index=changed_index):
+                if not keep_receipt:
+                    receipt_path.unlink()
+                config_before = config.read_bytes()
+                receipt_before = receipt_path.read_bytes() if receipt_path.is_file() else None
+                lock_path = canonical / "state" / "agent-core.lock.json"
+                lock_before = lock_path.read_bytes()
+                calls = 0
+
+                def validate_with_drift(*args, **kwargs):
+                    nonlocal calls
+                    result = list(original_validate(*args, **kwargs))
+                    calls += 1
+                    if calls == 2:
+                        result[changed_index] += b"\n"
+                    return tuple(result)
+
+                with mock.patch.object(state_module, "_validate_attach", side_effect=validate_with_drift):
+                    with self.assertRaisesRegex(ConfigError, "FAIL_REMOTE_RACE"):
+                        apply_attach(canonical / "state", config, confirm_private_remote=True)
+                self.assertEqual(config.read_bytes(), config_before)
+                self.assertEqual(lock_path.read_bytes(), lock_before)
+                self.assertEqual(
+                    receipt_path.read_bytes() if receipt_path.is_file() else None,
+                    receipt_before,
+                )
 
     def test_schema_and_pin_mutations_fail_closed_without_url_disclosure(self) -> None:
         canonical, config, _remote = self._canonical()

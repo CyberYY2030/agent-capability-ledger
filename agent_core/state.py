@@ -680,10 +680,11 @@ def apply_attach(
     refreshed = _validate_attach(
         context.state_root, config_path, confirm_private_remote=confirm_private_remote,
     )
-    refreshed_context, _fresh_config, _fresh_bytes, _fresh_lock, fresh_url_sha256, fresh_sha, fresh_root_sha, fresh_provenance_sha = refreshed
+    refreshed_context, _fresh_config, fresh_config_content, fresh_lock_content, fresh_url_sha256, fresh_sha, fresh_root_sha, fresh_provenance_sha = refreshed
     if (
         refreshed_context != context or fresh_url_sha256 != remote_sha256
         or fresh_sha != advertised_sha or fresh_root_sha != root_sha or fresh_provenance_sha != provenance_sha
+        or fresh_config_content != previous_config or fresh_lock_content != lock_content
     ):
         raise ConfigError("FAIL_REMOTE_RACE", "attachment identity changed during fetch")
     remote_sha = fresh_sha
