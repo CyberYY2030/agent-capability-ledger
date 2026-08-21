@@ -48,8 +48,8 @@ LEGACY_BOUNDARY_SEEDS = {
 }
 
 README_EXCERPT = (
-    "Public, deterministic mechanics for a private lessons ledger. "
-    "Private state and host bindings stay outside this repository."
+    "Private state, host bindings, credentials, sessions, caches, and machine-specific "
+    "paths must not enter that export."
 )
 
 NORMAL_CONTENT_SAMPLES = (
