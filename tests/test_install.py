@@ -19,7 +19,7 @@ from agent_core.installer import (
     plan_install,
     verify_release_manifest,
 )
-from agent_core.state import apply_attach, apply_init
+from agent_core.state import BindingEvidence, apply_attach, apply_init, binding_receipt_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +38,13 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-c", f"safe.directory={repo.resolve().as_posix()}", "-C", str(repo), *args],
         check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+
+
+def synthetic_binding(config: Path, state: Path) -> BindingEvidence:
+    return BindingEvidence(
+        "canonical", "state-binding/2", binding_receipt_path(config), "0" * 64,
+        state, "1" * 64, "2" * 40, "3" * 40, "4" * 64, "5" * 64, "6" * 64,
     )
 
 
@@ -170,6 +177,92 @@ def test_public_install_wrappers_are_thin_and_runtime_independent() -> None:
         assert "agent_core.cli install" in content
         assert "--source" in content
         assert "npm" not in content and "node" not in content
+
+
+def test_apply_install_builds_once_and_consumes_same_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = object()
+    calls: list[tuple[str, object, bool | None]] = []
+
+    def build(*_args, **_kwargs):
+        calls.append(("build", plan, None))
+        return plan
+
+    def apply(built, *, force: bool):
+        calls.append(("apply", built, force))
+        return ["PASS synthetic"]
+
+    monkeypatch.setattr(installer_module, "_build_plan", build)
+    monkeypatch.setattr(installer_module, "_apply_install_plan", apply)
+    result = apply_install(
+        Path("engine"), Path("host.json"), Path("state"), Path("source"), None,
+        force=False,
+    )
+    assert result == ["PASS synthetic"]
+    assert calls == [("build", plan, None), ("apply", plan, False)]
+
+
+@pytest.mark.parametrize("drift", ("config", "lock", "receipt", "origin"))
+def test_apply_install_plan_binding_drift_fails_before_preflight_and_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    plan = installer_module._build_plan(ROOT, config, state, ROOT, manifest)
+    managed = [item.path for item in plan.objects] + [item.path for item in plan.hook_bindings]
+    before = {
+        path: path.read_bytes() if path.is_file() else None
+        for path in managed
+    }
+
+    local = installer_module.validate_state_binding(
+        plan.state_root,
+        plan.config_path,
+        require_clean_snapshot=False,
+        require_remote_observation=False,
+        expected_remote_revision=plan.binding.remote_revision,
+    )
+    assert local == plan.binding
+    reached_preflight: list[installer_module.InstallPlan] = []
+
+    def no_changes(candidate, *, force: bool):
+        assert force is False
+        reached_preflight.append(candidate)
+        return None, True, []
+
+    monkeypatch.setattr(installer_module, "_preflight", no_changes)
+    assert installer_module._apply_install_plan(plan, force=False) == [
+        f"PASS install version={plan.artifact.version} no_changes=true"
+    ]
+    assert reached_preflight == [plan]
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("binding drift crossed the zero-write boundary")
+
+    for name in ("_preflight", "_snapshot", "_atomic_write"):
+        monkeypatch.setattr(installer_module, name, forbidden)
+
+    if drift == "config":
+        config.write_bytes(config.read_bytes() + b"\n")
+    elif drift == "lock":
+        lock = state / "agent-core.lock.json"
+        lock.write_bytes(lock.read_bytes() + b"\n")
+    elif drift == "receipt":
+        receipt = binding_receipt_path(config)
+        receipt.write_bytes(receipt.read_bytes() + b"\n")
+    else:
+        git(state, "remote", "set-url", "origin", str(tmp_path / "different-origin.git"))
+
+    with pytest.raises(ConfigError, match="^FAIL_STATE_BINDING "):
+        installer_module._apply_install_plan(plan, force=False)
+    for path, content in before.items():
+        if content is None:
+            assert not os.path.lexists(path)
+        else:
+            assert path.read_bytes() == content
+    assert not install_root.exists()
+    assert not plan.receipt_path.exists()
+    assert not (config.parent / "rollback").exists()
 
 
 def test_install_plan_is_zero_write_and_apply_is_idempotent(
@@ -353,8 +446,12 @@ def test_receipt_owned_old_bytes_conflict_with_new_desired_before_writes(
             hashlib.sha256(new_content).hexdigest(), new_content,
         ),),
         (),
+        synthetic_binding(tmp_path / "host" / "host.json", tmp_path / "state"),
     )
     monkeypatch.setattr(installer_module, "_build_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(
+        installer_module, "validate_state_binding", lambda *_args, **_kwargs: plan.binding,
+    )
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("conflict crossed the preflight boundary")
@@ -394,8 +491,12 @@ def test_runtime_config_directory_collision_is_conflict_before_writes(
         (installer_module.RuntimeBinding(
             "claude-code", "claude-code", settings, runtime_root, desired,
         ),),
+        synthetic_binding(tmp_path / "host" / "host.json", tmp_path / "state"),
     )
     monkeypatch.setattr(installer_module, "_build_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(
+        installer_module, "validate_state_binding", lambda *_args, **_kwargs: plan.binding,
+    )
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("collision crossed the preflight boundary")

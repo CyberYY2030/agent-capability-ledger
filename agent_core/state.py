@@ -519,8 +519,8 @@ def _validate_state_binding_context(
         if require_remote_observation:
             remote_url_sha256, advertised = _remote_snapshot(context)
         else:
-            if context.layout != "canonical" or not isinstance(expected_remote_revision, str):
-                _binding_fail("local binding validation requires canonical expected revision")
+            if not isinstance(expected_remote_revision, str):
+                _binding_fail("local binding validation requires expected revision")
             advertised = _valid_oid(expected_remote_revision)
             remote_url_sha256 = _local_remote_identity(context)
         if receipt["remote_url_sha256"] != remote_url_sha256:
@@ -674,6 +674,14 @@ def apply_attach(
     receipt_path = _host_path_outside_repository(
         binding_receipt_path(config_path), context.repo_root, "binding receipt",
     )
+    remote_state_path = _host_path_outside_repository(
+        config_path.parent / "remote-state.json", context.repo_root, "remote state",
+    )
+    previous_remote_state = (
+        _ordinary_file(remote_state_path, "remote state", single_link=True)
+        if os.path.lexists(remote_state_path)
+        else None
+    )
     fetched = _git(context.state_root, "fetch", "origin", "--quiet")
     if fetched.returncode != 0:
         raise ConfigError("REMOTE_REQUIRED", "state attach requires a fetchable origin/main")
@@ -706,17 +714,25 @@ def apply_attach(
         payload["repository_root_sha"] = root_sha
         payload["engine_provenance_sha256"] = provenance_sha
         receipt = _json_bytes(payload)
+    remote_state = _json_bytes({"last_known_good": remote_sha})
     try:
         _atomic_write(config_path, rendered_config)
         _atomic_write(receipt_path, receipt)
+        _atomic_write(remote_state_path, remote_state)
+        _ordinary_file(config_path, "host config", single_link=True)
         _ordinary_file(receipt_path, "binding receipt", single_link=True)
+        _ordinary_file(remote_state_path, "remote state", single_link=True)
     except Exception as exc:
         try:
-            _atomic_write(config_path, previous_config)
+            if previous_remote_state is None:
+                remote_state_path.unlink(missing_ok=True)
+            else:
+                _atomic_write(remote_state_path, previous_remote_state)
             if previous_receipt is None:
                 receipt_path.unlink(missing_ok=True)
             else:
                 _atomic_write(receipt_path, previous_receipt)
+            _atomic_write(config_path, previous_config)
         except Exception as rollback_exc:
             raise ConfigError("FAIL_ATTACH_ROLLBACK", str(rollback_exc)) from rollback_exc
         if isinstance(exc, ConfigError):

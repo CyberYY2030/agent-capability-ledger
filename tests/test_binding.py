@@ -13,6 +13,7 @@ from unittest import mock
 
 from agent_core import state as state_module
 from agent_core.config import ConfigError
+from agent_core.freshness import require_fresh
 from agent_core.installer import build_release_manifest, plan_install
 from agent_core.state import (
     apply_attach,
@@ -136,6 +137,18 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(standalone_receipt["schema"], "state-binding/1")
         self.assertEqual(validate_state_binding(standalone, standalone_config).layout, "standalone")
 
+    def test_standalone_local_binding_evidence_matches_observed_evidence(self) -> None:
+        standalone, config = self._standalone()
+        observed = validate_state_binding(standalone, config)
+        local = validate_state_binding(
+            standalone,
+            config,
+            require_clean_snapshot=False,
+            require_remote_observation=False,
+            expected_remote_revision=observed.remote_revision,
+        )
+        self.assertEqual(local, observed)
+
     def test_plan_attach_returns_current_revision_without_writes(self) -> None:
         canonical, config, _remote = self._canonical()
         canonical_before = (config.read_bytes(), binding_receipt_path(config).read_bytes())
@@ -185,6 +198,111 @@ class BindingTests(unittest.TestCase):
                     receipt_path.read_bytes() if receipt_path.is_file() else None,
                     receipt_before,
                 )
+
+    def test_attach_replaces_stale_remote_baseline_with_observed_revision(self) -> None:
+        canonical, config, _remote = self._canonical("attach-baseline")
+        remote_state = config.parent / "remote-state.json"
+        remote_state.write_text(
+            json.dumps({"last_known_good": "f" * 40}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        observed = git(canonical, "rev-parse", "origin/main").stdout.strip()
+
+        apply_attach(canonical / "state", config, confirm_private_remote=True)
+
+        self.assertEqual(
+            json.loads(remote_state.read_text(encoding="utf-8")),
+            {"last_known_good": observed},
+        )
+        self.assertEqual(
+            require_fresh(canonical / "state", "sync", config.parent, fetch=False).remote,
+            observed,
+        )
+
+    def test_attach_write_and_verify_failures_restore_three_file_transaction(self) -> None:
+        canonical, config, _remote = self._canonical("attach-rollback")
+        receipt = binding_receipt_path(config)
+        remote_state = config.parent / "remote-state.json"
+        config.write_bytes(config.read_bytes() + b"\n")
+        receipt.write_bytes(receipt.read_bytes() + b"\n")
+        remote_state.unlink()
+        original_atomic = state_module._atomic_write
+        original_ordinary = state_module._ordinary_file
+        targets = {
+            "config-write": config,
+            "receipt-write": receipt,
+            "remote-state-write": remote_state,
+        }
+
+        for failure in (*targets, "postverify"):
+            with self.subTest(failure=failure):
+                before = (config.read_bytes(), receipt.read_bytes(), None)
+                injected = False
+                remote_written = False
+
+                def atomic_with_failure(path: Path, content: bytes) -> None:
+                    nonlocal injected, remote_written
+                    original_atomic(path, content)
+                    if path == remote_state:
+                        remote_written = True
+                    if failure in targets and path == targets[failure] and not injected:
+                        injected = True
+                        raise OSError("synthetic attach write failure")
+
+                def ordinary_with_failure(
+                    path: Path, label: str, *, single_link: bool = False,
+                ) -> bytes:
+                    nonlocal injected
+                    if failure == "postverify" and remote_written and label == "host config" and not injected:
+                        injected = True
+                        raise OSError("synthetic attach verify failure")
+                    return original_ordinary(path, label, single_link=single_link)
+
+                with mock.patch.object(state_module, "_atomic_write", side_effect=atomic_with_failure), \
+                     mock.patch.object(state_module, "_ordinary_file", side_effect=ordinary_with_failure):
+                    with self.assertRaisesRegex(ConfigError, "FAIL_STATE_ATTACH"):
+                        apply_attach(canonical / "state", config, confirm_private_remote=True)
+                self.assertTrue(injected)
+                self.assertEqual(
+                    (
+                        config.read_bytes(),
+                        receipt.read_bytes(),
+                        remote_state.read_bytes() if remote_state.is_file() else None,
+                    ),
+                    before,
+                )
+
+    def test_attach_remote_state_directory_is_rejected_before_atomic_write(self) -> None:
+        canonical, config, _remote = self._canonical("attach-remote-state-directory")
+        remote_state = config.parent / "remote-state.json"
+        remote_state.unlink()
+        remote_state.mkdir()
+        identity = (remote_state.stat().st_dev, remote_state.stat().st_ino)
+        with mock.patch.object(
+            state_module, "_atomic_write", side_effect=AssertionError("crossed zero-write boundary"),
+        ):
+            with self.assertRaisesRegex(ConfigError, "FAIL_STATE_BINDING"):
+                apply_attach(canonical / "state", config, confirm_private_remote=True)
+        self.assertTrue(remote_state.is_dir())
+        self.assertEqual((remote_state.stat().st_dev, remote_state.stat().st_ino), identity)
+
+    def test_attach_remote_state_hardlink_is_rejected_before_atomic_write(self) -> None:
+        canonical, config, _remote = self._canonical("attach-remote-state-hardlink")
+        remote_state = config.parent / "remote-state.json"
+        link = self.root / "remote-state-link.json"
+        try:
+            os.link(remote_state, link)
+        except OSError as exc:
+            self.skipTest(f"hardlink support unavailable: {exc.__class__.__name__}")
+        before = remote_state.read_bytes()
+        with mock.patch.object(
+            state_module, "_atomic_write", side_effect=AssertionError("crossed zero-write boundary"),
+        ):
+            with self.assertRaisesRegex(ConfigError, "FAIL_STATE_BINDING"):
+                apply_attach(canonical / "state", config, confirm_private_remote=True)
+        self.assertEqual(remote_state.read_bytes(), before)
+        self.assertEqual(link.read_bytes(), before)
+        self.assertGreater(remote_state.stat().st_nlink, 1)
 
     def test_schema_and_pin_mutations_fail_closed_without_url_disclosure(self) -> None:
         canonical, config, _remote = self._canonical()

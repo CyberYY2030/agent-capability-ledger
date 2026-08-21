@@ -28,7 +28,7 @@ from .runtime_config import (
     runtime_config_path,
     runtime_hook_path,
 )
-from .state import binding_receipt_path, validate_state_binding
+from .state import BindingEvidence, binding_receipt_path, validate_state_binding
 from .sync import collect_operations
 
 
@@ -81,6 +81,7 @@ class InstallPlan:
     receipt_path: Path
     objects: tuple[ManagedObject, ...]
     hook_bindings: tuple[RuntimeBinding, ...]
+    binding: BindingEvidence
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -295,7 +296,7 @@ def _binding(
     explicit_state: Path | None,
     *,
     receipt_override: bytes | None = None,
-) -> tuple[dict[str, Any], Path]:
+) -> tuple[dict[str, Any], Path, BindingEvidence]:
     config_path = config_path.resolve()
     config = load_config(config_path)
     configured = config["state_root"]
@@ -308,7 +309,7 @@ def _binding(
     evidence = validate_state_binding(
         state_root, config_path, receipt_bytes=receipt_override, require_clean_snapshot=True,
     )
-    return config, evidence.state_root
+    return config, evidence.state_root, evidence
 
 
 def _wrapper_content() -> tuple[bytes, bytes]:
@@ -353,7 +354,7 @@ def _build_plan(
     artifact = verify_release_manifest(
         source_root, manifest_path, expected_version=expected_version,
     )
-    config, state_root = _binding(
+    config, state_root, binding = _binding(
         config_path, explicit_state, receipt_override=binding_receipt_override,
     )
     lock = _load_json(state_root / "agent-core.lock.json", "FAIL_STATE_LOCK")
@@ -421,7 +422,7 @@ def _build_plan(
         seen.add(key)
     return InstallPlan(
         config_path.resolve(), config, state_root, source_root, artifact, install_root,
-        engine_destination, receipt_path, tuple(objects), tuple(hook_bindings),
+        engine_destination, receipt_path, tuple(objects), tuple(hook_bindings), binding,
     )
 
 
@@ -900,6 +901,19 @@ def apply_install(
         engine_root, config_path, explicit_state, source_root, manifest_path,
         expected_version=expected_version,
     )
+    return _apply_install_plan(plan, force=force)
+
+
+def _apply_install_plan(plan: InstallPlan, *, force: bool) -> list[str]:
+    binding = validate_state_binding(
+        plan.state_root,
+        plan.config_path,
+        require_clean_snapshot=False,
+        require_remote_observation=False,
+        expected_remote_revision=plan.binding.remote_revision,
+    )
+    if binding != plan.binding:
+        raise ConfigError("FAIL_STATE_BINDING", "binding changed after install plan")
     previous, no_changes, hook_bindings = _preflight(plan, force=force)
     if no_changes:
         return [f"PASS install version={plan.artifact.version} no_changes=true"]

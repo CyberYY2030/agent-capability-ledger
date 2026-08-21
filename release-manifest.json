@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "Nj3vIGZwNdusOlcwtgaxVyStdJsmih0iTtgbNZNusFs",
+  "artifact_sha256": "lJo_FXrWWHRglPSA7cKUYW8V4rjshCVEGY0lT_7jKjs",
   "files": [
     {
       "path": "LICENSE",
@@ -43,7 +43,7 @@
     },
     {
       "path": "agent_core/installer.py",
-      "sha256": "Z8jK1dM2GlfYK86TE1_uzIJ-0uSQJBTJTbvQEAZ9wQw"
+      "sha256": "lME_HhOPryljsUqKHZyxHtRqFSWdtkEWXnvq2nJAMSw"
     },
     {
       "path": "agent_core/launcher.py",
@@ -155,7 +155,7 @@
     },
     {
       "path": "agent_core/state.py",
-      "sha256": "dFxqoF61TtLC9LkqjlI2IV94iLTqS19WH1sj6NMXVBk"
+      "sha256": "-UXyxEUaGQq6ZcxDmFOyC5_0wtTNL2Wsw6jjUm2wjcU"
     },
     {
       "path": "agent_core/stopwords.txt",

@@ -15,7 +15,7 @@ If `python` is unavailable on `PATH`, install Python or set `AGENT_CORE_PYTHON` 
 
 The private Git repository containing `engine/` and `state/` is the only runtime source of truth. Cross-machine synchronization uses ordinary Git operations on that private repository.
 
-A public repository, when C4 is accepted, is a one-way whitelist export of `engine/`. It is a publication artifact and never a runtime dependency. Private state, host bindings, credentials, sessions, caches, and machine-specific paths must not enter that export.
+The public `CyberYY2030/agent-capability-ledger` repository is a one-way whitelist export of `engine/`. It has passed the public privacy gate, remains a publication artifact, and is never a runtime dependency. Private state, host bindings, credentials, sessions, caches, and machine-specific paths must not enter that export.
 
 ## V0.1 CLI
 
@@ -61,14 +61,15 @@ $ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_ST
 
 `conflict` means user-owned or previously managed bytes differ. Stop, resolve every reported target manually, then plan again. The public installer has no force option and does not recommend overwriting conflicts.
 
-Always run and review the plan before `install --apply`. Live runtime cutover has not been executed; stop whenever the plan reports a conflict.
+Always run and review the plan before `install --apply`. The current Windows machine has passed live cutover acceptance; every future apply must still stop whenever the plan reports a conflict.
 
 ## Current limits
 
 - C1 clean-tree acceptance in C2 covered 222 `missing` targets, install, 222 `identical` targets, conflict zero-write behavior, the public no-force boundary, and injected-failure restoration of original bytes, prior absence, and residue cleanup.
-- C2 isolated Windows acceptance covered the installed four-command surface, doctor verification of the installed pin and manifest, ordinary Git push plus `pull --ff-only` before materialization, private lessons visibility, and a second sync with `writes=0`.
-- Live runtime cutover has not been executed. A second full workspace and macOS evidence remain pending C3; the isolated same-machine evidence is not cross-machine or macOS proof.
-- Public whitelist export, privacy verification, release packaging, and publication approval are pending C4.
+- C2 Windows acceptance includes live cutover on the current machine: 215 materializations classified as 7 `missing`, 150 `identical`, and 58 `conflict`, with `hook_conflict=0`; after the reviewed migration, all four installed wrapper commands returned zero, canonical bytes matched, and foreign hook fields were preserved.
+- The earlier isolated Windows run also covered doctor verification of the installed pin and manifest, ordinary Git push plus `pull --ff-only` before materialization, private lessons visibility, and a second sync with `writes=0`.
+- A second full workspace, macOS, and cross-machine evidence remain pending C3.
+- C4 exported the engine through the one-way whitelist to `CyberYY2030/agent-capability-ledger` and passed the public privacy gate. Each subsequent release, including the export of current fixes, remains gated before publication.
 - Complex transaction modules are retained as frozen implementation and are outside the V0.1 user path.
 
 ## Development safety
