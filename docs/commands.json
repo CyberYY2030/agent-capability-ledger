@@ -32,7 +32,7 @@
       "expect_regex": "(?m)^PASS artifact_sha256=.+ receipt=.+$",
       "capture": {},
       "example_output": ["PASS artifact_sha256=<ARTIFACT_SHA256> receipt=<HOST_DATA>/install-receipt.json"],
-      "omit": [{"line": "APPLIED install version=0.1.0.dev0 objects=21 hook_bindings=2", "reason": "keep the quickstart focused on the verified receipt"}]
+      "omit": [{"line": "APPLIED install version=0.1.0.dev2 objects=21 hook_bindings=2", "reason": "keep the quickstart focused on the verified receipt"}]
     },
     {
       "id": "capture",

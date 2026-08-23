@@ -16,9 +16,11 @@ from agent_core.promote import (
     PROJECT_INBOX,
     PROJECT_LEDGER,
     apply_project_promote,
+    apply_local_promote,
     apply_prepared,
     create_candidate,
     plan_project_promote,
+    plan_local_promote,
     plan_promote,
     plan_publish,
     prepare_promote,
@@ -156,6 +158,82 @@ def project_host_config(tmp_path: Path, state_root: Path | str = "<STATE>") -> P
     path = tmp_path / "host.json"
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def setup_unified_local(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """One Git root containing project and bound-state ledgers for C8 local promotion."""
+    repo, _unused = setup_project(tmp_path)
+    (repo / "experience").mkdir()
+    (repo / "experience" / "LESSONS.md").write_text(
+        "# Lessons Ledger\n<!-- next id: L-999 -->\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: global -->\n\n## 活跃\n\n"
+        "- **L-1 [pending·通用] Existing global rule.** 触发: existing trigger. "
+        "代价: existing cost. sink → checks/existing.md.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    profile = repo / "experience" / "profiles" / "example-domain"
+    profile.mkdir(parents=True)
+    (profile / "LESSONS.md").write_text(
+        "# Profile Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: profile -->\n<!-- lessons-profile: example-domain -->\n\n"
+        "## 活跃\n\n"
+        "- **[[lesson:EXAMPLE-1]] [pending·领域] Existing profile rule.** 触发: existing trigger. "
+        "代价: existing cost. sink → checks/existing.md.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    routing = json.loads((repo / ".agents" / "lessons.json").read_text(encoding="utf-8"))
+    routing["profiles"] = ["example-domain"]
+    (repo / ".agents" / "lessons.json").write_text(json.dumps(routing, sort_keys=True) + "\n", encoding="utf-8")
+    git(repo, "add", "experience", ".agents/lessons.json")
+    git(repo, "commit", "-q", "-m", "add state ledger")
+    return repo, project_host_config(tmp_path, repo), tmp_path / "legacy-control"
+
+
+def local_state_candidate(repo: Path, control: Path, suffix: str, *, rule: str,
+                          scope_hint: str = "global") -> str:
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    return create_candidate(
+        repo, control, host="desk", agent="codex", rule=rule,
+        trigger=f"local {suffix}", cost="lost local lesson", sink=f"checks/{suffix}.md",
+        scope_hint=scope_hint, evidence=f"synthetic:{suffix}", base_revision=f"{head} unverified",
+        require_state_freshness=False,
+    ).stem
+
+
+def setup_monorepo_state(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Canonical root/state layout with no project routing at the repository root."""
+    repo = tmp_path / "private"; repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", f"test{chr(64)}invalid")
+    (repo / "engine").mkdir()
+    global_ledger = repo / "state" / "experience" / "LESSONS.md"
+    global_ledger.parent.mkdir(parents=True)
+    global_ledger.write_text(
+        "# Lessons Ledger\n<!-- next id: L-999 -->\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: global -->\n\n## 活跃\n\n"
+        "- **L-1 [pending·通用] Existing global rule.** 触发: existing trigger. "
+        "代价: existing cost. sink → checks/existing.md.\n\n## 归档\n", encoding="utf-8")
+    profile = repo / "state" / "experience" / "profiles" / "example-domain" / "LESSONS.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "# Profile Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: profile -->\n<!-- lessons-profile: example-domain -->\n\n"
+        "## 活跃\n\n- **[[lesson:EXAMPLE-1]] [pending·领域] Profile rule.** "
+        "触发: profile trigger. 代价: profile cost. sink → checks/profile.md.\n\n## 归档\n", encoding="utf-8")
+    git(repo, "add", "state")
+    git(repo, "commit", "-q", "-m", "seed state")
+    return repo, project_host_config(tmp_path, repo / "state"), tmp_path / "candidate-control"
+
+
+def monorepo_state_candidate(repo: Path, control: Path, suffix: str, *, rule: str) -> str:
+    return create_candidate(
+        repo, control, host="desk", agent="codex", rule=rule,
+        trigger=f"state {suffix}", cost="lost state lesson", sink=f"checks/{suffix}.md",
+        scope_hint="global", evidence=f"synthetic:{suffix}",
+        base_revision=f"{git(repo, 'rev-parse', 'HEAD').stdout.strip()} unverified",
+        inbox_path=repo / "state" / "inbox", require_state_freshness=False,
+    ).stem
 
 
 def test_concurrent_inbox_writers_never_overwrite(tmp_path: Path) -> None:
@@ -502,7 +580,8 @@ def test_project_promote_cli_requires_and_applies_exact_plan_hash(
     repo, control = setup_project(tmp_path)
     item = project_candidate(repo, control, "cli")
     args = ["lessons", "promote", "--workspace", str(repo),
-            "--control-root", str(control), "--config", str(project_host_config(tmp_path)), "--id", item]
+            "--config", str(project_host_config(tmp_path)), "--id", item,
+            "--force-new"]
     canonical = repo / PROJECT_LEDGER
     candidate_path = repo / PROJECT_INBOX / f"{item}.md"
     before = {
@@ -526,7 +605,7 @@ def test_project_promote_cli_requires_and_applies_exact_plan_hash(
     assert "PASS project_promoted=SAMPLE-2" in output
 
 
-def test_project_promote_cli_uses_concrete_config_state_for_cross_scope_conflict(
+def test_project_promote_cli_reports_concrete_state_cross_scope_advisory(
         tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     repo, control = setup_project(tmp_path)
     _remote, _seed, state, _beta = setup_pair(tmp_path / "state")
@@ -536,10 +615,10 @@ def test_project_promote_cli_uses_concrete_config_state_for_cross_scope_conflict
     before = (ledger_path.read_bytes(), source.read_bytes(),
               git(repo, "diff", "--cached", "--binary").stdout)
     assert project_promote_main([
-        "--workspace", str(repo), "--control-root", str(control),
-        "--config", str(project_host_config(tmp_path, state)), "--id", item,
-    ]) == 1
-    assert "FAIL_SCOPE_REVIEW" in capsys.readouterr().err
+        "--workspace", str(repo),
+        "--config", str(project_host_config(tmp_path, state)), "--id", item, "--force-new",
+    ]) == 0
+    assert "EXACT scope=global store=global id=L-1" in capsys.readouterr().out
     assert (ledger_path.read_bytes(), source.read_bytes(),
             git(repo, "diff", "--cached", "--binary").stdout) == before
 
@@ -550,13 +629,14 @@ def test_project_promote_cli_rejects_concrete_state_without_global_ledger(
     item = project_candidate(repo, control, "missing-configured-global")
     state = tmp_path / "concrete-state"
     state.mkdir()
+    git(state, "init", "-q", "-b", "main")
     ledger_path = repo / PROJECT_LEDGER
     source = repo / PROJECT_INBOX / f"{item}.md"
     before = (ledger_path.read_bytes(), source.read_bytes(),
               git(repo, "diff", "--cached", "--binary").stdout)
     assert project_promote_main([
         "--workspace", str(repo), "--control-root", str(control),
-        "--config", str(project_host_config(tmp_path, state)), "--id", item,
+        "--config", str(project_host_config(tmp_path, state)), "--id", item, "--force-new",
     ]) == 1
     assert "FAIL_LESSON_ROUTING" in capsys.readouterr().err
     assert (ledger_path.read_bytes(), source.read_bytes(),
@@ -597,6 +677,26 @@ def test_project_promote_choice_flags_are_mutually_exclusive() -> None:
         project_promote_main([
             "--id", "synthetic", "--update", "SAMPLE-1", "--supersedes", "SAMPLE-2",
         ])
+
+
+def test_local_promote_placeholder_config_uses_install_lock_and_cli_rejects_bare_update(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo, legacy_control = setup_project(tmp_path)
+    config = project_host_config(tmp_path)
+    item = project_candidate(repo, legacy_control, "placeholder-lock")
+    plan = plan_local_promote(repo, None, item, force_new=True, config_path=config)
+    assert plan.payload["control_root"] == str((config.parent / "txn").resolve())
+    before = ((repo / PROJECT_LEDGER).read_bytes(),
+              (repo / PROJECT_INBOX / f"{item}.md").read_bytes(),
+              git(repo, "diff", "--cached", "--binary").stdout)
+    assert project_promote_main([
+        "--workspace", str(repo), "--config", str(config), "--id", item,
+        "--update", "SAMPLE-1",
+    ]) == 1
+    assert "FAIL_UPDATE_TARGET" in capsys.readouterr().err
+    assert ((repo / PROJECT_LEDGER).read_bytes(),
+            (repo / PROJECT_INBOX / f"{item}.md").read_bytes(),
+            git(repo, "diff", "--cached", "--binary").stdout) == before
 
 
 def test_project_update_preserves_identity_and_consumes_candidate(tmp_path: Path) -> None:
@@ -958,3 +1058,267 @@ def test_project_promote_ignores_remote_advancement(tmp_path: Path) -> None:
     git(other, "commit", "-q", "-m", "advance remote")
     git(other, "push", "-q")
     assert apply_project_promote(repo, control, plan, plan.plan_hash).lesson_id == "SAMPLE-2"
+
+
+def test_local_promote_global_scoped_update_moves_candidate_under_install_lock(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "global-update", rule="Replacement global rule")
+    source_relative = f"inbox/{item}.md"
+    git(repo, "add", source_relative)
+    git(repo, "commit", "-q", "-m", "track local candidate")
+    plan = plan_local_promote(
+        repo, None, item, scope_override="global", update="global:global:L-1",
+        state_root=repo, config_path=config,
+    )
+    assert plan.payload["target_scope"] == "global"
+    assert plan.payload["action"] == "update"
+    assert plan.payload["control_root"] == str((config.parent / "txn").resolve())
+    result = apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    source = repo / "inbox" / f"{item}.md"
+    consumed = repo / "inbox" / "consumed" / f"{item}.md"
+    assert result.lesson_id == "L-1" and not source.exists() and consumed.is_file()
+    assert f"from: {item}." in (repo / "experience" / "LESSONS.md").read_text(encoding="utf-8")
+    assert set(result.changed_paths) == {"experience/LESSONS.md", f"inbox/consumed/{item}.md", source_relative}
+    assert f"D\t{source_relative}" in git(repo, "diff", "--cached", "--name-status", "--no-renames").stdout
+
+
+def test_local_promote_same_repository_override_and_cross_repository_rejection(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = project_candidate(repo, control, "same-root", rule="Project rule promoted globally")
+    plan = plan_local_promote(
+        repo, None, item, scope_override="global", force_new=True,
+        state_root=repo, config_path=config,
+    )
+    assert plan.payload["source_kind"] == "project" and plan.payload["target_scope"] == "global"
+    result = apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    assert (repo / PROJECT_CONSUMED / f"{item}.md").is_file()
+    assert "experience/LESSONS.md" in result.changed_paths
+
+    cross_root = tmp_path / "cross"; cross_root.mkdir()
+    other, other_control = setup_project(cross_root)
+    bound_root = tmp_path / "bound-state"; bound_root.mkdir()
+    _remote, _seed, state, _beta = setup_pair(bound_root)
+    cross_item = project_candidate(other, other_control, "cross-root")
+    before = (other / PROJECT_LEDGER).read_bytes(), (other / PROJECT_INBOX / f"{cross_item}.md").read_bytes()
+    with pytest.raises(ConfigError, match="FAIL_SCOPE_REPOSITORY"):
+        plan_local_promote(
+            other, None, cross_item, scope_override="global", force_new=True,
+            state_root=state, config_path=project_host_config(cross_root, state),
+        )
+    assert ((other / PROJECT_LEDGER).read_bytes(), (other / PROJECT_INBOX / f"{cross_item}.md").read_bytes()) == before
+
+
+def test_local_promote_global_to_declared_profile_override_binds_scope(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "profile", rule="Global source promoted to profile")
+    global_plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                                     state_root=repo, config_path=config)
+    profile_plan = plan_local_promote(repo, None, item, scope_override="profile:example-domain", force_new=True,
+                                      state_root=repo, config_path=config)
+    assert global_plan.plan_hash != profile_plan.plan_hash
+    assert profile_plan.payload["target_scope"] == "profile"
+    result = apply_local_promote(repo, None, profile_plan, profile_plan.plan_hash, config_path=config)
+    assert result.lesson_id == "EXAMPLE-2"
+    assert (repo / "experience" / "profiles" / "example-domain" / "LESSONS.md").read_text(encoding="utf-8").count(f"from: {item}.") == 1
+
+
+def test_local_promote_scoped_project_update_accepts_no_fuzzy_shortlist(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = project_candidate(repo, control, "project-update", rule="Distinct scoped replacement")
+    plan = plan_local_promote(
+        repo, None, item, scope_override="project:sample-app",
+        update="project:sample-app:SAMPLE-1", state_root=repo, config_path=config,
+    )
+    assert plan.payload["update"] == "SAMPLE-1"
+    assert plan.payload["choice"] == "update"
+    assert not any(line.startswith("SIMILAR ") for line in plan.lines)
+    assert apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config).lesson_id == "SAMPLE-1"
+
+
+def test_local_promote_blocks_target_exact_and_advises_cross_layer_exact(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    target_item = local_state_candidate(repo, control, "target-exact", rule="Existing global rule.")
+    with pytest.raises(ConfigError, match="FAIL_EXACT_DUPLICATE"):
+        plan_local_promote(repo, None, target_item, scope_override="global", force_new=True,
+                           state_root=repo, config_path=config)
+
+    cross_item = project_candidate(repo, control, "cross-advisory", rule="Existing global rule.")
+    plan = plan_local_promote(repo, None, cross_item, scope_override="project:sample-app", force_new=True,
+                              state_root=repo, config_path=config)
+    assert "EXACT scope=global store=global id=L-1" in plan.lines
+    assert apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config).lesson_id == "SAMPLE-2"
+
+
+def test_local_promote_rerun_converges_after_canonical_write_fault(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "converge", rule="Convergent global rule")
+    plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                              state_root=repo, config_path=config)
+
+    def interrupt_after_canonical() -> None:
+        raise OSError("injected post-write interruption")
+
+    monkeypatch.setattr("agent_core.promote._after_local_promote_canonical_write", interrupt_after_canonical)
+    with pytest.raises(OSError, match="post-write"):
+        apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    assert (repo / "inbox" / f"{item}.md").is_file()
+    monkeypatch.setattr("agent_core.promote._after_local_promote_canonical_write", lambda: None)
+    converged = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                                   state_root=repo, config_path=config)
+    assert converged.payload["action"] == "converge"
+    assert apply_local_promote(repo, None, converged, converged.plan_hash, config_path=config).lesson_id == "L-2"
+    text = (repo / "experience" / "LESSONS.md").read_text(encoding="utf-8")
+    assert text.count(f"from: {item}.") == 1
+
+
+def test_local_promote_never_calls_frozen_remote_paths(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "no-remote", rule="Local only rule")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("local lessons promote must not call a remote transaction path")
+
+    monkeypatch.setattr("agent_core.promote.require_fresh", forbidden)
+    monkeypatch.setattr("agent_core.promote.plan_promote", forbidden)
+    monkeypatch.setattr("agent_core.promote.prepare_promote", forbidden)
+    monkeypatch.setattr("agent_core.promote._push", forbidden)
+    plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                              state_root=repo, config_path=config)
+    assert apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config).lesson_id == "L-2"
+
+
+def test_local_promote_uses_monorepo_state_root_without_project_routing(tmp_path: Path) -> None:
+    repo, config, control = setup_monorepo_state(tmp_path)
+    item = monorepo_state_candidate(repo, control, "root-global", rule="Root state update")
+    plan = plan_local_promote(
+        repo, None, item, scope_override="global", update="global:global:L-1",
+        state_root=repo / "state", config_path=config,
+    )
+    assert plan.payload["operation_root"] == str(repo.resolve())
+    assert plan.payload["source_path"] == f"state/inbox/{item}.md"
+    assert plan.payload["target_path"] == "state/experience/LESSONS.md"
+    result = apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    assert result.lesson_id == "L-1"
+    assert (repo / "state" / "inbox" / "consumed" / f"{item}.md").is_file()
+
+
+def test_local_promote_external_routing_selects_monorepo_profile(tmp_path: Path) -> None:
+    repo, config, control = setup_monorepo_state(tmp_path)
+    workspace_root = tmp_path / "workspace"; workspace_root.mkdir()
+    workspace, _legacy_control = setup_project(workspace_root)
+    routing_path = workspace / ".agents" / "lessons.json"
+    routing = json.loads(routing_path.read_text(encoding="utf-8"))
+    routing["profiles"] = ["example-domain"]
+    routing_path.write_text(json.dumps(routing, sort_keys=True) + "\n", encoding="utf-8")
+    item = monorepo_state_candidate(repo, control, "external-routing", rule="Routed state profile")
+    plan = plan_local_promote(
+        workspace, None, item, scope_override="profile:example-domain", force_new=True,
+        state_root=repo / "state", config_path=config,
+    )
+    assert plan.payload["operation_root"] == str(repo.resolve())
+    assert plan.payload["target_path"] == "state/experience/profiles/example-domain/LESSONS.md"
+
+
+def test_local_promote_rejects_rendered_ledger_errors_before_write(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, config, control = setup_monorepo_state(tmp_path)
+    item = monorepo_state_candidate(repo, control, "render-errors", rule="Reject invalid render")
+    plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                              state_root=repo / "state", config_path=config)
+    before = (repo / "state" / "experience" / "LESSONS.md").read_bytes()
+    from agent_core import ledger as ledger_module
+    original_parse = ledger_module.parse_ledger
+    calls = 0
+
+    def render_only_error(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return {}, ["invalid"], []
+        return original_parse(*args, **kwargs)
+
+    monkeypatch.setattr("agent_core.promote.ledger.parse_ledger", render_only_error)
+    with pytest.raises(ConfigError, match="FAIL_LEDGER"):
+        apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    assert (repo / "state" / "experience" / "LESSONS.md").read_bytes() == before
+    assert (repo / "state" / "inbox" / f"{item}.md").is_file()
+
+
+def test_local_promote_rejects_nested_state_root_before_write_or_stage(tmp_path: Path) -> None:
+    repo, config, control = setup_monorepo_state(tmp_path)
+    item = monorepo_state_candidate(repo, control, "nested", rule="Nested root must reject")
+    nested = repo / "state" / "nested"; nested.mkdir()
+    ledger_path = repo / "state" / "experience" / "LESSONS.md"
+    before = (ledger_path.read_bytes(), git(repo, "diff", "--cached", "--binary").stdout)
+    with pytest.raises(ConfigError, match="FAIL_SCOPE_REPOSITORY"):
+        plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                           state_root=nested, config_path=config)
+    assert (ledger_path.read_bytes(), git(repo, "diff", "--cached", "--binary").stdout) == before
+
+
+def test_local_promote_rejects_candidate_drift_and_binds_cross_exact_facts(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = project_candidate(repo, control, "drift", rule="Cross layer fact.")
+    plan = plan_local_promote(repo, None, item, scope_override="project:sample-app", force_new=True,
+                              state_root=repo, config_path=config)
+    candidate_path = repo / PROJECT_INBOX / f"{item}.md"
+    payload = json.loads(candidate_path.read_text(encoding="utf-8")); payload["rule"] = "Changed after review"
+    candidate_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    before = (repo / PROJECT_LEDGER).read_bytes()
+    with pytest.raises(ConfigError, match="FAIL_INPUT_CHANGED"):
+        apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    assert (repo / PROJECT_LEDGER).read_bytes() == before
+
+    payload["rule"] = "Cross layer fact."
+    candidate_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    initial = plan_local_promote(repo, None, item, scope_override="project:sample-app", force_new=True,
+                                 state_root=repo, config_path=config)
+    global_ledger = repo / "experience" / "LESSONS.md"
+    global_ledger.write_text(
+        global_ledger.read_text(encoding="utf-8").replace("Existing global rule.", "Cross layer fact."),
+        encoding="utf-8",
+    )
+    changed = plan_local_promote(repo, None, item, scope_override="project:sample-app", force_new=True,
+                                 state_root=repo, config_path=config)
+    assert initial.plan_hash != changed.plan_hash
+
+
+def test_local_promote_rejects_existing_consumed_before_canonical_write(tmp_path: Path) -> None:
+    repo, config, control = setup_monorepo_state(tmp_path)
+    item = monorepo_state_candidate(repo, control, "collision", rule="Consumed collision")
+    source = repo / "state" / "inbox" / f"{item}.md"
+    consumed = repo / "state" / "inbox" / "consumed" / source.name
+    consumed.parent.mkdir(); consumed.write_bytes(source.read_bytes())
+    plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                              state_root=repo / "state", config_path=config)
+    ledger_path = repo / "state" / "experience" / "LESSONS.md"; before = ledger_path.read_bytes()
+    with pytest.raises(ConfigError, match="FAIL_CANDIDATE_STATE"):
+        apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    assert ledger_path.read_bytes() == before and source.is_file() and consumed.is_file()
+
+
+def test_local_promote_converges_after_git_add_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, config, control = setup_monorepo_state(tmp_path)
+    item = monorepo_state_candidate(repo, control, "add-failure", rule="Retry after git add")
+    plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                              state_root=repo / "state", config_path=config)
+    from agent_core import promote as promote_module
+    original_git = promote_module._git
+
+    def fail_add(path: Path, *args: str, **kwargs):
+        if args and args[0] == "add":
+            raise ConfigError("FAIL_GIT", "injected add failure")
+        return original_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(promote_module, "_git", fail_add)
+    with pytest.raises(ConfigError, match="injected add failure"):
+        apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    consumed = repo / "state" / "inbox" / "consumed" / f"{item}.md"
+    assert consumed.is_file() and not (repo / "state" / "inbox" / f"{item}.md").exists()
+    monkeypatch.setattr(promote_module, "_git", original_git)
+    rerun = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                               state_root=repo / "state", config_path=config)
+    assert rerun.payload["action"] == "converge"
+    assert apply_local_promote(repo, None, rerun, rerun.plan_hash, config_path=config).lesson_id == "L-2"

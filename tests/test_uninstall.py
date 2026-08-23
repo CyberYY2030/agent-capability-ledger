@@ -87,7 +87,7 @@ def test_uninstall_rejects_receipt_root_outside_declared_domains(
     snapshot_manifest = json.loads(snapshot_manifest_path.read_text(encoding="utf-8"))
     snapshot_manifest["objects"][0]["root"] = str(tmp_path)
     snapshot_manifest_path.write_text(json.dumps(snapshot_manifest), encoding="utf-8")
-    engine = install_root / "engine" / "0.1.0.dev0"
+    engine = install_root / "engine" / "0.1.0.dev2"
     with pytest.raises(ConfigError, match="FAIL_INSTALL_RECEIPT"):
         apply_uninstall(config)
     assert engine.is_dir()

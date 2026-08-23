@@ -20,7 +20,7 @@ from typing import Any
 from unicodedata import normalize
 
 from . import ledger
-from .config import ConfigError, HOST_LABEL_RE
+from .config import ConfigError, HOST_LABEL_RE, load_config
 from .freshness import (CANDIDATE_ID_RE, SHA_RE, load_candidate, parse_candidate_bytes,
                         record_remote_head, require_fresh)
 from .match import parse_markdown, tokenize
@@ -228,6 +228,24 @@ class StandaloneDispatch:
 class ProjectResult:
     lesson_id: str
     changed_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LocalPromoteContext:
+    """One lock-held, byte-and-identity-bound local promote snapshot."""
+
+    repo: Path
+    state: RepositoryContext | None
+    candidate_path: Path
+    source_path: Path
+    target_path: Path
+    consumed_path: Path
+    candidate_raw: bytes
+    target_raw: bytes
+    candidate_token: OwnedFileToken
+    target_token: OwnedFileToken
+    sources: tuple[tuple[str, str, str], ...]
+    advisories: tuple[str, ...]
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -3047,6 +3065,535 @@ def apply_project_promote(
             stage_paths.append(source_relative)
         _git(repo, "add", "--", *stage_paths)
         return ProjectResult(plan.payload["lesson_id"], tuple(stage_paths))
+
+
+# C8 V0.1 local promotion deliberately stays outside the frozen remote
+# transaction machinery.  The old project-only functions above remain as the
+# compatibility surface used by existing callers; the CLI uses the unified
+# helpers below.
+def _local_checked_source(path: Path, state: RepositoryContext | None, label: str) -> Path:
+    """Return one reviewed ordinary ledger file without alias resolution."""
+    if state is not None:
+        try:
+            return _local_state_file(state, path.relative_to(state.state_root), label)
+        except ValueError:
+            pass
+    return _local_safe_file(path, label)
+
+
+def _local_promote_sources(workspace_repo: Path, project_id: str | None,
+                           state: RepositoryContext | None) -> tuple[tuple[str, str, Path], ...]:
+    sources: list[tuple[str, str, Path]] = []
+    project_ledger = workspace_repo / PROJECT_LEDGER
+    if project_id is not None and project_ledger.is_file():
+        sources.append(("project", project_id, _local_checked_source(project_ledger, state, "project ledger")))
+    if state is None:
+        return tuple(sources)
+    global_path = _safe_state_path(state, GLOBAL_LEDGER)
+    if not global_path.is_file():
+        raise ConfigError("FAIL_LESSON_ROUTING", "global ledger; RETRY lessons capture after repairing the bound state")
+    global_path = _local_state_file(state, GLOBAL_LEDGER, "global ledger")
+    resolved, errors, _warnings = ledger.resolve_sources(str(global_path), str(workspace_repo))
+    if errors:
+        raise ConfigError("FAIL_LESSON_ROUTING", "declared lessons routing; RETRY lessons capture after repairing routing")
+    result = [(scope, store, _local_checked_source(Path(path), state, "resolved lessons source"))
+              for scope, store, path in resolved]
+    if project_id is not None and project_ledger.is_file() and not any(
+            scope == "project" and store == project_id for scope, store, _path in result):
+        result.append(("project", project_id, _local_checked_source(project_ledger, state, "project ledger")))
+    for source in result:
+        _defined, validation_errors, _validation_warnings = ledger.validate_sources(
+            [(source[0], source[1], str(source[2]))]
+        )
+        if validation_errors:
+            raise ConfigError("FAIL_LESSON_ROUTING", "resolved lessons source; RETRY lessons capture after repairing ledger")
+    return tuple(result)
+
+
+def _local_state_context(state_root: Path | None) -> RepositoryContext | None:
+    if state_root is None:
+        return None
+    try:
+        return resolve_repository_context(state_root)
+    except ConfigError as exc:
+        raise ConfigError("FAIL_SCOPE_REPOSITORY", "state root; RETRY with the bound private state root") from exc
+
+
+def _local_file_token(path: Path, label: str) -> OwnedFileToken:
+    try:
+        entry = os.lstat(path)
+        if _is_reparse_alias(path) or not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            raise ValueError
+        return OwnedFileToken(entry.st_dev, entry.st_ino, entry.st_size)
+    except (OSError, ValueError) as exc:
+        raise ConfigError("FAIL_TRANSACTION_SCOPE", label) from exc
+
+
+def _local_safe_file(path: Path, label: str) -> Path:
+    # `_resolved_local_path` validates a directory chain.  The final leaf is
+    # deliberately checked separately as an ordinary single-link file.
+    resolved = _resolved_local_path(path.parent, label) / path.name
+    _local_file_token(resolved, label)
+    return resolved
+
+
+def _local_state_file(context: RepositoryContext, relative: Path, label: str,
+                      *, required: bool = True) -> Path:
+    path = _safe_state_path(context, relative, required="file" if required else None)
+    if required:
+        _local_file_token(path, label)
+    return path
+
+
+def _local_candidate_source(workspace_repo: Path, state: RepositoryContext | None,
+                            candidate_id: str) -> tuple[Path, Path, str]:
+    if not CANDIDATE_ID_RE.fullmatch(candidate_id):
+        raise ConfigError("FAIL_CANDIDATE", "invalid candidate id; RETRY lessons capture")
+    candidates = [(workspace_repo / PROJECT_INBOX / f"{candidate_id}.md", "project")]
+    if state is not None:
+        candidates.append((_safe_state_path(state, INBOX / f"{candidate_id}.md"), "state"))
+    current = [(path, kind) for path, kind in candidates if path.is_file()]
+    if len(current) == 1:
+        path, kind = current[0]
+        return (_local_safe_file(path, "candidate") if kind == "project" else _local_state_file(
+            state, INBOX / f"{candidate_id}.md", "candidate"), path, kind)
+    if len(current) > 1:
+        raise ConfigError("FAIL_CANDIDATE", "candidate source; RETRY lessons capture in the selected target inbox")
+    consumed: list[tuple[Path, Path, str]] = []
+    for source, kind in candidates:
+        target = source.parent / "consumed" / source.name
+        if target.is_file():
+            checked = (_local_safe_file(target, "consumed candidate") if kind == "project" else _local_state_file(
+                state, CONSUMED / f"{candidate_id}.md", "consumed candidate"))
+            consumed.append((checked, source, kind))
+    if len(consumed) == 1:
+        return consumed[0]
+    if len(consumed) > 1:
+        raise ConfigError("FAIL_CANDIDATE", "candidate source; RETRY lessons capture in the selected target inbox")
+    if not current:
+        code = "FAIL_CANDIDATE_MISSING"
+        raise ConfigError(code, "candidate source; RETRY lessons capture in the selected target inbox")
+
+
+def _parse_local_scope(value: str, project_id: str | None) -> tuple[str, str]:
+    if value == "global":
+        return "global", "global"
+    if value.startswith("profile:"):
+        name = value.removeprefix("profile:")
+        if ledger.PROFILE_RE.fullmatch(name):
+            return "profile", name
+    if value.startswith("project:") and value.removeprefix("project:") == project_id:
+        return "project", project_id
+    retry = f"project:{project_id}" if project_id else "global"
+    raise ConfigError("FAIL_SCOPE_REVIEW", f"target scope; RETRY lessons capture --scope {retry}")
+
+
+def _local_target(sources: tuple[tuple[str, str, Path], ...], scope: str,
+                  store: str) -> tuple[Path, str, str]:
+    matches = [path for source_scope, source_store, path in sources
+               if source_scope == scope and source_store == store]
+    if len(matches) != 1 or not matches[0].is_file():
+        raise ConfigError("FAIL_SCOPE_REVIEW", "target ledger; RETRY lessons capture in the declared target inbox")
+    label = ledger.SCOPE_LABEL[scope]
+    prefix = "L" if scope == "global" else store.split("-", 1)[0].upper()
+    return matches[0], label, prefix
+
+
+def _local_git_root(path: Path) -> Path:
+    root = ledger.find_git_root(str(path if path.is_dir() else path.parent))
+    if not root:
+        raise ConfigError("FAIL_SCOPE_REPOSITORY", "candidate/target repository; RETRY lessons capture in the target inbox")
+    return Path(root).resolve()
+
+
+def _local_control_root(config_path: Path | None, control_root: Path | None,
+                        state_root: Path | None) -> Path:
+    """Use install's one lock identity whenever a host config is supplied."""
+    del state_root
+    if config_path is None:
+        return (control_root or Path.home() / ".agent-core").resolve()
+    config = config_path.resolve()
+    expected = config.parent / "txn"
+    if control_root is not None:
+        supplied = control_root.resolve()
+        if supplied not in {config.parent, expected}:
+            raise ConfigError("FAIL_TRANSACTION_SCOPE", "control root; RETRY omit --control-root")
+    return expected
+
+
+def _local_update_pointer(value: str | None, scope: str, store: str) -> str | None:
+    if value is None:
+        return None
+    # Legacy direct callers may still supply a bare id.  The public CLI emits
+    # and accepts only the scoped form.
+    if ":" not in value:
+        return value
+    pieces = value.split(":", 2)
+    if len(pieces) != 3 or pieces[0] != scope or pieces[1] != store or not pieces[2]:
+        raise ConfigError("FAIL_UPDATE_TARGET", f"RETRY --update {scope}:{store}:<lesson-id>")
+    return pieces[2]
+
+
+def _local_entry(item: dict[str, str], lesson_id: str, label: str, *,
+                 project: bool, supersedes: str | None = None) -> str:
+    rendered_id = lesson_id if label == ledger.SCOPE_LABEL["global"] else f"[[lesson:{lesson_id}]]"
+    # Project rendering preserves the candidate's exact rule bytes.  Global
+    # and profile retain their existing frozen punctuation renderer.
+    rule = item["rule"] if project else f"{item['rule']}."
+    suffix = f" supersedes: {supersedes}." if supersedes else ""
+    when = f" when: {item['when']}" if "when" in item else ""
+    return (f"- **{rendered_id} [pending·{label}] {rule}** 触发: {item['trigger']}. "
+            f"代价: {item['cost']}. from: {item['id']}.{suffix} sink → {item['sink']}.{when}")
+
+
+def _local_render(text: str, item: dict[str, str], lesson_id: str, label: str,
+                  scope: str, update: str | None, supersedes: str | None) -> str:
+    if update is None:
+        if supersedes:
+            text = _archive_superseded(text, supersedes, lesson_id)
+        marker = "\n## 归档"
+        if marker not in text:
+            raise ConfigError("FAIL_LEDGER", "missing archive heading; RETRY after repairing target ledger")
+        entry = _local_entry(item, lesson_id, label, project=scope == "project", supersedes=supersedes)
+        return text.replace(marker, f"\n{entry}\n{marker}", 1)
+    lines = text.splitlines()
+    active = False
+    replacement = _local_entry(item, lesson_id, label, project=scope == "project")
+    for index, line in enumerate(lines):
+        if line.strip().startswith("## "):
+            active = ledger.is_active_heading(line.strip()[3:])
+            continue
+        match = ledger.ENTRY_RE.match(line)
+        if active and match and (match.group(1) or match.group(2)) == update:
+            lines[index] = replacement
+            return "\n".join(lines) + "\n"
+    raise ConfigError("FAIL_UPDATE_TARGET", f"{update}; RETRY with an active target pointer")
+
+
+def _local_exact_and_advisories(sources: tuple[tuple[str, str, Path], ...], rule: str,
+                                target: tuple[str, str], update: str | None,
+                                *, exclude_pointer: tuple[str, str, str] | None = None) -> tuple[str, ...]:
+    normalized = ledger.normalize_rule(rule)
+    try:
+        active = ledger.active_lessons(tuple((scope, store, str(path)) for scope, store, path in sources))
+    except ValueError as exc:
+        raise ConfigError("FAIL_LESSON_ROUTING", "lessons source; RETRY lessons capture after repairing source") from exc
+    lines: list[str] = []
+    for entry in active:
+        pointer = (entry.scope, entry.store, entry.lesson_id)
+        if entry.normalized_rule == normalized:
+            if pointer == exclude_pointer or pointer == (target[0], target[1], update):
+                continue
+            if pointer[:2] == target:
+                raise ConfigError("FAIL_EXACT_DUPLICATE",
+                                  f"{entry.scope}:{entry.store}:{entry.lesson_id}; RETRY --update {entry.scope}:{entry.store}:{entry.lesson_id}")
+            lines.append(f"EXACT scope={entry.scope} store={entry.store} id={entry.lesson_id}")
+    for scope, store, source in sources:
+        for lesson_id, score in _similarities(source.read_text(encoding="utf-8"), rule):
+            lines.append(f"SIMILAR scope={scope} store={store} id={lesson_id} score={score:.3f}")
+    return tuple(lines)
+
+
+def _local_exact_digest(lines: tuple[str, ...]) -> str:
+    """Only exact-duplicate facts are plan-bound; fuzzy advice is review output."""
+    return hashlib.sha256("\n".join(line for line in lines if line.startswith("EXACT ")).encode("utf-8")).hexdigest()
+
+
+def _local_promoted_entry(text: str, candidate_id: str, expected_entry: str) -> str | None:
+    for line in text.splitlines():
+        if f"from: {candidate_id}." not in line:
+            continue
+        match = ledger.ENTRY_RE.match(line)
+        if match and line == expected_entry:
+            return match.group(1) or match.group(2)
+    return None
+
+
+def _local_existing_result_id(text: str, candidate_id: str) -> str | None:
+    """Find an existing candidate-derived entry before allocating a fresh ID."""
+    for line in text.splitlines():
+        if f"from: {candidate_id}." not in line:
+            continue
+        match = ledger.ENTRY_RE.match(line)
+        if match:
+            return match.group(1) or match.group(2)
+    return None
+
+
+def _after_local_promote_canonical_write() -> None:
+    """Narrow test seam for the only post-write convergence boundary."""
+
+
+def _local_plan(candidate_id: str, *, repo: Path, candidate_path: Path, source: Path, source_kind: str,
+                target: Path, scope: str, store: str, project_id: str | None,
+                state_root: Path | None, config_path: Path | None, control_root: Path,
+                item: dict[str, str], action: str, review_choice: str, update: str | None,
+                supersedes: str | None, result_id: str,
+                canonical_sha256: str, expected_postimage_sha256: str, source_root: Path, target_root: Path,
+                stage_paths: tuple[str, ...], sources: tuple[tuple[str, str, Path], ...],
+                lines: tuple[str, ...], state: RepositoryContext | None) -> Plan:
+    candidate_token = _local_file_token(candidate_path, "candidate")
+    target_token = _local_file_token(target, "target ledger")
+    payload = {
+        "operation": "lessons-promote", "candidate_id": candidate_id,
+        "expected_remote_sha": "", "source_path": source.relative_to(repo).as_posix(),
+        "candidate_path": candidate_path.relative_to(repo).as_posix(), "source_kind": source_kind,
+        "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+        "target_scope": scope, "target_store": store,
+        "target_path": target.relative_to(repo).as_posix(), "operation_root": str(repo),
+        "target_git_root": str(target_root), "source_git_root": str(source_root),
+        "canonical_sha256": canonical_sha256, "expected_postimage_sha256": expected_postimage_sha256,
+        "action": action, "choice": review_choice,
+        "update": update, "supersedes": supersedes,
+        "result_id": result_id, "project_id": project_id,
+        "state_root": str(state_root.resolve()) if state_root else None,
+        "config_path": str(config_path.resolve()) if config_path else None,
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest() if config_path else None,
+        "control_root": str(control_root), "stage_paths": stage_paths,
+        "candidate_identity": (candidate_token.device, candidate_token.inode, candidate_token.size),
+        "target_identity": (target_token.device, target_token.inode, target_token.size),
+        "resolved_sources": tuple((scope, store, str(path)) for scope, store, path in sources),
+        "exact_facts_sha256": _local_exact_digest(lines),
+        "layout": state.layout if state else None,
+        "state_prefix": state.state_prefix if state else None,
+    }
+    plan_hash = _canonical_hash(payload)
+    plan_lines = lines + (
+        f"PLAN operation=lessons-promote candidate={candidate_id}",
+        f"TARGET scope={scope} store={store} path={payload['target_path']}",
+        f"ACTION {action}", f"RESULT_ID {result_id}",
+        f"CANDIDATE_SHA256 {payload['candidate_sha256']}",
+        f"CANONICAL_SHA256 {canonical_sha256}",
+        f"EXPECTED_POSTIMAGE_SHA256 {expected_postimage_sha256}", f"PLAN_HASH {plan_hash}",
+    )
+    return Plan("lessons-promote", candidate_id, "", plan_hash, plan_lines, payload)
+
+
+def _local_context_from_plan(plan: Plan) -> LocalPromoteContext:
+    """Rebuild the reviewed local paths once, then freeze bytes for the write phase."""
+    payload = plan.payload
+    try:
+        repo = Path(payload["operation_root"]).resolve()
+        if _local_git_root(repo) != repo:
+            raise ValueError
+        state_value = payload.get("state_root")
+        state = _local_state_context(Path(state_value)) if isinstance(state_value, str) else None
+        if state is not None and (state.repo_root != repo or payload.get("layout") != state.layout
+                                  or payload.get("state_prefix") != state.state_prefix):
+            raise ValueError
+        candidate = repo / payload["candidate_path"]
+        source = repo / payload["source_path"]
+        target = repo / payload["target_path"]
+        consumed = source.parent / "consumed" / source.name
+        for value in (candidate, source, target, consumed):
+            value.relative_to(repo)
+        def checked(value: Path, label: str) -> Path:
+            if state is not None:
+                try:
+                    relative = value.relative_to(state.state_root)
+                except ValueError:
+                    relative = None
+                if relative is not None:
+                    return _local_state_file(state, relative, label)
+            return _local_safe_file(value, label)
+        candidate = checked(candidate, "candidate")
+        target = checked(target, "target ledger")
+        candidate_raw = candidate.read_bytes()
+        target_raw = target.read_bytes()
+        candidate_token = _local_file_token(candidate, "candidate")
+        target_token = _local_file_token(target, "target ledger")
+        if (hashlib.sha256(candidate_raw).hexdigest() != payload.get("candidate_sha256")
+                or hashlib.sha256(target_raw).hexdigest() != payload.get("canonical_sha256")
+                or not isinstance(payload.get("expected_postimage_sha256"), str)
+                or SHA256_RE.fullmatch(payload["expected_postimage_sha256"]) is None
+                or tuple(payload.get("candidate_identity", ())) != (candidate_token.device, candidate_token.inode, candidate_token.size)
+                or tuple(payload.get("target_identity", ())) != (target_token.device, target_token.inode, target_token.size)):
+            raise ValueError
+        sources_raw = payload.get("resolved_sources")
+        if not isinstance(sources_raw, (tuple, list)):
+            raise ValueError
+        if not sources_raw or any(
+                not isinstance(source, (tuple, list)) or len(source) != 3
+                or any(not isinstance(value, str) or not value for value in source)
+                for source in sources_raw):
+            raise ValueError
+        sources = tuple(
+            (scope, store, str(_local_checked_source(Path(path), state, "resolved lessons source")))
+            for scope, store, path in sources_raw
+        )
+        item = parse_candidate_bytes(candidate_raw, plan.candidate_id, allow_project=True)
+        advisories = _local_exact_and_advisories(
+            tuple((scope, store, Path(path)) for scope, store, path in sources), item["rule"],
+            (str(payload["target_scope"]), str(payload["target_store"])), payload.get("update"),
+            exclude_pointer=((str(payload["target_scope"]), str(payload["target_store"]), str(payload["result_id"]))
+                             if payload.get("action") == "converge" else None))
+        if _local_exact_digest(advisories) != payload.get("exact_facts_sha256"):
+            raise ValueError
+        return LocalPromoteContext(repo, state, candidate, source, target, consumed, candidate_raw,
+                                   target_raw, candidate_token, target_token, sources, advisories)
+    except (ConfigError, OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, ConfigError):
+            raise
+        raise ConfigError("FAIL_INPUT_CHANGED", "reviewed local promote context; RETRY replan lessons promote") from exc
+
+
+def plan_local_promote(workspace: Path, control_root: Path | None, candidate_id: str, *,
+                       scope_override: str | None = None, supersedes: str | None = None,
+                       force_new: bool = False, update: str | None = None,
+                       state_root: Path | None = None, config_path: Path | None = None) -> Plan:
+    if sum(value is not None and value is not False for value in (supersedes, force_new, update)) != 1:
+        raise ConfigError("FAIL_PLAN_HASH", "RETRY choose exactly one --update or --force-new")
+    if config_path is not None and state_root is None:
+        configured = load_config(config_path)["state_root"]
+        if not (configured.startswith("<") and configured.endswith(">")):
+            state_root = Path(configured).expanduser()
+    workspace = workspace.resolve()
+    state = _local_state_context(state_root)
+    candidate_path, source, source_kind = _local_candidate_source(workspace, state, candidate_id)
+    item = load_candidate(candidate_path, allow_project=True)
+    requested_scope = scope_override or item["scope_hint"]
+    project_repo: Path | None = None
+    project_id: str | None = None
+    if source_kind == "project" or requested_scope.startswith("project:"):
+        project_repo, project_id = _project_context(workspace)
+    scope, store = _parse_local_scope(requested_scope, project_id)
+    sources = _local_promote_sources(workspace, project_id, state)
+    target, label, prefix = _local_target(sources, scope, store)
+    try:
+        state_relative = target.relative_to(state.state_root) if state is not None else None
+    except ValueError:
+        state_relative = None
+    if state_relative is not None:
+        target = _local_state_file(state, state_relative, "target ledger")
+    else:
+        target = _local_safe_file(target, "target ledger")
+    source_root, target_root = _local_git_root(source), _local_git_root(target)
+    if source_root != target_root:
+        raise ConfigError("FAIL_SCOPE_REPOSITORY",
+                          f"RETRY agent-core lessons capture --scope {scope if scope == 'global' else scope + ':' + store}")
+    if project_repo is not None and project_repo.resolve() != source_root:
+        raise ConfigError("FAIL_SCOPE_REPOSITORY", "RETRY lessons capture in the target repository inbox")
+    repo = source_root
+    control = _local_control_root(config_path, control_root, state_root)
+    update_id = _local_update_pointer(update, scope, store)
+    ledger_text = target.read_text(encoding="utf-8")
+    if update_id is not None:
+        _project_active_target(ledger_text, update_id, project_id or "")
+    prior_result_id = _local_existing_result_id(ledger_text, candidate_id)
+    result_id = update_id or prior_result_id or _next_id(ledger_text, scope, prefix)
+    expected_entry = _local_entry(item, result_id, label, project=scope == "project", supersedes=supersedes)
+    existing = _local_promoted_entry(ledger_text, candidate_id, expected_entry)
+    consumed = source.parent / "consumed" / source.name
+    if state is not None:
+        try:
+            source_relative_state = source.relative_to(state.state_root)
+        except ValueError:
+            source_relative_state = None
+        if source_relative_state is not None:
+            consumed = _safe_state_path(state, source_relative_state.parent / "consumed" / source.name)
+        else:
+            consumed = _resolved_local_path(consumed, "consumed candidate")
+    else:
+        consumed = _resolved_local_path(consumed, "consumed candidate")
+    source_relative = source.relative_to(repo).as_posix(); consumed_relative = consumed.relative_to(repo).as_posix()
+    target_relative = target.relative_to(repo).as_posix()
+    tracked_source = _git(repo, "ls-files", "--error-unmatch", "--", source_relative, check=False).returncode == 0
+    stage_paths = (target_relative, consumed_relative) + ((source_relative,) if tracked_source else ())
+    _assert_project_index_clean(repo, (target, source, consumed))
+    if existing is not None:
+        convergence_advisories = _local_exact_and_advisories(
+            sources, item["rule"], (scope, store), update_id,
+            exclude_pointer=(scope, store, existing))
+        current_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        return _local_plan(candidate_id, repo=repo, candidate_path=candidate_path, source=source, source_kind=source_kind, target=target,
+                           scope=scope, store=store, project_id=project_id, state_root=state_root,
+                           config_path=config_path, control_root=control, item=item, action="converge",
+                           review_choice="update" if update_id else "force-new", update=update_id,
+                           supersedes=supersedes, result_id=existing, canonical_sha256=current_sha256,
+                           expected_postimage_sha256=current_sha256,
+                           source_root=source_root, target_root=target_root, stage_paths=stage_paths,
+                           sources=sources, lines=convergence_advisories, state=state)
+    advisories = _local_exact_and_advisories(sources, item["rule"], (scope, store), update_id)
+    expected_postimage_sha256 = hashlib.sha256(
+        _local_render(ledger_text, item, result_id, label, scope, update_id, supersedes).encode("utf-8")
+    ).hexdigest()
+    return _local_plan(candidate_id, repo=repo, candidate_path=candidate_path, source=source, source_kind=source_kind, target=target,
+                       scope=scope, store=store, project_id=project_id, state_root=state_root,
+                       config_path=config_path, control_root=control, item=item,
+                       action="update" if update_id else "force-new", review_choice="update" if update_id else "force-new",
+                       update=update_id, supersedes=supersedes, result_id=result_id,
+                       canonical_sha256=hashlib.sha256(target.read_bytes()).hexdigest(), source_root=source_root,
+                       expected_postimage_sha256=expected_postimage_sha256, target_root=target_root, stage_paths=stage_paths, sources=sources,
+                       lines=advisories, state=state)
+
+
+def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, plan_hash: str, *,
+                        config_path: Path | None = None) -> ProjectResult:
+    if plan.operation != "lessons-promote" or plan_hash != plan.plan_hash or plan.plan_hash != _canonical_hash(plan.payload):
+        raise ConfigError("FAIL_INPUT_CHANGED", "RETRY replan lessons promote")
+    state_value = plan.payload.get("state_root")
+    state_root = Path(state_value) if isinstance(state_value, str) else None
+    bound_config = Path(plan.payload["config_path"]) if isinstance(plan.payload.get("config_path"), str) else None
+    if bound_config is not None:
+        if config_path is None or config_path.resolve() != bound_config.resolve() or hashlib.sha256(bound_config.read_bytes()).hexdigest() != plan.payload["config_sha256"]:
+            raise ConfigError("FAIL_INPUT_CHANGED", "config; RETRY replan lessons promote")
+    control = _local_control_root(bound_config, control_root, state_root)
+    if str(control) != plan.payload.get("control_root"):
+        raise ConfigError("FAIL_INPUT_CHANGED", "lock identity; RETRY replan lessons promote")
+    with operation_lock(control):
+        reviewed = plan_local_promote(workspace, control, plan.candidate_id,
+                                      scope_override=(plan.payload["target_scope"] if plan.payload["target_scope"] == "global" else f"{plan.payload['target_scope']}:{plan.payload['target_store']}"),
+                                      supersedes=plan.payload.get("supersedes"),
+                                      force_new=plan.payload.get("choice") == "force-new",
+                                      update=(f"{plan.payload['target_scope']}:{plan.payload['target_store']}:{plan.payload['update']}" if plan.payload.get("choice") == "update" else None),
+                                      state_root=state_root, config_path=bound_config)
+        if reviewed.plan_hash != plan.plan_hash:
+            raise ConfigError("FAIL_INPUT_CHANGED", "reviewed facts; RETRY replan lessons promote")
+        payload = reviewed.payload
+        context = _local_context_from_plan(reviewed)
+        repo, source, target, consumed = context.repo, context.source_path, context.target_path, context.consumed_path
+        item = parse_candidate_bytes(context.candidate_raw, reviewed.candidate_id, allow_project=True)
+        # Planning uses TextIO's universal-newline view and the atomic writer
+        # persists LF.  Render from the same logical ledger text while keeping
+        # the raw preimage hash in the reviewed context.
+        target_text = context.target_raw.decode("utf-8", "strict").replace("\r\n", "\n").replace("\r", "\n")
+        if payload["action"] != "converge":
+            if os.path.lexists(consumed):
+                raise ConfigError("FAIL_CANDIDATE_STATE", "consumed candidate; RETRY replan lessons promote")
+            rendered = _local_render(target_text, item, payload["result_id"], ledger.SCOPE_LABEL[payload["target_scope"]],
+                                     payload["target_scope"], payload.get("update"), payload.get("supersedes"))
+            try:
+                _ids, errors, _warnings = ledger.parse_ledger(
+                    rendered, payload["target_scope"], payload["target_path"])
+                if errors:
+                    raise ValueError("rendered ledger validation failed")
+            except ValueError as exc:
+                raise ConfigError("FAIL_LEDGER", "rendered target ledger; RETRY after repairing target ledger") from exc
+            if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != payload["expected_postimage_sha256"]:
+                raise ConfigError("FAIL_INPUT_CHANGED", "expected postimage; RETRY replan lessons promote")
+            _atomic_write_text(target, rendered)
+            _after_local_promote_canonical_write()
+        else:
+            expected = _local_entry(item, payload["result_id"], ledger.SCOPE_LABEL[payload["target_scope"]], project=payload["target_scope"] == "project", supersedes=payload.get("supersedes"))
+            if (hashlib.sha256(context.target_raw).hexdigest() != payload["expected_postimage_sha256"]
+                    or _local_promoted_entry(target_text, plan.candidate_id, expected) != payload["result_id"]):
+                raise ConfigError("FAIL_INPUT_CHANGED", "convergence evidence; RETRY replan lessons promote")
+        if context.candidate_path != consumed:
+            if (not _owned_file_matches(context.candidate_path, context.candidate_token, links=1)
+                    or context.candidate_path.read_bytes() != context.candidate_raw):
+                raise ConfigError("FAIL_INPUT_CHANGED", "candidate identity; RETRY replan lessons promote")
+            if os.path.lexists(consumed):
+                raise ConfigError("FAIL_CANDIDATE_STATE", "consumed candidate; RETRY replan lessons promote")
+            consumed.parent.mkdir(parents=True, exist_ok=True)
+            context.candidate_path.replace(consumed)
+        staged = [payload["target_path"], consumed.relative_to(repo).as_posix()]
+        tracked = _git(repo, "ls-files", "--error-unmatch", "--", payload["source_path"], check=False).returncode == 0
+        if tracked:
+            staged.append(payload["source_path"])
+        if tuple(staged) != tuple(payload["stage_paths"]):
+            raise ConfigError("FAIL_INPUT_CHANGED", "staging paths; RETRY replan lessons promote")
+        _git(repo, "add", "--", *staged)
+        return ProjectResult(payload["result_id"], tuple(staged))
 
 
 def apply_prepared(prepared: Prepared, *, retry_inbox_race: bool = False) -> Result:

@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "z6fKVF3JZZzY0JUxHME0jTz9TGEA_l6KWy1CPIqHNfM",
+  "artifact_sha256": "h6PlezHeuy4LbT56ISJgs1shZgUS3YfFt95Js-6t5n8",
   "files": [
     {
       "path": "LICENSE",
@@ -11,7 +11,7 @@
     },
     {
       "path": "agent_core/__init__.py",
-      "sha256": "mXEg50gMJBrtvqmQJpP5jfHLAxaFa0lVVrcM4k-S9M8"
+      "sha256": "kGn9Cv22Ilr2h0HdpuM4iU3danjnbrM7QEjtOJ_O5J4"
     },
     {
       "path": "agent_core/capture.py",
@@ -71,11 +71,11 @@
     },
     {
       "path": "agent_core/project_promote.py",
-      "sha256": "jwK2mPiE028k5JhUDe6mB_dLmhSCbH-GggCGh3j02z8"
+      "sha256": "xPd8MNfb0yyyrg6kNfWBAudLnG8g3GC-mnO9rUoeUC0"
     },
     {
       "path": "agent_core/promote.py",
-      "sha256": "d9qbGyhjo-lQgYHGoNzJcohncmsOppzJvq9e6Y2v_lE"
+      "sha256": "dIGMUmkkOQOYw9snoEdI-O_365gdeyMtcG0YC_KZSns"
     },
     {
       "path": "agent_core/provenance.py",
@@ -287,5 +287,5 @@
     }
   ],
   "schema": "release-manifest/1",
-  "version": "0.1.0.dev0"
+  "version": "0.1.0.dev2"
 }

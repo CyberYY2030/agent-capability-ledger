@@ -48,8 +48,9 @@ LEGACY_BOUNDARY_SEEDS = {
 }
 
 README_EXCERPT = (
-    "Private state, host bindings, credentials, sessions, caches, and machine-specific "
-    "paths must not enter that export."
+    "A public export checkout is a one-way whitelist export of `engine/`. It is a "
+    "publication artifact, never a runtime dependency, and never receives private state, "
+    "host bindings, credentials, sessions, caches, or machine-specific paths."
 )
 
 NORMAL_CONTENT_SAMPLES = (
@@ -700,7 +701,7 @@ class PreCommitHookTests(unittest.TestCase):
 
 class RuleContractTests(unittest.TestCase):
     def test_default_and_capture_rules_accept_normal_content(self) -> None:
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
         self.assertIn(README_EXCERPT, readme)
         samples = (*NORMAL_CONTENT_SAMPLES, README_EXCERPT)
         rule_sets = {

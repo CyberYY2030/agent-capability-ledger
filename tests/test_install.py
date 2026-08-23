@@ -407,7 +407,7 @@ def test_install_plan_is_zero_write_and_apply_is_idempotent(
     receipt_path = config.parent / "install-receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["schema"] == "install-receipt/1"
-    assert receipt["engine_version"] == "0.1.0.dev0"
+    assert receipt["engine_version"] == "0.1.0.dev2"
     assert (install_root / "engine" / receipt["engine_version"] / "agent_core" / "cli.py").is_file()
     assert (install_root / "bin" / "agent-core.cmd").is_file()
     assert (install_root / "bin" / "agent-core").is_file()
@@ -430,7 +430,7 @@ def test_install_plan_is_zero_write_and_apply_is_idempotent(
 
     launched = launch("--version")
     assert launched.returncode == 0
-    assert launched.stdout.strip() == "0.1.0.dev0"
+    assert launched.stdout.strip() == "0.1.0.dev2"
     checked = launch("check", "--all-profiles")
     assert checked.returncode == 2
     assert checked.stderr.strip() == "FAIL_COMMAND_FROZEN check"
@@ -456,7 +456,7 @@ def test_install_plan_is_zero_write_and_apply_is_idempotent(
         cwd=workspace, check=False, capture_output=True, text=True, encoding="utf-8", env=environment,
     )
     assert shadow_checked.returncode == 0
-    assert shadow_checked.stdout.strip() == "0.1.0.dev0"
+    assert shadow_checked.stdout.strip() == "0.1.0.dev2"
     assert "SHADOW CHECKOUT RAN" not in shadow_checked.stdout + shadow_checked.stderr
     duplicate_state = subprocess.run(
         [
@@ -467,13 +467,13 @@ def test_install_plan_is_zero_write_and_apply_is_idempotent(
     )
     assert duplicate_state.returncode != 0
     assert "FAIL_STATE_ARGUMENT duplicate --state" in duplicate_state.stderr
-    assert not list((install_root / "engine" / "0.1.0.dev0").rglob("__pycache__"))
+    assert not list((install_root / "engine" / "0.1.0.dev2").rglob("__pycache__"))
     second_plan = plan_install(ROOT, config, state, ROOT, manifest)
     second_targets = [line for line in second_plan if line.startswith("TARGET ")]
     assert second_targets and all(" status=identical " in line for line in second_targets)
     assert second_plan[-1] == "DRY_RUN writes=0 ready=true no_changes=true"
     second = apply_install(ROOT, config, state, ROOT, manifest, force=False)
-    assert second == ["PASS install version=0.1.0.dev0 no_changes=true"]
+    assert second == ["PASS install version=0.1.0.dev2 no_changes=true"]
     assert receipt_path.read_bytes() == receipt_before
     after = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert {item["path"]: item["installed_sha256"] for item in after["objects"]} == first_hashes
@@ -510,7 +510,7 @@ def test_install_first_binding_requires_confirmation_and_is_transactional(
     assert applied[-1].startswith("PASS artifact_sha256=")
     assert binding.is_file() and (config.parent / "install-receipt.json").is_file()
     assert apply_install(ROOT, config, state, ROOT, manifest, force=False) == [
-        "PASS install version=0.1.0.dev0 no_changes=true"
+        "PASS install version=0.1.0.dev2 no_changes=true"
     ]
 
 
@@ -828,7 +828,7 @@ def test_receipt_write_failure_rolls_back_pin_and_all_installed_objects(
     with pytest.raises(ConfigError, match="FAIL_INSTALL"):
         apply_install(ROOT, config, state, ROOT, manifest, force=False)
     assert not (install_root / "engine-pin.json").exists()
-    assert not (install_root / "engine" / "0.1.0.dev0").exists()
+    assert not (install_root / "engine" / "0.1.0.dev2").exists()
     assert not (config.parent / "install-receipt.json").exists()
 
 
@@ -836,7 +836,7 @@ def test_existing_version_directory_is_foreign_even_with_force(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
-    version_root = install_root / "engine" / "0.1.0.dev0"
+    version_root = install_root / "engine" / "0.1.0.dev2"
     version_root.mkdir(parents=True)
     (version_root / "foreign.txt").write_text("different artifact", encoding="utf-8")
     with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
@@ -1172,7 +1172,7 @@ def test_foreign_and_indeterminate_targets_coexist_without_writes(
     foreign = runtime / payload["targets"][0]["rules_target"]
     foreign.parent.mkdir(parents=True)
     foreign.write_bytes(b"foreign target\n")
-    wrong_type = install_root / "engine" / "0.1.0.dev0"
+    wrong_type = install_root / "engine" / "0.1.0.dev2"
     wrong_type.parent.mkdir(parents=True)
     wrong_type.write_bytes(b"not a managed directory\n")
     before = {foreign: foreign.read_bytes(), wrong_type: wrong_type.read_bytes()}

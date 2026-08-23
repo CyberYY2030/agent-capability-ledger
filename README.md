@@ -15,7 +15,9 @@ If `python` is unavailable on `PATH`, install Python or set `AGENT_CORE_PYTHON` 
 
 The private Git repository containing `engine/` and `state/` is the only runtime source of truth. Cross-machine synchronization uses ordinary Git operations on that private repository.
 
-The public `CyberYY2030/agent-capability-ledger` repository is a one-way whitelist export of `engine/`. It has passed the public privacy gate, remains a publication artifact, and is never a runtime dependency. Private state, host bindings, credentials, sessions, caches, and machine-specific paths must not enter that export.
+A public export checkout is a one-way whitelist export of `engine/`. It is a
+publication artifact, never a runtime dependency, and never receives private
+state, host bindings, credentials, sessions, caches, or machine-specific paths.
 
 ## V0.1 CLI
 
@@ -41,6 +43,10 @@ $ agent-core lessons match --stage prompt --text '<TASK>' --explain
 ```
 
 The first two lines are the plan/apply phases of the single `install` command, so the user-facing surface remains four commands.
+
+### Lessons promotion
+
+`agent-core lessons promote --id <CANDIDATE>` reviews one local promotion and stops at the worktree/index boundary. Choose exactly one `--force-new` or scoped `--update <scope:store:lesson-id>`; `--scope global`, `--scope profile:<declared>`, and `--scope project:<current-project-id>` select the destination. An explicit same-repository override may move a project candidate into a bound global or declared profile ledger. A cross-repository request writes nothing and directs recapture in the target inbox. The reviewed plan hash binds the candidate, target, selected action, configuration, and exact staged paths. Apply uses the install transaction lock, writes the canonical ledger and consumed candidate only, and never syncs, commits, pushes, fetches, or contacts a remote.
 
 ## Installation preview
 

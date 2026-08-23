@@ -17,7 +17,7 @@ from agent_core.state import apply_attach, apply_init, binding_receipt_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "0.1.0.dev0"
+CURRENT_VERSION = "0.1.0.dev2"
 TARGET_VERSION = "0.2.0"
 TEST_EMAIL = "upgrade" + chr(64) + "invalid"
 
