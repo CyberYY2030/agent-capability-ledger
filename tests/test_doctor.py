@@ -10,6 +10,7 @@ import pytest
 from agent_core import __version__
 from agent_core.config import ConfigError
 from agent_core import doctor as doctor_module
+from agent_core.cli import main as cli_main
 from agent_core.installer import build_release_manifest
 from agent_core.provenance import EngineLayout
 from agent_core.doctor import (
@@ -273,3 +274,104 @@ def test_doctor_standalone_skips_provenance_gate(tmp_path: Path, monkeypatch: py
     )
     with pytest.raises(ConfigError, match="FAIL_CONFIG"):
         doctor_module.run(engine, tmp_path / "missing-host.json", None, None)
+
+
+def test_doctor_duplicate_scan_reports_identity_only_and_writes_nothing(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    global_ledger = state / "experience" / "LESSONS.md"
+    global_ledger.parent.mkdir(parents=True)
+    global_ledger.write_text(
+        "# Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n<!-- lessons-scope: global -->\n"
+        "\n## 活跃\n- **L-1 [pending·通用] Private duplicate body.** 触发:x. 代价:y. sink → z.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    (workspace / ".agents").mkdir(parents=True)
+    git(workspace, "init", "-q")
+    (workspace / ".agents" / "lessons.json").write_text(
+        json.dumps({"schema": "lessons-routing/1", "project_id": "sample-app", "profiles": []}),
+        encoding="utf-8",
+    )
+    (workspace / ".agents" / "LESSONS.md").write_text(
+        "# Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n<!-- lessons-scope: project -->\n"
+        "<!-- lessons-project: sample-app -->\n\n## 活跃\n"
+        "- **[[lesson:SAMPLE-1]] [pending·项目] Private duplicate body.** 触发:x. 代价:y. sink → z.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    before = {path: path.read_bytes() for path in (global_ledger, workspace / ".agents" / "LESSONS.md")}
+    with pytest.raises(ConfigError, match="FAIL_LESSON_DUPLICATE") as caught:
+        doctor_module._lesson_duplicate_line(state, workspace)
+    assert "global:global:L-1" in str(caught.value)
+    assert "project:sample-app:SAMPLE-1" in str(caught.value)
+    assert "Private duplicate body" not in str(caught.value)
+    assert {path: path.read_bytes() for path in before} == before
+
+    (workspace / ".agents" / "LESSONS.md").write_text(
+        (workspace / ".agents" / "LESSONS.md").read_text(encoding="utf-8").replace(
+            "Private duplicate body.", "A distinct project rule.",
+        ), encoding="utf-8",
+    )
+    before = {path: path.read_bytes() for path in before}
+    assert doctor_module._lesson_duplicate_line(state, workspace) == "PASS lesson_duplicates=none"
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_doctor_workspace_cli_reports_duplicates_and_skips_without_state(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    state = tmp_path / "state"
+    global_ledger = state / "experience" / "LESSONS.md"
+    global_ledger.parent.mkdir(parents=True)
+    global_ledger.write_text(
+        "# Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n<!-- lessons-scope: global -->\n"
+        "\n## 活跃\n- **L-1 [pending·通用] Hidden duplicate body.** 触发:x. 代价:y. sink → z.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    (workspace / ".agents").mkdir(parents=True)
+    git(workspace, "init", "-q")
+    (workspace / ".agents" / "lessons.json").write_text(
+        json.dumps({"schema": "lessons-routing/1", "project_id": "sample-app", "profiles": []}),
+        encoding="utf-8",
+    )
+    (workspace / ".agents" / "LESSONS.md").write_text(
+        "# Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n<!-- lessons-scope: project -->\n"
+        "<!-- lessons-project: sample-app -->\n\n## 活跃\n"
+        "- **[[lesson:SAMPLE-1]] [pending·项目] Hidden duplicate body.** 触发:x. 代价:y. sink → z.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "host.json"
+    config.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(doctor_module, "classify_engine_layout", lambda _root: EngineLayout.STANDALONE)
+    monkeypatch.setattr(doctor_module, "assert_repository_separation", lambda *_args: None)
+    monkeypatch.setattr(doctor_module, "assert_remote_role", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(doctor_module, "load_config", lambda _path: {"targets": []})
+    monkeypatch.setattr(doctor_module, "compose_manifests", lambda *_args: SimpleNamespace(composition_hash="synthetic"))
+    monkeypatch.setattr(doctor_module, "assert_capability_sources", lambda *_args: None)
+    monkeypatch.setattr(doctor_module, "is_repository", lambda _path: True)
+    monkeypatch.setattr(doctor_module, "check_remote_parity", lambda *_args: "synthetic")
+    before = {
+        path: path.read_bytes()
+        for path in (global_ledger, workspace / ".agents" / "LESSONS.md")
+    }
+    cached = subprocess.run(
+        ["git", "-C", str(workspace), "diff", "--cached", "--binary"],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout
+    assert cli_main(["doctor", "--config", str(config), "--state", str(state),
+                     "--workspace", str(workspace)]) == 1
+    error = capsys.readouterr().err
+    assert "FAIL_LESSON_DUPLICATE" in error and "global:global:L-1" in error
+    assert "Hidden duplicate body" not in error
+    assert {path: path.read_bytes() for path in before} == before
+    assert subprocess.run(
+        ["git", "-C", str(workspace), "diff", "--cached", "--binary"],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout == cached
+
+    (workspace / ".agents" / "LESSONS.md").write_text(
+        (workspace / ".agents" / "LESSONS.md").read_text(encoding="utf-8").replace(
+            "Hidden duplicate body.", "Different project rule.",
+        ), encoding="utf-8",
+    )
+    assert cli_main(["doctor", "--config", str(config), "--workspace", str(workspace)]) == 0
+    assert "FAIL_LESSON_DUPLICATE" not in capsys.readouterr().err

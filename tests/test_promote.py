@@ -31,6 +31,7 @@ from agent_core.promote import (
 from agent_core.cli import main as cli_main
 from agent_core.freshness import load_candidate
 from agent_core.match import parse_markdown
+from agent_core.project_promote import main as project_promote_main
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -145,6 +146,16 @@ def project_candidate(
         base_revision=f"{head} unverified", inbox_path=repo / PROJECT_INBOX,
         require_state_freshness=False, allow_project=True, when=when,
     ).stem
+
+
+def project_host_config(tmp_path: Path, state_root: Path | str = "<STATE>") -> Path:
+    payload = json.loads(
+        (Path(__file__).resolve().parents[1] / "examples" / "host.example.json").read_text(encoding="utf-8")
+    )
+    payload["state_root"] = str(state_root)
+    path = tmp_path / "host.json"
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return path
 
 
 def test_concurrent_inbox_writers_never_overwrite(tmp_path: Path) -> None:
@@ -491,7 +502,7 @@ def test_project_promote_cli_requires_and_applies_exact_plan_hash(
     repo, control = setup_project(tmp_path)
     item = project_candidate(repo, control, "cli")
     args = ["lessons", "promote", "--workspace", str(repo),
-            "--control-root", str(control), "--id", item]
+            "--control-root", str(control), "--config", str(project_host_config(tmp_path)), "--id", item]
     canonical = repo / PROJECT_LEDGER
     candidate_path = repo / PROJECT_INBOX / f"{item}.md"
     before = {
@@ -515,20 +526,263 @@ def test_project_promote_cli_requires_and_applies_exact_plan_hash(
     assert "PASS project_promoted=SAMPLE-2" in output
 
 
-def test_project_similarity_requires_state_equivalent_decision(tmp_path: Path) -> None:
+def test_project_promote_cli_uses_concrete_config_state_for_cross_scope_conflict(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     repo, control = setup_project(tmp_path)
-    item = project_candidate(repo, control, "similar", rule="Existing project rule")
-    with pytest.raises(ConfigError, match=r"FAIL_SIMILAR_REVIEW SAMPLE-1:1\.000"):
+    _remote, _seed, state, _beta = setup_pair(tmp_path / "state")
+    item = project_candidate(repo, control, "config-cross-scope", rule="Existing rule.")
+    ledger_path = repo / PROJECT_LEDGER
+    source = repo / PROJECT_INBOX / f"{item}.md"
+    before = (ledger_path.read_bytes(), source.read_bytes(),
+              git(repo, "diff", "--cached", "--binary").stdout)
+    assert project_promote_main([
+        "--workspace", str(repo), "--control-root", str(control),
+        "--config", str(project_host_config(tmp_path, state)), "--id", item,
+    ]) == 1
+    assert "FAIL_SCOPE_REVIEW" in capsys.readouterr().err
+    assert (ledger_path.read_bytes(), source.read_bytes(),
+            git(repo, "diff", "--cached", "--binary").stdout) == before
+
+
+def test_project_promote_cli_rejects_concrete_state_without_global_ledger(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo, control = setup_project(tmp_path)
+    item = project_candidate(repo, control, "missing-configured-global")
+    state = tmp_path / "concrete-state"
+    state.mkdir()
+    ledger_path = repo / PROJECT_LEDGER
+    source = repo / PROJECT_INBOX / f"{item}.md"
+    before = (ledger_path.read_bytes(), source.read_bytes(),
+              git(repo, "diff", "--cached", "--binary").stdout)
+    assert project_promote_main([
+        "--workspace", str(repo), "--control-root", str(control),
+        "--config", str(project_host_config(tmp_path, state)), "--id", item,
+    ]) == 1
+    assert "FAIL_LESSON_ROUTING" in capsys.readouterr().err
+    assert (ledger_path.read_bytes(), source.read_bytes(),
+            git(repo, "diff", "--cached", "--binary").stdout) == before
+
+
+def test_project_exact_duplicate_rejects_create_and_force_new_without_writes(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    item = project_candidate(repo, control, "similar", rule="Existing project rule.")
+    before = (repo / PROJECT_LEDGER).read_bytes()
+    with pytest.raises(ConfigError, match=r"FAIL_EXACT_DUPLICATE project:sample-app:SAMPLE-1"):
         plan_project_promote(repo, control, item)
-    plan = plan_project_promote(repo, control, item, supersedes="SAMPLE-1")
-    assert plan.payload["supersedes"] == "SAMPLE-1"
-    assert plan.lines[0] == "SIMILAR SAMPLE-1 1.000"
-    apply_project_promote(repo, control, plan, plan.plan_hash)
+    with pytest.raises(ConfigError, match=r"FAIL_EXACT_DUPLICATE project:sample-app:SAMPLE-1"):
+        plan_project_promote(repo, control, item, force_new=True)
+    assert (repo / PROJECT_LEDGER).read_bytes() == before
+    assert (repo / PROJECT_INBOX / f"{item}.md").is_file()
+
+
+def test_project_exact_rule_is_case_and_punctuation_sensitive_but_nfc_whitespace_exact(
+        tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    for suffix, rule in (("case", "existing project rule."), ("punctuation", "Existing project rule")):
+        item = project_candidate(repo, control, suffix, rule=rule)
+        assert plan_project_promote(repo, control, item).candidate_id == item
+
+    ledger_path = repo / PROJECT_LEDGER
+    ledger_path.write_text(
+        ledger_path.read_text(encoding="utf-8").replace("Existing project rule.", "Å  rule."),
+        encoding="utf-8",
+    )
+    item = project_candidate(repo, control, "nfc-space", rule="A\u030a\t rule.")
+    with pytest.raises(ConfigError, match=r"FAIL_EXACT_DUPLICATE project:sample-app:SAMPLE-1"):
+        plan_project_promote(repo, control, item)
+
+
+def test_project_promote_choice_flags_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit, match="2"):
+        project_promote_main([
+            "--id", "synthetic", "--update", "SAMPLE-1", "--supersedes", "SAMPLE-2",
+        ])
+
+
+def test_project_update_preserves_identity_and_consumes_candidate(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    item = project_candidate(repo, control, "update", rule="Rewritten distinct project rule")
+    before = (repo / PROJECT_LEDGER).read_text(encoding="utf-8")
+    plan = plan_project_promote(repo, control, item, update="SAMPLE-1")
+    assert plan.payload["lesson_id"] == "SAMPLE-1" and plan.payload["update"] == "SAMPLE-1"
+    result = apply_project_promote(repo, control, plan, plan.plan_hash)
+    after = (repo / PROJECT_LEDGER).read_text(encoding="utf-8")
+    assert result.lesson_id == "SAMPLE-1"
+    assert after.count("[[lesson:SAMPLE-1]]") == 1 and "Rewritten distinct project rule" in after
+    assert "Existing project rule" not in after and before.count("[[lesson:SAMPLE-1]]") == 1
+    assert not (repo / PROJECT_INBOX / f"{item}.md").exists()
+    assert (repo / PROJECT_CONSUMED / f"{item}.md").is_file()
+    assert set(git(repo, "diff", "--cached", "--name-only").stdout.splitlines()) == {
+        ".agents/LESSONS.md", f".agents/inbox/consumed/{item}.md",
+    }
+
+
+def test_project_update_rejects_missing_or_archived_target_before_writes(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    item = project_candidate(repo, control, "bad-update")
+    before = (repo / PROJECT_LEDGER).read_bytes()
+    with pytest.raises(ConfigError, match="FAIL_UPDATE_TARGET"):
+        plan_project_promote(repo, control, item, update="SAMPLE-404")
+    assert (repo / PROJECT_LEDGER).read_bytes() == before
+
     text = (repo / PROJECT_LEDGER).read_text(encoding="utf-8")
-    active, archived = text.split("## 归档", 1)
-    assert "[[lesson:SAMPLE-1]]" not in active
-    assert "[[lesson:SAMPLE-1]]" in archived
-    assert "supersedes: SAMPLE-1" in active
+    target = next(line for line in text.splitlines() if "[[lesson:SAMPLE-1]]" in line)
+    active, archived = text.split("\n## 归档\n", 1)
+    (repo / PROJECT_LEDGER).write_text(
+        active.replace(target + "\n", "") + "\n## 归档\n" + target + "\n" + archived,
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="FAIL_UPDATE_TARGET"):
+        plan_project_promote(repo, control, item, update="SAMPLE-1")
+
+
+@pytest.mark.parametrize("involved", ("ledger", "source", "consumed"))
+def test_project_involved_index_conflict_fails_before_write(tmp_path: Path, involved: str) -> None:
+    repo, control = setup_project(tmp_path)
+    item = project_candidate(repo, control, "index-conflict")
+    ledger_path = repo / PROJECT_LEDGER
+    source = repo / PROJECT_INBOX / f"{item}.md"
+    consumed = repo / PROJECT_CONSUMED / source.name
+    source_relative = source.relative_to(repo).as_posix()
+    git(repo, "add", source_relative)
+    git(repo, "commit", "-q", "-m", "track candidate")
+    target = {"ledger": ledger_path, "source": source, "consumed": consumed}[involved]
+    if involved == "ledger":
+        target.write_text(target.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        git(repo, "add", target.relative_to(repo).as_posix())
+    elif involved == "consumed":
+        target.parent.mkdir(parents=True)
+        target.write_text("staged destination\n", encoding="utf-8")
+        git(repo, "add", target.relative_to(repo).as_posix())
+    elif involved == "source":
+        git(repo, "rm", "--cached", "--", source_relative)
+        assert git(repo, "diff", "--cached", "--name-status", "--no-renames", "--", source_relative).stdout.strip() == (
+            f"D\t{source_relative}"
+        )
+    before = (
+        ledger_path.exists(), ledger_path.read_bytes(), source.exists(), source.read_bytes(),
+        consumed.exists(), consumed.read_bytes() if consumed.exists() else None,
+        git(repo, "diff", "--cached", "--binary").stdout,
+    )
+    with pytest.raises(ConfigError, match="FAIL_INDEX_CONFLICT"):
+        plan_project_promote(repo, control, item)
+    assert (
+        ledger_path.exists(), ledger_path.read_bytes(), source.exists(), source.read_bytes(),
+        consumed.exists(), consumed.read_bytes() if consumed.exists() else None,
+        git(repo, "diff", "--cached", "--binary").stdout,
+    ) == before
+
+
+@pytest.mark.parametrize("involved", ("ledger", "source", "consumed"))
+def test_project_apply_rechecks_involved_index_before_any_write(
+        tmp_path: Path, involved: str) -> None:
+    repo, control = setup_project(tmp_path)
+    item = project_candidate(repo, control, "apply-index")
+    source = repo / PROJECT_INBOX / f"{item}.md"
+    source_relative = source.relative_to(repo).as_posix()
+    git(repo, "add", source_relative)
+    git(repo, "commit", "-q", "-m", "track candidate")
+    plan = plan_project_promote(repo, control, item)
+    ledger_path = repo / PROJECT_LEDGER
+    consumed = repo / PROJECT_CONSUMED / source.name
+    target = {"ledger": ledger_path, "source": source, "consumed": consumed}[involved]
+    if involved == "consumed":
+        target.parent.mkdir(parents=True)
+        target.write_text("staged destination\n", encoding="utf-8")
+        git(repo, "add", target.relative_to(repo).as_posix())
+    elif involved == "source":
+        git(repo, "rm", "--cached", "--", source_relative)
+        assert git(repo, "diff", "--cached", "--name-status", "--no-renames", "--", source_relative).stdout.strip() == (
+            f"D\t{source_relative}"
+        )
+    else:
+        target.write_bytes(target.read_bytes() + b"\n")
+        git(repo, "add", target.relative_to(repo).as_posix())
+    before = (ledger_path.exists(), ledger_path.read_bytes(), source.exists(), source.read_bytes(), consumed.exists(),
+              consumed.read_bytes() if consumed.exists() else None,
+              git(repo, "diff", "--cached", "--binary").stdout)
+    with pytest.raises(ConfigError, match="FAIL_INDEX_CONFLICT"):
+        apply_project_promote(repo, control, plan, plan.plan_hash)
+    assert (ledger_path.exists(), ledger_path.read_bytes(), source.exists(), source.read_bytes(), consumed.exists(),
+            consumed.read_bytes() if consumed.exists() else None,
+            git(repo, "diff", "--cached", "--binary").stdout) == before
+
+
+@pytest.mark.parametrize("choice", ({}, {"force_new": True}, {"update": "SAMPLE-1"}))
+def test_project_cross_scope_exact_rule_requires_review(tmp_path: Path, choice: dict[str, object]) -> None:
+    repo, control = setup_project(tmp_path)
+    _remote, _seed, state, _beta = setup_pair(tmp_path / "state")
+    item = project_candidate(repo, control, "cross-scope", rule="Existing rule.")
+    before = (repo / PROJECT_LEDGER).read_bytes()
+    with pytest.raises(ConfigError, match="FAIL_SCOPE_REVIEW"):
+        plan_project_promote(repo, control, item, state_root=state, **choice)
+    assert (repo / PROJECT_LEDGER).read_bytes() == before
+
+
+def test_project_cross_scope_fuzzy_only_is_advisory(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    _remote, _seed, state, _beta = setup_pair(tmp_path / "state")
+    global_ledger = state / "experience" / "LESSONS.md"
+    global_ledger.write_text(
+        global_ledger.read_text(encoding="utf-8").replace("Existing rule.", "alpha beta gamma."),
+        encoding="utf-8",
+    )
+    item = project_candidate(repo, control, "cross-fuzzy", rule="alpha beta gamma delta")
+    plan = plan_project_promote(repo, control, item, state_root=state, force_new=True)
+    assert plan.candidate_id == item
+    assert "SIMILAR scope=global store=global id=L-1 score=0.750" in plan.lines
+
+
+def test_project_create_round_trip_preserves_rule_identity(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    rule = "No terminal punctuation exact identity"
+    first = project_candidate(repo, control, "round-trip-first", rule=rule)
+    plan = plan_project_promote(repo, control, first)
+    apply_project_promote(repo, control, plan, plan.plan_hash)
+    git(repo, "commit", "-q", "-m", "promote no-punctuation rule")
+    assert f"{rule}**" in (repo / PROJECT_LEDGER).read_text(encoding="utf-8")
+
+    second = project_candidate(repo, control, "round-trip-second", rule=rule)
+    with pytest.raises(ConfigError, match="FAIL_EXACT_DUPLICATE"):
+        plan_project_promote(repo, control, second)
+    punctuated = project_candidate(repo, control, "round-trip-punctuation", rule=f"{rule}.")
+    assert plan_project_promote(repo, control, punctuated).candidate_id == punctuated
+
+
+def test_project_update_does_not_exclude_same_id_in_profile_store(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    _remote, _seed, state, _beta = setup_pair(tmp_path / "state")
+    profile = state / "experience" / "profiles" / "sample-app"
+    profile.mkdir(parents=True)
+    (profile / "LESSONS.md").write_text(
+        "# Profile\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: profile -->\n<!-- lessons-profile: sample-app -->\n\n## 活跃\n\n"
+        "- **[[lesson:SAMPLE-1]] [pending·领域] Profile exact rule** 触发: test. "
+        "代价: test. sink → checks/profile.md.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    routing = repo / ".agents" / "lessons.json"
+    payload = json.loads(routing.read_text(encoding="utf-8"))
+    payload["profiles"] = ["sample-app"]
+    routing.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    item = project_candidate(repo, control, "same-id-profile", rule="Profile exact rule")
+    with pytest.raises(ConfigError, match=r"FAIL_SCOPE_REVIEW profile:sample-app:SAMPLE-1"):
+        plan_project_promote(repo, control, item, update="SAMPLE-1", state_root=state)
+
+
+def test_project_update_target_drift_is_rechecked_under_lock(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    item = project_candidate(repo, control, "target-drift")
+    plan = plan_project_promote(repo, control, item, update="SAMPLE-1")
+    ledger_path = repo / PROJECT_LEDGER
+    ledger_path.write_text(
+        ledger_path.read_text(encoding="utf-8").replace("- **[[lesson:SAMPLE-1]]", "- **[[lesson:SAMPLE-1-ARCHIVED]]"),
+        encoding="utf-8",
+    )
+    before = (ledger_path.read_bytes(), (repo / PROJECT_INBOX / f"{item}.md").read_bytes())
+    with pytest.raises(ConfigError, match="FAIL_UPDATE_TARGET"):
+        apply_project_promote(repo, control, plan, plan.plan_hash)
+    assert (ledger_path.read_bytes(), (repo / PROJECT_INBOX / f"{item}.md").read_bytes()) == before
 
 
 def test_project_rejects_superseding_active_but_dissimilar_lesson(tmp_path: Path) -> None:

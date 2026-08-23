@@ -263,10 +263,27 @@ def merge_owned_hooks(
     previous: dict[str, Any] | None,
     *,
     force: bool,
+    adopt_identical: bool = False,
 ) -> tuple[bytes, dict[str, Any], bool]:
     text = original.decode("utf-8") if original is not None else "{}\n"
     root = _root_span(text)
     hooks_member = _member(text, root, "hooks")
+    exact_unowned_adoption = False
+    if previous is None and original is not None and adopt_identical:
+        if hooks_member is not None and text[hooks_member.value_span.start] == "{":
+            exact_unowned_adoption = True
+            for event in ("UserPromptSubmit", "PreToolUse", "Stop"):
+                event_member = _member(text, hooks_member.value_span, event)
+                if event_member is None:
+                    exact_unowned_adoption = False
+                    break
+                values = [
+                    json.loads(text[item.start:item.end])
+                    for item in _array_elements(text, event_member.value_span)
+                ]
+                if values.count(desired[event][0]) != 1:
+                    exact_unowned_adoption = False
+                    break
     hooks_created = hooks_member is None if previous is None else bool(previous.get("hooks_created"))
     if hooks_member is None:
         text = _append_member(text, root, "hooks", {})
@@ -297,7 +314,7 @@ def merge_owned_hooks(
             values = [json.loads(text[item.start:item.end]) for item in elements]
             if old is None:
                 matches = [index for index, value in enumerate(values) if value == desired_group]
-                if matches and not force:
+                if matches and not (force or exact_unowned_adoption):
                     raise ConfigError("INSTALL_CONFLICT", f"equivalent unowned hook group: {event}")
                 if matches:
                     index = matches[0]

@@ -13,7 +13,8 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -28,6 +29,8 @@ from .runtime_config import (
     runtime_config_path,
     runtime_hook_path,
 )
+from .promote import operation_lock
+from . import state as state_module
 from .state import BindingEvidence, binding_receipt_path, validate_state_binding
 from .sync import collect_operations
 
@@ -35,7 +38,10 @@ from .sync import collect_operations
 RELEASE_SCHEMA = "release-manifest/1"
 RECEIPT_SCHEMA = "install-receipt/1"
 SNAPSHOT_SCHEMA = "install-snapshot/1"
+PENDING_SCHEMA = "install-pending/1"
 PIN_SCHEMA = "engine-pin/1"
+INSTALL_PLAN_SCHEMA = "install-plan/1"
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 PAYLOAD_DIRS = ("agent_core", "enforcement", "examples", "runtimes", "seed", "skills", "templates")
 PAYLOAD_FILES = (
     "LICENSE", "NOTICE", "install.ps1", "install.sh", "manifest.yaml", "privacy_rules.default.json",
@@ -82,6 +88,17 @@ class InstallPlan:
     objects: tuple[ManagedObject, ...]
     hook_bindings: tuple[RuntimeBinding, ...]
     binding: BindingEvidence
+    binding_pending: bool = False
+    confirm_private_remote: bool = False
+    binding_config_preimage_sha256: str | None = None
+    binding_receipt_preimage_sha256: str | None = None
+    binding_receipt_preimage_exists: bool = False
+    artifact_manifest_path: Path | None = None
+    plan_hash: str = ""
+    object_preimages: tuple[str | None, ...] = ()
+    hook_preimages: tuple[str | None, ...] = ()
+    receipt_preimage_sha256: str | None = None
+    receipt_preimage_exists: bool = False
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -94,6 +111,27 @@ def _sha256(content: bytes) -> str:
 
 def _sha256_b64(content: bytes) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode("ascii").rstrip("=")
+
+
+def _canonical_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
+
+
+def _raw_file_sha256(path: Path) -> tuple[bool, str | None]:
+    """Return an ordinary file's immutable reviewed fact without following aliases."""
+    junction = getattr(path, "is_junction", None)
+    if not os.path.lexists(path):
+        return False, None
+    if path.is_symlink() or (callable(junction) and junction()) or not path.is_file():
+        raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed file identity changed")
+    try:
+        return True, _sha256(path.read_bytes())
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed file is unreadable") from exc
 
 
 def _load_json(path: Path, code: str) -> dict[str, Any]:
@@ -277,8 +315,104 @@ def _atomic_write(path: Path, content: bytes, *, executable: bool = False) -> No
         if executable:
             temporary.chmod(temporary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         os.replace(temporary, path)
+        _flush_parent(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _flush_parent(path: Path) -> None:
+    """Durably publish metadata where the platform exposes directory fsync."""
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError as exc:
+        raise ConfigError("FAIL_INSTALL_SNAPSHOT", "snapshot parent is unavailable") from exc
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise ConfigError("FAIL_INSTALL_SNAPSHOT", "snapshot parent cannot be flushed") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _flush_file(path: Path) -> None:
+    try:
+        with path.open("r+b") as stream:
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise ConfigError("FAIL_INSTALL_SNAPSHOT", "snapshot material cannot be flushed") from exc
+
+
+def _move_no_replace(source: Path, destination: Path) -> None:
+    """Move a staged or detached object without ever replacing a recreated path."""
+    if os.path.lexists(destination):
+        raise ConfigError("FAIL_INSTALL_RACE", "destination was recreated during install")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if os.name == "nt":
+            # Windows rename refuses an existing destination; no REPLACE_EXISTING flag is used.
+            os.rename(source, destination)
+        elif source.is_file():
+            # A hard-link publication is exclusive on POSIX; directory replacement is not.
+            os.link(source, destination)
+            source.unlink()
+        else:
+            raise ConfigError("FAIL_INSTALL_RACE", "no-replace directory placement is unavailable")
+    except FileExistsError as exc:
+        raise ConfigError("FAIL_INSTALL_RACE", "destination was recreated during install") from exc
+    except OSError as exc:
+        raise ConfigError("FAIL_INSTALL_RACE", "no-replace placement failed") from exc
+
+
+def _detach_owned(
+    path: Path,
+    root: Path,
+    kind: str,
+    expected: str | None,
+    snapshot: Path,
+    key: str,
+) -> Path | None:
+    """Detach only a reviewed managed pre-image into this invocation's durable area."""
+    _assert_within(path, root)
+    current = _path_hash(path, kind)
+    if current != expected:
+        raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed target changed before detach")
+    if expected is None:
+        return None
+    detached = snapshot / "detached" / key
+    _move_no_replace(path, detached)
+    if _path_hash(detached, kind) != expected:
+        try:
+            _move_no_replace(detached, path)
+        except ConfigError:
+            pass
+        raise ConfigError("FAIL_INSTALL_RACE", "detached pre-image differs from reviewed plan")
+    _flush_snapshot_material(detached, kind)
+    return detached
+
+
+def _stage_bytes(snapshot: Path, key: str, content: bytes, *, executable: bool = False) -> Path:
+    staged = snapshot / "staged" / key
+    _atomic_write(staged, content, executable=executable)
+    return staged
+
+
+def _replace_owned_bytes(
+    path: Path,
+    root: Path,
+    expected: str | None,
+    desired: bytes,
+    snapshot: Path,
+    key: str,
+    *,
+    executable: bool = False,
+) -> None:
+    staged = _stage_bytes(snapshot, key, desired, executable=executable)
+    _detach_owned(path, root, "file", expected, snapshot, key)
+    _move_no_replace(staged, path)
+    if _path_hash(path, "file") != _sha256(desired):
+        raise ConfigError("FAIL_INSTALL_RACE", "placed target differs from reviewed desired bytes")
 
 
 def _user_data_root() -> Path:
@@ -291,25 +425,77 @@ def _user_data_root() -> Path:
     return (Path(value).expanduser().resolve() if value else Path.home() / ".local" / "share") / "agent-core"
 
 
+def _prospective_binding(
+    config_path: Path,
+    explicit_state: Path,
+    config: dict[str, Any],
+    receipt_path: Path,
+) -> tuple[dict[str, Any], Path, BindingEvidence, str, str | None, bool]:
+    context, _old_config, config_bytes, lock_bytes, remote_hash, remote_sha, root_sha, provenance_sha = state_module._validate_attach(
+        explicit_state, config_path, confirm_private_remote=True,
+    )
+    config["state_root"] = str(context.state_root)
+    rendered = _json_bytes(config)
+    payload: dict[str, Any] = {
+        "schema": state_module.BINDING_SCHEMA_V2 if context.layout == "canonical" else state_module.BINDING_SCHEMA_V1,
+        "state_root": str(context.state_root), "remote_name": "origin",
+        "remote_url_sha256": remote_hash, "remote_revision": remote_sha,
+        "state_lock_sha256": _sha256(lock_bytes), "config_sha256": _sha256(rendered),
+        "confirmed_private_remote": True,
+    }
+    if context.layout == "canonical":
+        payload["repository_root_sha"] = root_sha
+        payload["engine_provenance_sha256"] = provenance_sha
+    raw = _json_bytes(payload)
+    receipt_exists, receipt_sha256 = _raw_file_sha256(receipt_path)
+    return config, context.state_root, BindingEvidence(
+        context.layout, payload["schema"], receipt_path, _sha256(raw), context.state_root,
+        remote_hash, remote_sha, root_sha, provenance_sha, _sha256(rendered), _sha256(lock_bytes),
+    ), _sha256(config_bytes), receipt_sha256, receipt_exists
+
+
 def _binding(
     config_path: Path,
     explicit_state: Path | None,
     *,
     receipt_override: bytes | None = None,
-) -> tuple[dict[str, Any], Path, BindingEvidence]:
+    confirm_private_remote: bool = False,
+) -> tuple[dict[str, Any], Path, BindingEvidence, bool, str | None, str | None, bool]:
     config_path = config_path.resolve()
     config = load_config(config_path)
     configured = config["state_root"]
+    receipt_path = binding_receipt_path(config_path)
+    if not receipt_path.is_file():
+        if not confirm_private_remote:
+            raise ConfigError("PRIVATE_REMOTE_CONFIRMATION_REQUIRED", "install first binding requires confirmation")
+        if explicit_state is None:
+            raise ConfigError("FAIL_STATE_UNBOUND", "install first binding requires --state")
+        config, state_root, evidence, config_sha256, receipt_sha256, receipt_exists = _prospective_binding(
+            config_path, explicit_state, config, receipt_path,
+        )
+        return config, state_root, evidence, True, config_sha256, receipt_sha256, receipt_exists
     if configured.startswith("<") and configured.endswith(">"):
-        raise ConfigError("FAIL_STATE_UNBOUND", "install requires state attach first")
+        raise ConfigError("FAIL_STATE_UNBOUND", "attached binding requires concrete state_root")
     configured_root = Path(configured).expanduser().resolve()
     state_root = (explicit_state or configured_root).expanduser().resolve()
     if state_root != configured_root:
         raise ConfigError("FAIL_STATE_BINDING", "explicit state differs from the attached state_root")
-    evidence = validate_state_binding(
-        state_root, config_path, receipt_bytes=receipt_override, require_clean_snapshot=True,
-    )
-    return config, evidence.state_root, evidence
+    try:
+        evidence = validate_state_binding(
+            state_root, config_path, receipt_bytes=receipt_override, require_clean_snapshot=True,
+        )
+    except ConfigError as exc:
+        if exc.code != "FAIL_STATE_BINDING" or not confirm_private_remote:
+            raise
+        if explicit_state is None:
+            raise ConfigError("FAIL_STATE_UNBOUND", "binding reacceptance requires --state") from None
+        if explicit_state.expanduser().resolve() != configured_root:
+            raise ConfigError("FAIL_STATE_BINDING", "explicit state differs from the attached state_root") from None
+        config, state_root, evidence, config_sha256, receipt_sha256, receipt_exists = _prospective_binding(
+            config_path, state_root, config, receipt_path,
+        )
+        return config, state_root, evidence, True, config_sha256, receipt_sha256, receipt_exists
+    return config, evidence.state_root, evidence, False, None, None, False
 
 
 def _wrapper_content() -> tuple[bytes, bytes]:
@@ -348,14 +534,16 @@ def _build_plan(
     *,
     expected_version: str | None = None,
     binding_receipt_override: bytes | None = None,
+    confirm_private_remote: bool = False,
 ) -> InstallPlan:
     source_root = source_root.resolve()
     manifest_path = (manifest_path or source_root / "release-manifest.json").resolve()
     artifact = verify_release_manifest(
         source_root, manifest_path, expected_version=expected_version,
     )
-    config, state_root, binding = _binding(
+    config, state_root, binding, binding_pending, binding_config_preimage_sha256, binding_receipt_preimage_sha256, binding_receipt_preimage_exists = _binding(
         config_path, explicit_state, receipt_override=binding_receipt_override,
+        confirm_private_remote=confirm_private_remote,
     )
     lock = _load_json(state_root / "agent-core.lock.json", "FAIL_STATE_LOCK")
     if lock.get("engine_version") != artifact.version:
@@ -423,6 +611,8 @@ def _build_plan(
     return InstallPlan(
         config_path.resolve(), config, state_root, source_root, artifact, install_root,
         engine_destination, receipt_path, tuple(objects), tuple(hook_bindings), binding,
+        binding_pending, confirm_private_remote, binding_config_preimage_sha256,
+        binding_receipt_preimage_sha256, binding_receipt_preimage_exists, manifest_path,
     )
 
 
@@ -440,6 +630,15 @@ def _load_receipt(path: Path, *, required: bool = False) -> dict[str, Any] | Non
         raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt fields mismatch")
     if not isinstance(payload.get("objects"), list) or not isinstance(payload.get("hook_bindings"), list):
         raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt collections must be lists")
+    if (
+        not isinstance(payload.get("engine_version"), str)
+        or not isinstance(payload.get("artifact_sha256"), str)
+        or not _is_sha256(payload.get("config_sha256"))
+        or not _is_sha256(payload.get("state_lock_sha256"))
+        or not isinstance(payload.get("snapshot_path"), str)
+        or not Path(payload["snapshot_path"]).is_absolute()
+    ):
+        raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt header is invalid")
     return payload
 
 
@@ -467,9 +666,8 @@ def _receipt_objects(receipt: dict[str, Any] | None) -> dict[str, dict[str, Any]
         if item.get("kind") not in {"file", "dir"} or not isinstance(item.get("before_exists"), bool):
             raise ConfigError("FAIL_INSTALL_RECEIPT", f"invalid managed type: {path}")
         if (
-            not isinstance(item.get("installed_sha256"), str)
-            or len(item["installed_sha256"]) != 64
-            or (before_hash is not None and (not isinstance(before_hash, str) or len(before_hash) != 64))
+            not _is_sha256(item.get("installed_sha256"))
+            or (before_hash is not None and not _is_sha256(before_hash))
         ):
             raise ConfigError("FAIL_INSTALL_RECEIPT", f"invalid managed hash: {path}")
         if item["before_exists"] != (before_hash is not None):
@@ -479,6 +677,10 @@ def _receipt_objects(receipt: dict[str, Any] | None) -> dict[str, dict[str, Any]
             or Path(snapshot_rel).is_absolute() or ".." in Path(snapshot_rel).parts
         ):
             raise ConfigError("FAIL_INSTALL_RECEIPT", f"invalid snapshot path: {path}")
+        try:
+            _assert_within(Path(path), Path(root))
+        except (ConfigError, OSError, ValueError) as exc:
+            raise ConfigError("FAIL_INSTALL_RECEIPT", "managed path is outside its root") from exc
         result[path.casefold()] = item
     return result
 
@@ -532,14 +734,17 @@ def _receipt_hook_bindings(receipt: dict[str, Any] | None) -> dict[str, dict[str
             or not isinstance(root, str) or not Path(root).is_absolute()
             or not isinstance(item.get("before_exists"), bool)
             or item["before_exists"] != (before_hash is not None)
-            or (before_hash is not None and (not isinstance(before_hash, str) or len(before_hash) != 64))
-            or not isinstance(item.get("installed_sha256"), str)
-            or len(item["installed_sha256"]) != 64
+            or (before_hash is not None and not _is_sha256(before_hash))
+            or not _is_sha256(item.get("installed_sha256"))
             or not isinstance(snapshot_rel, str) or not snapshot_rel
             or Path(snapshot_rel).is_absolute() or ".." in Path(snapshot_rel).parts
             or not valid_groups
         ):
             raise ConfigError("FAIL_INSTALL_RECEIPT", f"invalid hook binding: {target_id!r}")
+        try:
+            _assert_within(Path(path), Path(root))
+        except (ConfigError, OSError, ValueError) as exc:
+            raise ConfigError("FAIL_INSTALL_RECEIPT", "hook path is outside its root") from exc
         result[target_id] = item
     return result
 
@@ -579,9 +784,12 @@ def _prepare_hook_bindings(
         ):
             raise ConfigError("FAIL_INSTALL_RECEIPT", f"runtime hook identity differs: {binding.target_id}")
         try:
+            # Public install deliberately has no force path: every pre-existing
+            # unmanaged hook conflict remains a whole-plan zero-write conflict.
+            _ = force
             merged, ownership, item_changed = merge_owned_hooks(
                 current, binding.desired, old.get("ownership") if old else None,
-                force=force,
+                force=False, adopt_identical=old is None and current is not None,
             )
         except ConfigError as exc:
             if exc.code != "INSTALL_CONFLICT":
@@ -592,7 +800,15 @@ def _prepare_hook_bindings(
             conflicts.append(label)
             continue
         changed = changed or item_changed
-        status = "identical" if current is not None and _sha256(current) == _sha256(merged) else "missing"
+        adopt_identical = (
+            old is None
+            and current is not None
+            and not item_changed
+            and current == merged
+        )
+        status = "adopt-identical" if adopt_identical else (
+            "identical" if current is not None and _sha256(current) == _sha256(merged) else "missing"
+        )
         statuses.append((f"runtime-config:{binding.target_id}", binding.path, status))
         records.append({
             "target_id": binding.target_id,
@@ -604,10 +820,34 @@ def _prepare_hook_bindings(
             "installed_sha256": _sha256(merged),
             "snapshot_rel": f"hook-bindings/{index}",
             "ownership": ownership,
+            "adopt_identical": adopt_identical,
             "content": merged,
             "before_content": current,
         })
     return records, changed, statuses, conflicts
+
+
+def _validate_receipt_identity(plan: InstallPlan, previous: dict[str, Any] | None, objects: dict[str, dict[str, Any]]) -> None:
+    """A malformed or redirected receipt is indeterminate, never overwrite authority."""
+    if previous is None:
+        return
+    if not isinstance(previous["engine_version"], str):
+        raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt engine version is invalid")
+    expected = {str(item.path).casefold(): item for item in plan.objects}
+    for key, recorded in objects.items():
+        current = expected.get(key)
+        if current is None:
+            # Historic engine versions are the one deliberate managed retirement.
+            if Path(recorded["path"]).parent == plan.install_root / "engine":
+                continue
+            raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt has an unexpected managed path")
+        if (
+            recorded["label"] != current.label
+            or recorded["kind"] != current.kind
+            or Path(recorded["root"]).resolve() != current.root.resolve()
+            or Path(recorded["path"]).resolve() != current.path.resolve()
+        ):
+            raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt managed identity differs from current plan")
 
 
 def _classify_install(
@@ -616,8 +856,13 @@ def _classify_install(
     dict[str, Any] | None, bool, list[dict[str, Any]],
     list[tuple[str, Path, str]], list[str],
 ]:
-    previous = _load_receipt(plan.receipt_path)
-    previous_objects = _receipt_objects(previous)
+    try:
+        previous = _load_receipt(plan.receipt_path)
+        previous_objects = _receipt_objects(previous)
+        _validate_receipt_identity(plan, previous, previous_objects)
+    except ConfigError:
+        statuses = [(item.label, item.path, "indeterminate") for item in plan.objects]
+        return None, False, [], statuses, [item.label for item in plan.objects]
     expected_keys = {str(item.path).casefold() for item in plan.objects}
     if previous is not None:
         retired = set(previous_objects) - expected_keys
@@ -631,18 +876,26 @@ def _classify_install(
     statuses: list[tuple[str, Path, str]] = []
     conflicts: list[str] = []
     for item in plan.objects:
-        current = _path_hash(item.path, item.kind)
+        try:
+            current = _path_hash(item.path, item.kind)
+        except ConfigError:
+            statuses.append((item.label, item.path, "indeterminate"))
+            conflicts.append(item.label)
+            continue
         old = previous_objects.get(str(item.path).casefold())
         if current == item.installed_sha256:
             status = "identical"
         elif current is None:
-            status = "missing"
-        elif force:
-            if item.kind == "dir":
-                raise ConfigError("FAIL_IMMUTABLE_ARTIFACT", str(item.path))
-            status = "missing"
+            status = "absent"
+        elif (
+            old is not None
+            and old["kind"] == item.kind
+            and Path(old["path"]).resolve() == item.path.resolve()
+            and old["installed_sha256"] == current
+        ):
+            status = "managed-update"
         else:
-            status = "conflict"
+            status = "foreign"
             conflicts.append(item.label)
         statuses.append((item.label, item.path, status))
         no_changes = no_changes and status == "identical"
@@ -654,7 +907,13 @@ def _classify_install(
     hook_bindings, hooks_changed, hook_statuses, hook_conflicts = _prepare_hook_bindings(
         plan, previous, force=force,
     )
-    statuses.extend(hook_statuses)
+    for label, path, status in hook_statuses:
+        if status == "conflict":
+            statuses.append((label, path, "foreign"))
+        elif status == "missing":
+            statuses.append((label, path, "absent" if not path.exists() else "managed-update"))
+        else:
+            statuses.append((label, path, status))
     conflicts.extend(hook_conflicts)
     no_changes = no_changes and not hooks_changed
     return previous, no_changes, hook_bindings, statuses, conflicts
@@ -671,6 +930,139 @@ def _preflight(
     return previous, no_changes, hook_bindings
 
 
+def _reviewed_install_plan(
+    plan: InstallPlan,
+) -> tuple[InstallPlan, dict[str, Any] | None, bool, list[dict[str, Any]], list[tuple[str, Path, str]], list[str]]:
+    """Freeze every fact that gives install authority; callers never print payload."""
+    previous, no_changes, hook_bindings, statuses, conflicts = _classify_install(plan, force=False)
+    object_preimages: list[str | None] = []
+    for item in plan.objects:
+        try:
+            object_preimages.append(_path_hash(item.path, item.kind))
+        except ConfigError:
+            object_preimages.append(None)
+    hook_preimages: list[str | None] = []
+    for binding in plan.hook_bindings:
+        try:
+            exists, digest = _raw_file_sha256(binding.path)
+            hook_preimages.append(digest if exists else None)
+        except ConfigError:
+            hook_preimages.append(None)
+    try:
+        receipt_exists, receipt_sha256 = _raw_file_sha256(plan.receipt_path)
+    except ConfigError:
+        receipt_exists, receipt_sha256 = True, None
+        conflicts.append("install-receipt")
+    try:
+        config_exists, config_sha256 = _raw_file_sha256(plan.config_path)
+        manifest_exists, manifest_sha256 = _raw_file_sha256(plan.artifact_manifest_path or (plan.source_root / "release-manifest.json"))
+    except ConfigError:
+        config_exists = manifest_exists = False
+        config_sha256 = manifest_sha256 = None
+        conflicts.append("reviewed-input")
+    ownership = [
+        _sha256(_canonical_bytes(item["ownership"]))
+        for item in hook_bindings
+    ]
+    payload = {
+        "schema": INSTALL_PLAN_SCHEMA,
+        "config_sha256": config_sha256 if config_exists else None,
+        "state_identity_sha256": _sha256(str(plan.state_root.resolve()).encode("utf-8")),
+        "binding": {
+            "layout": plan.binding.layout,
+            "schema": plan.binding.schema,
+            "receipt_sha256": plan.binding.receipt_sha256,
+            "remote_url_sha256": plan.binding.remote_url_sha256,
+            "remote_revision": plan.binding.remote_revision,
+            "repository_root_sha": plan.binding.repository_root_sha,
+            "engine_provenance_sha256": plan.binding.engine_provenance_sha256,
+            "config_sha256": plan.binding.config_sha256,
+            "state_lock_sha256": plan.binding.state_lock_sha256,
+        },
+        "binding_pending": plan.binding_pending,
+        "binding_refresh": {
+            "config_preimage_sha256": plan.binding_config_preimage_sha256,
+            "receipt_preimage_exists": plan.binding_receipt_preimage_exists,
+            "receipt_preimage_sha256": plan.binding_receipt_preimage_sha256,
+        },
+        "manifest_sha256": manifest_sha256 if manifest_exists else None,
+        "artifact": {"version": plan.artifact.version, "sha256": plan.artifact.artifact_sha256},
+        "receipt": {"exists": receipt_exists, "sha256": receipt_sha256},
+        "objects": [
+            {
+                "label": item.label,
+                "path_identity_sha256": _sha256(str(item.path.resolve()).encode("utf-8")),
+                "kind": item.kind,
+                "desired_sha256": item.installed_sha256,
+                "current_sha256": current,
+            }
+            for item, current in zip(plan.objects, object_preimages)
+        ],
+        "hooks": [
+            {
+                "target_id": binding.target_id,
+                "path_identity_sha256": _sha256(str(binding.path.resolve()).encode("utf-8")),
+                "current_sha256": current,
+                "desired_sha256": hook_bindings[index]["installed_sha256"] if index < len(hook_bindings) else None,
+                "ownership_sha256": ownership[index] if index < len(ownership) else None,
+                "adopt_identical": hook_bindings[index]["adopt_identical"] if index < len(hook_bindings) else None,
+            }
+            for index, (binding, current) in enumerate(zip(plan.hook_bindings, hook_preimages))
+        ],
+    }
+    token = _sha256(_canonical_bytes(payload))
+    reviewed = replace(
+        plan, plan_hash=token, object_preimages=tuple(object_preimages),
+        hook_preimages=tuple(hook_preimages), receipt_preimage_sha256=receipt_sha256,
+        receipt_preimage_exists=receipt_exists,
+    )
+    return reviewed, previous, no_changes, hook_bindings, statuses, conflicts
+
+
+def _assert_reviewed_plan_current(plan: InstallPlan) -> tuple[InstallPlan, dict[str, Any] | None, bool, list[dict[str, Any]]]:
+    reviewed, previous, no_changes, hook_bindings, _statuses, conflicts = _reviewed_install_plan(plan)
+    if plan.plan_hash and reviewed.plan_hash != plan.plan_hash:
+        raise ConfigError("FAIL_PLAN_HASH", "install inputs changed after reviewed plan")
+    if conflicts:
+        raise ConfigError("INSTALL_CONFLICT", "install plan ready=false")
+    return reviewed, previous, no_changes, hook_bindings
+
+
+def _assert_pending_binding_current(plan: InstallPlan) -> None:
+    """Rebuild the prospective attach evidence before any install-side write."""
+    if not plan.binding_pending:
+        return
+    config, state_root, binding, pending, config_sha256, receipt_sha256, receipt_exists = _binding(
+        plan.config_path, plan.state_root, confirm_private_remote=plan.confirm_private_remote,
+    )
+    if (
+        not pending or state_root != plan.state_root or config != plan.config or binding != plan.binding
+        or config_sha256 != plan.binding_config_preimage_sha256
+        or receipt_exists != plan.binding_receipt_preimage_exists
+        or receipt_sha256 != plan.binding_receipt_preimage_sha256
+    ):
+        raise ConfigError("FAIL_STATE_BINDING", "binding changed after install plan")
+
+
+def _assert_object_preimage(plan: InstallPlan, index: int) -> None:
+    item = plan.objects[index]
+    if index >= len(plan.object_preimages) or _path_hash(item.path, item.kind) != plan.object_preimages[index]:
+        raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed target changed before replacement")
+
+
+def _assert_hook_preimage(plan: InstallPlan, index: int, path: Path) -> None:
+    exists, digest = _raw_file_sha256(path)
+    current = digest if exists else None
+    if index >= len(plan.hook_preimages) or current != plan.hook_preimages[index]:
+        raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed hook changed before replacement")
+
+
+def _assert_receipt_preimage(plan: InstallPlan) -> None:
+    exists, digest = _raw_file_sha256(plan.receipt_path)
+    if exists != plan.receipt_preimage_exists or digest != plan.receipt_preimage_sha256:
+        raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed install receipt changed before publication")
+
+
 def plan_install(
     engine_root: Path,
     config_path: Path,
@@ -680,21 +1072,32 @@ def plan_install(
     *,
     expected_version: str | None = None,
     binding_receipt_override: bytes | None = None,
+    confirm_private_remote: bool = False,
 ) -> list[str]:
+    pending = _read_pending(config_path)
+    if pending is not None:
+        raise ConfigError(
+            "FAIL_INSTALL_RECOVERY",
+            f"inspect and clear pending install marker before replanning: {pending}",
+        )
     plan = _build_plan(
         engine_root, config_path, explicit_state, source_root, manifest_path,
         expected_version=expected_version,
         binding_receipt_override=binding_receipt_override,
+        confirm_private_remote=confirm_private_remote,
     )
-    _previous, no_changes, _hook_bindings, statuses, conflicts = _classify_install(
-        plan, force=False,
-    )
+    plan, _previous, no_changes, _hook_bindings, statuses, conflicts = _reviewed_install_plan(plan)
     lines = [
         f"PLAN operation=install version={plan.artifact.version}",
         f"PLAN artifact_sha256={plan.artifact.artifact_sha256}",
     ]
+    if plan.binding_pending:
+        lines.append("BINDING_REFRESH pending=true")
     for label, path, status in statuses:
         lines.append(f"TARGET {label} status={status} path={path}")
+    if not conflicts:
+        lines.append(f"EXPECTED_REMOTE_SHA {plan.binding.remote_revision}")
+        lines.append(f"PLAN_HASH {plan.plan_hash}")
     lines.append(
         f"DRY_RUN writes=0 ready={'false' if conflicts else 'true'} "
         f"no_changes={'true' if no_changes else 'false'}"
@@ -723,6 +1126,8 @@ def _snapshot(
     plan: InstallPlan,
     previous: dict[str, Any] | None,
     hook_bindings: list[dict[str, Any]],
+    *,
+    host_paths: tuple[Path, ...] = (),
 ) -> tuple[Path, list[dict[str, Any]], list[dict[str, Any]]]:
     snapshot = plan.config_path.parent / "rollback" / f"install-{uuid.uuid4().hex}"
     _assert_within(snapshot, plan.config_path.parent)
@@ -731,9 +1136,14 @@ def _snapshot(
     try:
         for index, item in enumerate(plan.objects):
             current = _path_hash(item.path, item.kind)
+            if index >= len(plan.object_preimages) or current != plan.object_preimages[index]:
+                raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed target changed during snapshot")
             relative = f"objects/{index}"
             if current is not None:
                 _copy_path(item.path, snapshot / relative, item.kind)
+                _flush_snapshot_material(snapshot / relative, item.kind)
+                if _path_hash(item.path, item.kind) != plan.object_preimages[index]:
+                    raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed target changed during snapshot copy")
             records.append({
                 "label": item.label,
                 "path": str(item.path),
@@ -745,19 +1155,51 @@ def _snapshot(
                 "snapshot_rel": relative,
             })
         binding_records: list[dict[str, Any]] = []
-        for item in hook_bindings:
-            record = {key: value for key, value in item.items() if key not in {"content", "before_content"}}
+        for index, item in enumerate(hook_bindings):
+            record = {
+                key: value for key, value in item.items()
+                if key not in {"content", "before_content", "adopt_identical"}
+            }
             before = item["before_content"]
+            expected = plan.hook_preimages[index] if index < len(plan.hook_preimages) else None
+            actual = _sha256(before) if before is not None else None
+            if actual != expected:
+                raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed hook changed during snapshot")
             if before is not None:
                 destination = snapshot / item["snapshot_rel"]
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(before)
+                _flush_file(destination)
+                _flush_parent(destination.parent)
+                exists, digest = _raw_file_sha256(Path(item["path"]))
+                if not exists or digest != expected:
+                    raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed hook changed during snapshot copy")
             binding_records.append(record)
-        if previous is not None:
-            (snapshot / "previous-receipt.json").write_bytes(_json_bytes(previous))
+        host_records: list[dict[str, Any]] = []
+        for index, path in enumerate(host_paths):
+            _assert_within(path, plan.config_path.parent)
+            exists, digest = _raw_file_sha256(path)
+            relative = f"host/{index}"
+            if exists:
+                destination = snapshot / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(path.read_bytes())
+                _flush_file(destination)
+                _flush_parent(destination.parent)
+            host_records.append({
+                "path": str(path), "before_exists": exists, "before_sha256": digest,
+                "snapshot_rel": relative,
+            })
+        if previous is not None and not host_paths:
+            previous_receipt = snapshot / "previous-receipt.json"
+            previous_receipt.write_bytes(_json_bytes(previous))
+            _flush_file(previous_receipt)
+            _flush_parent(previous_receipt.parent)
         _atomic_write(snapshot / "snapshot.json", _json_bytes({
             "schema": SNAPSHOT_SCHEMA, "objects": records, "hook_bindings": binding_records,
+            "host_records": host_records,
         }))
+        _flush_parent(snapshot)
         return snapshot, records, binding_records
     except Exception:
         if snapshot.exists():
@@ -773,9 +1215,16 @@ def _restore(snapshot: Path, records: list[dict[str, Any]]) -> None:
         root = Path(record["root"])
         kind = record["kind"]
         _assert_within(path, root)
-        _remove_path(path, kind)
+        current = _path_hash(path, kind)
+        if current == record["before_sha256"]:
+            continue
+        if current not in {None, record["installed_sha256"]}:
+            # A non-cooperating writer won the race. Preserve both its bytes and our snapshot.
+            continue
+        if current is not None:
+            _remove_path(path, kind)
         if record["before_exists"]:
-            _copy_path(snapshot / record["snapshot_rel"], path, kind)
+            _restore_material_no_replace(snapshot / record["snapshot_rel"], path, kind)
         actual = _path_hash(path, kind)
         if actual != record["before_sha256"]:
             raise ConfigError("FAIL_INSTALL_ROLLBACK", str(path))
@@ -788,16 +1237,120 @@ def _restore_hook_bindings(snapshot: Path, records: list[dict[str, Any]]) -> Non
         path = Path(record["path"])
         root = Path(record["root"])
         _assert_within(path, root)
+        current = _path_hash(path, "file")
+        if current == record["before_sha256"]:
+            continue
+        if current not in {None, record["installed_sha256"]}:
+            continue
         if record["before_exists"]:
-            _atomic_write(path, (snapshot / record["snapshot_rel"]).read_bytes())
+            if current is not None:
+                path.unlink()
+            _restore_material_no_replace(snapshot / record["snapshot_rel"], path, "file")
         else:
-            path.unlink(missing_ok=True)
+            if current is not None:
+                path.unlink()
         actual = _sha256(path.read_bytes()) if path.is_file() else None
         if actual != record["before_sha256"]:
             raise ConfigError("FAIL_INSTALL_ROLLBACK", str(path))
 
 
-def _install_engine(plan: InstallPlan) -> None:
+def _restore_material_no_replace(source: Path, destination: Path, kind: str) -> None:
+    if os.path.lexists(destination):
+        raise ConfigError("FAIL_INSTALL_RACE", "destination was recreated during rollback")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.parent / f".agent-core-restore-{uuid.uuid4().hex}"
+    try:
+        _copy_path(source, staging, kind)
+        _move_no_replace(staging, destination)
+    finally:
+        if os.path.lexists(staging):
+            _remove_path(staging, kind)
+
+
+def _snapshot_host_records(snapshot: Path) -> list[dict[str, Any]]:
+    manifest = _load_json(snapshot / "snapshot.json", "FAIL_INSTALL_SNAPSHOT")
+    records = manifest.get("host_records", [])
+    if not isinstance(records, list):
+        raise ConfigError("FAIL_INSTALL_SNAPSHOT", "host pre-image records are invalid")
+    for item in records:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"path", "before_exists", "before_sha256", "snapshot_rel"}
+            or not isinstance(item["path"], str) or not Path(item["path"]).is_absolute()
+            or not isinstance(item["before_exists"], bool)
+            or item["before_exists"] != (item["before_sha256"] is not None)
+            or (item["before_sha256"] is not None and not _is_sha256(item["before_sha256"]))
+            or not isinstance(item["snapshot_rel"], str) or Path(item["snapshot_rel"]).is_absolute()
+            or ".." in Path(item["snapshot_rel"]).parts
+        ):
+            raise ConfigError("FAIL_INSTALL_SNAPSHOT", "host pre-image record is invalid")
+    return records
+
+
+def _rollback_host_records(snapshot: Path, host_root: Path) -> None:
+    for record in reversed(_snapshot_host_records(snapshot)):
+        path = Path(record["path"])
+        try:
+            _assert_within(path, host_root)
+        except (ConfigError, OSError, ValueError) as exc:
+            raise ConfigError("FAIL_INSTALL_RECOVERY", "host pre-image path is invalid") from exc
+        if record["before_exists"]:
+            content = (snapshot / record["snapshot_rel"]).read_bytes()
+            if _sha256(content) != record["before_sha256"]:
+                raise ConfigError("FAIL_INSTALL_ROLLBACK", "host pre-image hash differs")
+            _atomic_write(path, content)
+        else:
+            path.unlink(missing_ok=True)
+        exists, digest = _raw_file_sha256(path)
+        if exists != record["before_exists"] or digest != record["before_sha256"]:
+            raise ConfigError("FAIL_INSTALL_ROLLBACK", "host pre-image restore differs")
+
+
+def _pending_path(config_path: Path) -> Path:
+    return config_path.resolve().parent / "install-pending.json"
+
+
+def _read_pending(config_path: Path) -> Path | None:
+    """Read only the host-local diagnostic marker; never trust its snapshot to write."""
+    path = _pending_path(config_path)
+    exists, _digest = _raw_file_sha256(path)
+    if not exists:
+        return None
+    payload = _load_json(path, "FAIL_INSTALL_RECOVERY")
+    if set(payload) != {"schema", "snapshot_id", "snapshot_sha256"} or payload.get("schema") != PENDING_SCHEMA:
+        raise ConfigError("FAIL_INSTALL_RECOVERY", "pending install marker is invalid")
+    snapshot_id = payload.get("snapshot_id")
+    snapshot_sha256 = payload.get("snapshot_sha256")
+    if not isinstance(snapshot_id, str) or not re.fullmatch(r"install-[0-9a-f]{32}", snapshot_id) or not _is_sha256(snapshot_sha256):
+        raise ConfigError("FAIL_INSTALL_RECOVERY", "pending install marker identity is invalid")
+    return path
+
+
+def _write_pending(config_path: Path, snapshot: Path) -> None:
+    pending = _pending_path(config_path)
+    if os.path.lexists(pending):
+        raise ConfigError("FAIL_INSTALL_RECOVERY", "install recovery marker already exists")
+    exists, digest = _raw_file_sha256(snapshot / "snapshot.json")
+    if not exists or digest is None:
+        raise ConfigError("FAIL_INSTALL_SNAPSHOT", "snapshot manifest is unavailable")
+    _atomic_write(pending, _json_bytes({
+        "schema": PENDING_SCHEMA, "snapshot_id": snapshot.name, "snapshot_sha256": digest,
+    }))
+
+
+def _flush_snapshot_material(path: Path, kind: str) -> None:
+    if kind == "file":
+        _flush_file(path)
+        _flush_parent(path.parent)
+        return
+    for item in path.rglob("*"):
+        if item.is_file():
+            _flush_file(item)
+    _flush_parent(path)
+
+
+def _install_engine(plan: InstallPlan, snapshot: Path) -> None:
+    _assert_object_preimage(plan, 0)
     if _path_hash(plan.engine_root, "dir") == _installed_tree_hash(plan.artifact):
         return
     plan.engine_root.parent.mkdir(parents=True, exist_ok=True)
@@ -811,7 +1364,11 @@ def _install_engine(plan: InstallPlan) -> None:
         (staging / "release-manifest.json").write_bytes(plan.artifact.manifest_bytes)
         if _path_hash(staging, "dir") != _installed_tree_hash(plan.artifact):
             raise ConfigError("FAIL_ARTIFACT_HASH", "installed staging tree differs")
-        os.replace(staging, plan.engine_root)
+        _detach_owned(
+            plan.engine_root, plan.install_root, "dir", plan.object_preimages[0], snapshot,
+            "object-0",
+        )
+        _move_no_replace(staging, plan.engine_root)
     finally:
         if staging.exists():
             shutil.rmtree(staging)
@@ -887,6 +1444,32 @@ def _verify_installed(
             )
 
 
+def _install_control_root(config_path: Path) -> Path:
+    return config_path.resolve().parent / "txn"
+
+
+def _assert_adopted_hooks_current(plan: InstallPlan, hook_bindings: list[dict[str, Any]]) -> None:
+    """Reprove exact unowned hook adoption immediately before receipt publication."""
+    for index, item in enumerate(hook_bindings):
+        if not item["adopt_identical"]:
+            continue
+        path = Path(item["path"])
+        exists, digest = _raw_file_sha256(path)
+        if (
+            not exists
+            or digest != plan.hook_preimages[index]
+            or digest != item["installed_sha256"]
+        ):
+            raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed adopted hook changed before receipt")
+        current = path.read_bytes()
+        merged, ownership, changed = merge_owned_hooks(
+            current, plan.hook_bindings[index].desired, None,
+            force=False, adopt_identical=True,
+        )
+        if changed or merged != current or ownership != item["ownership"]:
+            raise ConfigError("FAIL_INSTALL_DRIFT", "reviewed adopted hook no longer matches desired result")
+
+
 def apply_install(
     engine_root: Path,
     config_path: Path,
@@ -896,49 +1479,138 @@ def apply_install(
     *,
     force: bool,
     expected_version: str | None = None,
+    confirm_private_remote: bool = False,
+    plan_hash: str | None = None,
+    already_locked: bool = False,
 ) -> list[str]:
+    """Apply under the shared host lock unless an explicit internal owner holds it."""
+    if already_locked:
+        return _apply_install_locked(
+            engine_root, config_path, explicit_state, source_root, manifest_path,
+            force=force, expected_version=expected_version,
+            confirm_private_remote=confirm_private_remote, plan_hash=plan_hash,
+        )
+    with operation_lock(_install_control_root(config_path)):
+        return _apply_install_locked(
+            engine_root, config_path, explicit_state, source_root, manifest_path,
+            force=force, expected_version=expected_version,
+            confirm_private_remote=confirm_private_remote, plan_hash=plan_hash,
+        )
+
+
+def _apply_install_locked(
+    engine_root: Path,
+    config_path: Path,
+    explicit_state: Path | None,
+    source_root: Path,
+    manifest_path: Path | None,
+    *,
+    force: bool,
+    expected_version: str | None,
+    confirm_private_remote: bool,
+    plan_hash: str | None,
+) -> list[str]:
+    pending = _read_pending(config_path)
+    if pending is not None:
+        raise ConfigError(
+            "FAIL_INSTALL_RECOVERY",
+            f"inspect and clear pending install marker before replanning: {pending}",
+        )
     plan = _build_plan(
         engine_root, config_path, explicit_state, source_root, manifest_path,
         expected_version=expected_version,
+        confirm_private_remote=confirm_private_remote,
     )
+    plan, _previous, _no_changes, _hooks, _statuses, _conflicts = _reviewed_install_plan(plan)
+    if plan_hash is not None and plan_hash != plan.plan_hash:
+        raise ConfigError("FAIL_PLAN_HASH", "install plan hash differs from reviewed plan")
     return _apply_install_plan(plan, force=force)
 
 
 def _apply_install_plan(plan: InstallPlan, *, force: bool) -> list[str]:
-    binding = validate_state_binding(
-        plan.state_root,
-        plan.config_path,
-        require_clean_snapshot=False,
-        require_remote_observation=False,
-        expected_remote_revision=plan.binding.remote_revision,
-    )
-    if binding != plan.binding:
-        raise ConfigError("FAIL_STATE_BINDING", "binding changed after install plan")
-    previous, no_changes, hook_bindings = _preflight(plan, force=force)
+    if plan.artifact_manifest_path is not None:
+        current_artifact = verify_release_manifest(
+            plan.source_root,
+            plan.artifact_manifest_path,
+            expected_version=plan.artifact.version,
+        )
+        if current_artifact != plan.artifact:
+            raise ConfigError("FAIL_ARTIFACT_HASH", "install artifact changed after install plan")
+    if not plan.binding_pending:
+        binding = validate_state_binding(
+            plan.state_root,
+            plan.config_path,
+            require_clean_snapshot=False,
+            require_remote_observation=False,
+            expected_remote_revision=plan.binding.remote_revision,
+        )
+        if binding != plan.binding:
+            raise ConfigError("FAIL_STATE_BINDING", "binding changed after install plan")
+    _assert_pending_binding_current(plan)
+    plan, previous, no_changes, hook_bindings = _assert_reviewed_plan_current(plan)
     if no_changes:
         return [f"PASS install version={plan.artifact.version} no_changes=true"]
     require_fresh(plan.state_root, "sync", plan.config_path.parent / "txn")
-    snapshot, records, binding_records = _snapshot(plan, previous, hook_bindings)
+    _assert_pending_binding_current(plan)
+    plan, previous, no_changes, hook_bindings = _assert_reviewed_plan_current(plan)
+    if no_changes:
+        return [f"PASS install version={plan.artifact.version} no_changes=true"]
+    host_paths = ()
+    if plan.binding_pending:
+        host_paths = (
+            plan.config_path,
+            binding_receipt_path(plan.config_path),
+            plan.config_path.parent / "remote-state.json",
+            plan.receipt_path,
+        )
+    snapshot, records, binding_records = _snapshot(
+        plan, previous, hook_bindings, host_paths=host_paths,
+    )
+    _write_pending(plan.config_path, snapshot)
     try:
-        _install_engine(plan)
-        for item in plan.objects:
+        if plan.binding_pending:
+            state_module.apply_attach(
+                plan.state_root, plan.config_path,
+                confirm_private_remote=plan.confirm_private_remote,
+            )
+            binding = validate_state_binding(
+                plan.state_root, plan.config_path,
+                require_clean_snapshot=False,
+                require_remote_observation=False,
+                expected_remote_revision=plan.binding.remote_revision,
+            )
+            if binding != plan.binding:
+                raise ConfigError("FAIL_STATE_BINDING", "binding changed after install plan")
+        _install_engine(plan, snapshot)
+        for index, item in enumerate(plan.objects):
             if item.kind != "file" or item.label == "pin":
                 continue
+            _assert_object_preimage(plan, index)
             if _path_hash(item.path, item.kind) == item.installed_sha256:
                 continue
-            _assert_within(item.path, item.root)
-            _atomic_write(
-                item.path, item.content or b"", executable=item.label == "wrapper-posix",
+            _replace_owned_bytes(
+                item.path, item.root, plan.object_preimages[index], item.content or b"", snapshot,
+                f"object-{index}", executable=item.label == "wrapper-posix",
             )
-        for item in hook_bindings:
+        for index, item in enumerate(hook_bindings):
+            _assert_hook_preimage(plan, index, Path(item["path"]))
             if item["before_sha256"] == item["installed_sha256"]:
                 continue
-            _atomic_write(Path(item["path"]), item["content"])
+            _replace_owned_bytes(
+                Path(item["path"]), Path(item["root"]), plan.hook_preimages[index], item["content"],
+                snapshot, f"hook-{index}",
+            )
         _verify_installed(plan, hook_bindings, include_launcher=False)
         pin = next(item for item in plan.objects if item.label == "pin")
+        _assert_object_preimage(plan, plan.objects.index(pin))
         if _path_hash(pin.path, pin.kind) != pin.installed_sha256:
-            _atomic_write(pin.path, pin.content or b"")
+            pin_index = plan.objects.index(pin)
+            _replace_owned_bytes(
+                pin.path, pin.root, plan.object_preimages[pin_index], pin.content or b"", snapshot,
+                f"object-{pin_index}",
+            )
         _verify_installed(plan, hook_bindings, include_launcher=True)
+        _assert_adopted_hooks_current(plan, hook_bindings)
         receipt = {
             "schema": RECEIPT_SCHEMA,
             "engine_version": plan.artifact.version,
@@ -949,7 +1621,12 @@ def _apply_install_plan(plan: InstallPlan, *, force: bool) -> list[str]:
             "objects": records,
             "hook_bindings": binding_records,
         }
-        _atomic_write(plan.receipt_path, _json_bytes(receipt))
+        _assert_receipt_preimage(plan)
+        _replace_owned_bytes(
+            plan.receipt_path, plan.config_path.parent, plan.receipt_preimage_sha256,
+            _json_bytes(receipt), snapshot, "install-receipt",
+        )
+        _pending_path(plan.config_path).unlink()
     except Exception as exc:
         try:
             _restore_hook_bindings(snapshot, binding_records)
@@ -958,7 +1635,11 @@ def _apply_install_plan(plan: InstallPlan, *, force: bool) -> list[str]:
                 plan.receipt_path.unlink(missing_ok=True)
             else:
                 _atomic_write(plan.receipt_path, _json_bytes(previous))
-            shutil.rmtree(snapshot)
+            if plan.binding_pending:
+                _rollback_host_records(snapshot, plan.config_path.parent)
+            if not (isinstance(exc, ConfigError) and exc.code == "FAIL_INSTALL_RACE"):
+                _pending_path(plan.config_path).unlink(missing_ok=True)
+                shutil.rmtree(snapshot)
             for directory in (
                 plan.install_root / "bin", plan.install_root / "engine", plan.install_root,
             ):
@@ -966,6 +1647,10 @@ def _apply_install_plan(plan: InstallPlan, *, force: bool) -> list[str]:
                     directory.rmdir()
         except Exception as rollback_exc:
             raise ConfigError("FAIL_INSTALL_ROLLBACK", str(rollback_exc)) from rollback_exc
+        if isinstance(exc, ConfigError) and exc.code == "FAIL_INSTALL_RACE":
+            raise ConfigError(
+                "FAIL_INSTALL_RACE", f"raced bytes preserved; detached pre-image retained at {snapshot}",
+            ) from None
         if isinstance(exc, ConfigError):
             raise
         raise ConfigError("FAIL_INSTALL", str(exc)) from exc
@@ -1030,7 +1715,7 @@ def _uninstall_plan(
         raise ConfigError("FAIL_INSTALL_RECEIPT", f"missing snapshot: {snapshot}")
     snapshot_manifest = _load_json(snapshot / "snapshot.json", "FAIL_INSTALL_RECEIPT")
     if (
-        set(snapshot_manifest) != {"schema", "objects", "hook_bindings"}
+        set(snapshot_manifest) not in ({"schema", "objects", "hook_bindings"}, {"schema", "objects", "hook_bindings", "host_records"})
         or snapshot_manifest.get("schema") != SNAPSHOT_SCHEMA
         or snapshot_manifest.get("objects") != receipt["objects"]
         or snapshot_manifest.get("hook_bindings") != receipt["hook_bindings"]
@@ -1091,7 +1776,9 @@ def _parser(engine_root: Path) -> argparse.ArgumentParser:
     install.add_argument("--state", type=Path)
     install.add_argument("--source", type=Path, default=engine_root)
     install.add_argument("--artifact-manifest", type=Path)
+    install.add_argument("--confirm-private-remote", action="store_true")
     install.add_argument("--apply", action="store_true")
+    install.add_argument("--plan-hash")
     uninstall = commands.add_parser("uninstall")
     uninstall.add_argument("--config", type=Path, required=True)
     uninstall.add_argument("--apply", action="store_true")
@@ -1106,11 +1793,17 @@ def main(
     args = _parser(root).parse_args(list(sys.argv[1:] if argv is None else argv))
     try:
         if args.command == "install":
+            if args.plan_hash and not args.apply:
+                raise ConfigError("FAIL_PLAN_HASH", "install plan hash requires --apply")
+            if args.apply and not args.plan_hash:
+                raise ConfigError("FAIL_PLAN_HASH", "install --apply requires a reviewed plan hash")
             lines = apply_install(
                 root, args.config, args.state, args.source, args.artifact_manifest,
-                force=False,
+                force=False, confirm_private_remote=args.confirm_private_remote,
+                plan_hash=args.plan_hash,
             ) if args.apply else plan_install(
                 root, args.config, args.state, args.source, args.artifact_manifest,
+                confirm_private_remote=args.confirm_private_remote,
             )
         else:
             lines = apply_uninstall(args.config) if args.apply else plan_uninstall(args.config)

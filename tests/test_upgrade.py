@@ -107,7 +107,8 @@ def _fixture(
     git(state, "push", "-q", "origin", "main")
     target, manifest = _target_source(tmp_path, monkeypatch)
     install_root = tmp_path / "local-data" / "agent-core"
-    return state, config, target, manifest, install_root, tmp_path / "control"
+    # Historical callers may pass the host control directory; upgrade normalizes it to txn/.
+    return state, config, target, manifest, install_root, config.parent
 
 
 def _snapshot(root: Path) -> dict[str, tuple[bytes, int]]:
@@ -158,6 +159,27 @@ def test_upgrade_plan_is_zero_write_and_apply_keeps_old_engine(
     assert not git(state, "status", "--porcelain").stdout.strip()
 
 
+def test_upgrade_passes_explicit_lock_ownership_to_install_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, target, manifest, _install_root, _control = _fixture(tmp_path, monkeypatch)
+    plan = upgrade.plan_upgrade(ROOT, state, config, target, manifest, TARGET_VERSION)
+    control = config.parent / "txn"
+    calls: list[bool] = []
+    real_apply = upgrade.apply_install
+
+    def inspect_apply(*args, **kwargs):
+        calls.append(kwargs.get("already_locked", False))
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(upgrade, "apply_install", inspect_apply)
+    result = upgrade.apply_upgrade(
+        ROOT, state, config, target, manifest, TARGET_VERSION, control, plan.plan_hash,
+    )
+    assert result[0] == f"APPLIED engine-upgrade to={TARGET_VERSION}"
+    assert calls == [True]
+
+
 def test_upgrade_rejects_stale_plan_after_valid_artifact_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -185,7 +207,7 @@ def test_upgrade_restores_binding_when_installer_fails(
         "install": _content_snapshot(install_root),
         "runtimes": _content_snapshot(tmp_path / "runtimes"),
     }
-    with operation_lock(control):
+    with operation_lock(control / "txn"):
         with pytest.raises(ConfigError, match="FAIL_LOCKED"):
             upgrade.apply_upgrade(
                 ROOT, state, config, target, manifest, TARGET_VERSION, control, plan.plan_hash,
@@ -214,7 +236,38 @@ def test_upgrade_restores_binding_when_installer_fails(
     }
 
 
-def test_launcher_allows_only_upgrade_across_pin_lock_mismatch(
+def test_upgrade_rejects_unrelated_control_root_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, target, manifest, install_root, _control = _fixture(tmp_path, monkeypatch)
+    plan = upgrade.plan_upgrade(ROOT, state, config, target, manifest, TARGET_VERSION)
+    unrelated = tmp_path / "unrelated-control"
+    receipt_path = binding_receipt_path(config)
+    install_lock = config.parent / "txn"
+
+    before = {
+        "state": _content_snapshot(state),
+        "host": _content_snapshot(config.parent),
+        "install": _content_snapshot(install_root),
+        "runtimes": _content_snapshot(tmp_path / "runtimes"),
+        "binding": receipt_path.read_bytes(),
+    }
+    with operation_lock(install_lock):
+        with pytest.raises(ConfigError, match="FAIL_LOCKED"):
+            upgrade.apply_upgrade(
+                ROOT, state, config, target, manifest, TARGET_VERSION, unrelated, plan.plan_hash,
+            )
+    assert before == {
+        "state": _content_snapshot(state),
+        "host": _content_snapshot(config.parent),
+        "install": _content_snapshot(install_root),
+        "runtimes": _content_snapshot(tmp_path / "runtimes"),
+        "binding": receipt_path.read_bytes(),
+    }
+    assert not unrelated.exists()
+
+
+def test_launcher_rejects_frozen_upgrade_across_pin_lock_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, target, manifest, install_root, control = _fixture(tmp_path, monkeypatch)
@@ -230,25 +283,12 @@ def test_launcher_allows_only_upgrade_across_pin_lock_mismatch(
 
     blocked = launch("--version")
     assert blocked.returncode != 0 and "FAIL_ENGINE_PIN" in blocked.stderr
-    confused = launch(
-        "engine", "upgrade", "--state", str(tmp_path / "different-state"),
-        "--config", str(config), "--source", str(target), "--to", TARGET_VERSION,
-    )
-    assert confused.returncode != 0 and "FAIL_STATE_ARGUMENT" in confused.stderr
-    planned = launch(
+    frozen = launch(
         "engine", "upgrade", "--config", str(config), "--source", str(target),
         "--manifest", str(manifest), "--to", TARGET_VERSION, "--control-root", str(control),
     )
-    assert planned.returncode == 0, planned.stderr
-    plan_hash = next(line.split(" ", 1)[1] for line in planned.stdout.splitlines() if line.startswith("PLAN_HASH "))
-    applied = launch(
-        "engine", "upgrade", "--config", str(config), "--source", str(target),
-        "--manifest", str(manifest), "--to", TARGET_VERSION, "--control-root", str(control),
-        "--apply", "--plan-hash", plan_hash,
-    )
-    assert applied.returncode == 0, applied.stderr
-    version = launch("--version")
-    assert version.returncode == 0 and version.stdout.strip() == TARGET_VERSION
+    assert frozen.returncode != 0 and "FAIL_COMMAND_FROZEN engine upgrade" in frozen.stderr
+    assert launch("--version").returncode != 0
 
 
 def test_upgrade_rejects_manifest_source_version_mismatch_before_write(

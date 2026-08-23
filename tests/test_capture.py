@@ -131,7 +131,7 @@ def test_project_auto_captures_in_dirty_workspace_without_state_freshness(
     monkeypatch.setattr("agent_core.capture.subprocess.run", no_fetch)
     assert cli_main(["lessons", "capture", *argv(config, workspace, rule="当项目捕获失败，先检查项目台账")]) == 0
     output = capsys.readouterr().out
-    assert "SIMILAR SAMPLE-1 1.000" in output
+    assert "SIMILAR scope=project store=sample-project id=SAMPLE-1 score=1.000" in output
     candidates = list((workspace / ".agents" / "inbox").glob("*.md"))
     assert len(candidates) == 1
     payload = load_candidate(candidates[0], allow_project=True)
@@ -142,6 +142,63 @@ def test_project_auto_captures_in_dirty_workspace_without_state_freshness(
     assert str(tmp_path) not in candidates[0].read_text(encoding="utf-8")
     assert hashlib.sha256(canonical.read_bytes()).hexdigest() == canonical_hash
     assert git(workspace, "diff", "--cached", "--name-only").stdout == ""
+
+
+def test_project_capture_uses_all_resolved_lessons_stores(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = project_repo(tmp_path)
+    state = state_repo(tmp_path)
+    (state / "experience" / "LESSONS.md").write_text(
+        "# Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: global -->\n\n## 活跃\n\n"
+        "- **L-1 [pending·通用] 当项目捕获失败，先检查项目台账.** "
+        "触发: test. 代价: test. sink → checks/test.md.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    profile = state / "experience" / "profiles" / "example-domain"
+    profile.mkdir(parents=True)
+    (profile / "LESSONS.md").write_text(
+        "# Profile\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: profile -->\n<!-- lessons-profile: example-domain -->\n\n## 活跃\n\n"
+        "- **[[lesson:EXAMPLE-1]] [pending·领域] 当项目捕获失败，先检查项目台账.** "
+        "触发: test. 代价: test. sink → checks/test.md.\n\n## 归档\n",
+        encoding="utf-8",
+    )
+    routing = workspace / ".agents" / "lessons.json"
+    payload = json.loads(routing.read_text(encoding="utf-8"))
+    payload["profiles"] = ["example-domain"]
+    routing.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    config = config_file(tmp_path, state)
+    assert capture.main(argv(config, workspace)) == 0
+    output = capsys.readouterr().out
+    assert "SIMILAR scope=global store=global id=L-1 score=" in output
+    assert "SIMILAR scope=profile store=example-domain id=EXAMPLE-1 score=" in output
+    assert "SIMILAR scope=project store=sample-project id=SAMPLE-1 score=" in output
+
+
+@pytest.mark.parametrize("failure", ("missing-profile", "unreadable-profile"))
+def test_project_capture_resolves_all_sources_before_creating_candidate(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str], failure: str) -> None:
+    workspace = project_repo(tmp_path)
+    state = state_repo(tmp_path)
+    routing = workspace / ".agents" / "lessons.json"
+    payload = json.loads(routing.read_text(encoding="utf-8"))
+    payload["profiles"] = ["example-domain"]
+    routing.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    if failure == "unreadable-profile":
+        profile = state / "experience" / "profiles" / "example-domain"
+        profile.mkdir(parents=True)
+        (profile / "LESSONS.md").write_bytes(b"\xff")
+    config = config_file(tmp_path, state)
+    inbox = workspace / ".agents" / "inbox"
+    before_status = git(workspace, "status", "--short").stdout
+    before_cached = git(workspace, "diff", "--cached", "--binary").stdout
+    assert cli_main(["lessons", "capture", *argv(config, workspace)]) == 1
+    assert "FAIL_LESSON_ROUTING" in capsys.readouterr().err
+    assert not inbox.exists()
+    assert git(workspace, "status", "--short").stdout == before_status
+    assert git(workspace, "diff", "--cached", "--binary").stdout == before_cached
 
 
 @pytest.mark.parametrize("field", ["rule", "trigger", "cost", "sink", "evidence"])

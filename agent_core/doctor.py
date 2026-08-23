@@ -12,8 +12,9 @@ import sys
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from . import ledger
 from .config import ConfigError, assert_capability_sources, compose_manifests, load_config
-from .freshness import is_repository, record_remote_head, require_fresh
+from .freshness import is_repository, require_fresh
 from .privacy import DEFAULT_MAX_BLOB_BYTES, SENSITIVE_IDENTITY_RULES, scan_trees
 from .provenance import EngineLayout, classify_engine_layout, validate_engine_provenance
 from .runtime_config import runtime_hook_path
@@ -33,6 +34,34 @@ STATE_ENGINE_SIGNATURES = (
     ("seed", "CASE_LAW.md"),
 )
 STATE_ALLOWED_SIGNATURES = {("enforcement", "verifiers.json")}
+
+
+def _lesson_duplicate_line(state_root: Path | None, workspace: Path | None) -> str | None:
+    """Read-only exact duplicate debt report for stores applicable to a workspace."""
+    if state_root is None:
+        return None
+    global_ledger = state_root.resolve() / "experience" / "LESSONS.md"
+    if not global_ledger.is_file():
+        return None
+    sources, errors, _warnings = ledger.resolve_sources(
+        str(global_ledger), str((workspace or Path.cwd()).resolve()),
+    )
+    if errors:
+        raise ConfigError("FAIL_LESSON_DUPLICATE", "source resolution")
+    try:
+        active = ledger.active_lessons(sources)
+    except ValueError as exc:
+        raise ConfigError("FAIL_LESSON_DUPLICATE", "source read") from exc
+    grouped: dict[str, list[ledger.ActiveLesson]] = {}
+    for entry in active:
+        grouped.setdefault(entry.normalized_rule, []).append(entry)
+    duplicates = [entries for entries in grouped.values() if len(entries) > 1]
+    if duplicates:
+        pointers = []
+        for entries in duplicates:
+            pointers.extend(f"{item.scope}:{item.store}:{item.lesson_id}" for item in entries)
+        raise ConfigError("FAIL_LESSON_DUPLICATE", ",".join(sorted(pointers)))
+    return "PASS lesson_duplicates=none"
 
 
 def _installed_artifact_line(engine_root: Path, config_path: Path) -> str | None:
@@ -140,7 +169,7 @@ def hook_retrieval_status(script: Path) -> tuple[str, str]:
 
 
 def check_remote_parity(state_root: Path, control_root: Path | None = None) -> str:
-    """Fetch and prove that a versioned state checkout matches origin/main."""
+    """Read and prove that a versioned state checkout matches origin/main."""
     root = control_root or Path.home() / ".agent-core"
     try:
         state = require_fresh(state_root, "doctor", root)
@@ -149,7 +178,6 @@ def check_remote_parity(state_root: Path, control_root: Path | None = None) -> s
             raise
         raise ConfigError("FAIL_REMOTE_PARITY", str(exc)) from exc
     remote = state.remote or ""
-    record_remote_head(root, remote)
     return remote
 
 
@@ -290,7 +318,7 @@ def assert_repository_separation(engine_root: Path, state_root: Path | None) -> 
 
 
 def run(engine_root: Path, config_path: Path, state_root: Path | None, state_manifest: Path | None,
-        *, require_versioned: bool = False) -> list[str]:
+        *, require_versioned: bool = False, workspace: Path | None = None) -> list[str]:
     provenance = None
     installed_line = _installed_artifact_line(engine_root, config_path)
     if installed_line is None:
@@ -321,6 +349,9 @@ def run(engine_root: Path, config_path: Path, state_root: Path | None, state_man
     if installed_line is not None:
         lines.append(installed_line)
     lines.extend(remote_role_lines)
+    duplicate_line = _lesson_duplicate_line(state_root, workspace)
+    if duplicate_line is not None:
+        lines.append(duplicate_line)
     if state_root is not None and is_repository(state_root):
         remote = check_remote_parity(state_root)
         lines.append(f"PASS git_remote_parity={remote}")

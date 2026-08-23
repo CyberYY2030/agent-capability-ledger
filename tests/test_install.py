@@ -4,7 +4,10 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -85,6 +88,100 @@ def installed_fixture(
         encoding="utf-8",
     )
     return state, config, manifest, tmp_path / "local-data" / "agent-core"
+
+
+def canonical_installed_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, Path, Path, Path]:
+    """Create a private canonical clone with a valid v2 binding and install receipt."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-data"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    source = tmp_path / "canonical-source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+    git(source, "config", "core.autocrlf", "false")
+    git(source, "config", "user.name", "Synthetic Canonical Install")
+    git(source, "config", "user.email", TEST_EMAIL)
+    ignored = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
+    shutil.copytree(ROOT, source / "engine", ignore=ignored)
+    shutil.copytree(ROOT.parent / "state", source / "state", ignore=ignored)
+    # This synthetic repository has no root attributes file; retain raw fixture bytes consistently.
+    (source / "engine" / ".gitattributes").unlink()
+    git(source, "add", "engine", "state")
+    git(source, "checkout-index", "-f", "-a")
+    payload = build_release_manifest(source / "engine")
+    (source / "engine" / "release-manifest.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    git(source, "add", "engine", "state")
+    staged = git(source, "write-tree").stdout.strip()
+    record = {
+        "schema": "engine-provenance/1",
+        "sequence": 1,
+        "previous_record_sha256": None,
+        "engine_tree_oid": git(source, "rev-parse", f"{staged}:engine").stdout.strip(),
+        "release_artifact_sha256": payload["artifact_sha256"],
+    }
+    (source / "engine.provenance.json").write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    git(source, "add", "engine.provenance.json")
+    git(source, "commit", "-q", "-m", "canonical fixture")
+    remote = tmp_path / "canonical.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    git(source, "remote", "add", "origin", str(remote))
+    git(source, "push", "-q", "-u", "origin", "main")
+    subprocess.run(["git", "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+    clone = tmp_path / "canonical-clone"
+    subprocess.run(["git", "-c", "core.autocrlf=false", "clone", "-q", str(remote), str(clone)], check=True)
+    git(clone, "config", "core.autocrlf", "false")
+    git(clone, "config", "core.eol", "lf")
+    git(clone, "checkout-index", "-f", "-a")
+    git(clone, "config", "user.name", "Synthetic Canonical Install")
+    git(clone, "config", "user.email", TEST_EMAIL)
+    config_payload = json.loads((ROOT / "examples" / "host.example.json").read_text(encoding="utf-8"))
+    config_payload["backup_root"] = str(tmp_path / "host" / "backups")
+    for index, target in enumerate(config_payload["targets"]):
+        target["root"] = str(tmp_path / "runtimes" / f"runtime-{index}")
+    config = tmp_path / "host" / "host.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps(config_payload, indent=2) + "\n", encoding="utf-8")
+    apply_attach(clone / "state", config, confirm_private_remote=True)
+    manifest = clone / "engine" / "release-manifest.json"
+    install_root = tmp_path / "local-data" / "agent-core"
+    apply_install(clone / "engine", config, clone / "state", clone / "engine", manifest, force=False)
+    return source, clone, config, manifest, install_root
+
+
+def advance_canonical_engine(source: Path, clone: Path) -> None:
+    """Advance only the engine subtree and its chained provenance record."""
+    notice = source / "engine" / "NOTICE"
+    notice.write_text("agent-core\nCopyright 2026 Synthetic Canonical Update\n", encoding="utf-8")
+    git(source, "add", "engine/NOTICE")
+    git(source, "checkout-index", "-f", "--", "engine/NOTICE")
+    payload = build_release_manifest(source / "engine")
+    (source / "engine" / "release-manifest.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    previous = (source / "engine.provenance.json").read_bytes()
+    git(source, "add", "engine")
+    staged = git(source, "write-tree").stdout.strip()
+    record = {
+        "schema": "engine-provenance/1",
+        "sequence": 2,
+        "previous_record_sha256": hashlib.sha256(previous).hexdigest(),
+        "engine_tree_oid": git(source, "rev-parse", f"{staged}:engine").stdout.strip(),
+        "release_artifact_sha256": payload["artifact_sha256"],
+    }
+    (source / "engine.provenance.json").write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    git(source, "add", "engine.provenance.json")
+    git(source, "commit", "-q", "-m", "advance engine provenance")
+    git(source, "push", "-q", "origin", "main")
+    git(clone, "fetch", "origin")
+    git(clone, "merge", "--ff-only", "origin/main")
 
 
 def test_release_manifest_excludes_bytecode_and_detects_tamper(tmp_path: Path) -> None:
@@ -180,7 +277,7 @@ def test_public_install_wrappers_are_thin_and_runtime_independent() -> None:
 
 
 def test_apply_install_builds_once_and_consumes_same_plan(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = object()
     calls: list[tuple[str, object, bool | None]] = []
@@ -194,9 +291,15 @@ def test_apply_install_builds_once_and_consumes_same_plan(
         return ["PASS synthetic"]
 
     monkeypatch.setattr(installer_module, "_build_plan", build)
+    monkeypatch.setattr(
+        installer_module, "_reviewed_install_plan",
+        lambda candidate: (candidate, None, False, [], [], []),
+    )
     monkeypatch.setattr(installer_module, "_apply_install_plan", apply)
+    config = tmp_path / "host" / "host.json"
+    config.parent.mkdir()
     result = apply_install(
-        Path("engine"), Path("host.json"), Path("state"), Path("source"), None,
+        Path("engine"), config, Path("state"), Path("source"), None,
         force=False,
     )
     assert result == ["PASS synthetic"]
@@ -225,12 +328,11 @@ def test_apply_install_plan_binding_drift_fails_before_preflight_and_writes(
     assert local == plan.binding
     reached_preflight: list[installer_module.InstallPlan] = []
 
-    def no_changes(candidate, *, force: bool):
-        assert force is False
+    def no_changes(candidate):
         reached_preflight.append(candidate)
-        return None, True, []
+        return candidate, None, True, []
 
-    monkeypatch.setattr(installer_module, "_preflight", no_changes)
+    monkeypatch.setattr(installer_module, "_assert_reviewed_plan_current", no_changes)
     assert installer_module._apply_install_plan(plan, force=False) == [
         f"PASS install version={plan.artifact.version} no_changes=true"
     ]
@@ -239,7 +341,7 @@ def test_apply_install_plan_binding_drift_fails_before_preflight_and_writes(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("binding drift crossed the zero-write boundary")
 
-    for name in ("_preflight", "_snapshot", "_atomic_write"):
+    for name in ("_assert_reviewed_plan_current", "_snapshot", "_atomic_write"):
         monkeypatch.setattr(installer_module, name, forbidden)
 
     if drift == "config":
@@ -265,6 +367,27 @@ def test_apply_install_plan_binding_drift_fails_before_preflight_and_writes(
     assert not (config.parent / "rollback").exists()
 
 
+def test_apply_install_plan_artifact_drift_fails_before_preflight_and_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    plan = installer_module._build_plan(ROOT, config, state, ROOT, manifest)
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_payload["artifact_sha256"] = "A" * 43
+    manifest.write_text(json.dumps(manifest_payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("artifact drift crossed the zero-write boundary")
+
+    monkeypatch.setattr(installer_module, "_preflight", forbidden)
+    monkeypatch.setattr(installer_module, "_snapshot", forbidden)
+    with pytest.raises(ConfigError, match="^FAIL_ARTIFACT_HASH"):
+        installer_module._apply_install_plan(plan, force=False)
+    assert not install_root.exists()
+    assert not plan.receipt_path.exists()
+    assert not (config.parent / "rollback").exists()
+
+
 def test_install_plan_is_zero_write_and_apply_is_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -273,7 +396,7 @@ def test_install_plan_is_zero_write_and_apply_is_idempotent(
     state_head = git(state, "rev-parse", "HEAD").stdout.strip()
     lines = plan_install(ROOT, config, state, ROOT, manifest)
     targets = [line for line in lines if line.startswith("TARGET ")]
-    assert targets and all(" status=missing " in line for line in targets)
+    assert targets and all(" status=absent " in line for line in targets)
     assert lines[-1] == "DRY_RUN writes=0 ready=true no_changes=false"
     assert not install_root.exists()
     assert config.read_bytes() == config_before
@@ -356,7 +479,126 @@ def test_install_plan_is_zero_write_and_apply_is_idempotent(
     assert {item["path"]: item["installed_sha256"] for item in after["objects"]} == first_hashes
 
 
-def test_existing_owned_path_requires_force_and_unowned_file_survives(
+def test_install_first_binding_requires_confirmation_and_is_transactional(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    binding = binding_receipt_path(config)
+    binding.unlink()
+    before_config = config.read_bytes()
+    with pytest.raises(ConfigError, match="PRIVATE_REMOTE_CONFIRMATION_REQUIRED"):
+        plan_install(ROOT, config, state, ROOT, manifest)
+    assert config.read_bytes() == before_config
+    assert not binding.exists() and not install_root.exists()
+    plan = plan_install(
+        ROOT, config, state, ROOT, manifest, confirm_private_remote=True,
+    )
+    assert plan[-1].endswith("ready=true no_changes=false")
+    assert config.read_bytes() == before_config
+    assert not binding.exists() and not install_root.exists()
+    built = installer_module._build_plan(
+        ROOT, config, state, ROOT, manifest, confirm_private_remote=True,
+    )
+    config.write_bytes(before_config + b"\n")
+    with pytest.raises(ConfigError, match="FAIL_STATE_BINDING"):
+        installer_module._apply_install_plan(built, force=False)
+    assert not binding.exists() and not install_root.exists()
+    config.write_bytes(before_config)
+    applied = apply_install(
+        ROOT, config, state, ROOT, manifest, force=False, confirm_private_remote=True,
+    )
+    assert applied[-1].startswith("PASS artifact_sha256=")
+    assert binding.is_file() and (config.parent / "install-receipt.json").is_file()
+    assert apply_install(ROOT, config, state, ROOT, manifest, force=False) == [
+        "PASS install version=0.1.0.dev0 no_changes=true"
+    ]
+
+
+def test_existing_invalid_binding_requires_confirmation_then_reaccepts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, clone, config, manifest, install_root = canonical_installed_fixture(tmp_path, monkeypatch)
+    advance_canonical_engine(source, clone)
+    binding = binding_receipt_path(config)
+    before = {
+        "config": config.read_bytes(),
+        "binding": binding.read_bytes(),
+        "pin": (install_root / "engine-pin.json").read_bytes(),
+    }
+    with pytest.raises(ConfigError, match="FAIL_STATE_BINDING"):
+        plan_install(clone / "engine", config, clone / "state", clone / "engine", manifest)
+    assert before == {
+        "config": config.read_bytes(),
+        "binding": binding.read_bytes(),
+        "pin": (install_root / "engine-pin.json").read_bytes(),
+    }
+
+    lines = plan_install(
+        clone / "engine", config, clone / "state", clone / "engine", manifest,
+        confirm_private_remote=True,
+    )
+    assert "BINDING_REFRESH pending=true" in lines
+    token = next(line.split(" ", 1)[1] for line in lines if line.startswith("PLAN_HASH "))
+    assert before == {
+        "config": config.read_bytes(),
+        "binding": binding.read_bytes(),
+        "pin": (install_root / "engine-pin.json").read_bytes(),
+    }
+    applied = apply_install(
+        clone / "engine", config, clone / "state", clone / "engine", manifest,
+        force=False, confirm_private_remote=True, plan_hash=token,
+    )
+    assert applied[-1].startswith("PASS artifact_sha256=")
+    record_sha256 = hashlib.sha256((clone / "engine.provenance.json").read_bytes()).hexdigest()
+    assert json.loads(binding.read_text(encoding="utf-8"))["engine_provenance_sha256"] == record_sha256
+    next_plan = plan_install(clone / "engine", config, clone / "state", clone / "engine", manifest)
+    assert next_plan[-1] == "DRY_RUN writes=0 ready=true no_changes=true"
+
+
+def test_reacceptance_token_rejects_reviewed_binding_drift_before_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, clone, config, manifest, install_root = canonical_installed_fixture(tmp_path, monkeypatch)
+    advance_canonical_engine(source, clone)
+    binding = binding_receipt_path(config)
+    lines = plan_install(
+        clone / "engine", config, clone / "state", clone / "engine", manifest,
+        confirm_private_remote=True,
+    )
+    token = next(line.split(" ", 1)[1] for line in lines if line.startswith("PLAN_HASH "))
+    config_before = config.read_bytes()
+    binding_before = binding.read_bytes()
+    pin_before = (install_root / "engine-pin.json").read_bytes()
+    config.write_bytes(config_before + b"\n")
+    with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
+        apply_install(
+            clone / "engine", config, clone / "state", clone / "engine", manifest,
+            force=False, confirm_private_remote=True, plan_hash=token,
+        )
+    assert binding.read_bytes() == binding_before
+    assert (install_root / "engine-pin.json").read_bytes() == pin_before
+    assert not (config.parent / "install-pending.json").exists()
+    config.write_bytes(config_before)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows batch wrapper contract")
+def test_repository_windows_wrapper_propagates_child_exit_status(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment["AGENT_CORE_PYTHON"] = os.fspath(Path(os.sys.executable))
+    wrapper = ROOT / "agent-core.cmd"
+    invalid = subprocess.run(
+        [str(wrapper), "install", "--unknown-argument"], cwd=tmp_path, env=environment,
+        check=False, capture_output=True, text=True, encoding="utf-8",
+    )
+    assert invalid.returncode == 2
+    version = subprocess.run(
+        [str(wrapper), "--version"], cwd=tmp_path, env=environment,
+        check=False, capture_output=True, text=True, encoding="utf-8",
+    )
+    assert version.returncode == 0
+
+
+def test_existing_unowned_path_is_foreign_and_unowned_file_survives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
@@ -370,8 +612,9 @@ def test_existing_owned_path_requires_force_and_unowned_file_survives(
     with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
         apply_install(ROOT, config, state, ROOT, manifest, force=False)
     assert rules.read_bytes() == b"user-owned-before\n"
-    apply_install(ROOT, config, state, ROOT, manifest, force=True)
-    assert rules.read_bytes() != b"user-owned-before\n"
+    with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=True)
+    assert rules.read_bytes() == b"user-owned-before\n"
     assert unrelated.read_bytes() == b"never managed\n"
 
 
@@ -389,7 +632,7 @@ def test_plan_reports_all_conflicts_and_apply_writes_nothing(
         before[path] = content
 
     lines = plan_install(ROOT, config, state, ROOT, manifest)
-    conflicts = [line for line in lines if " status=conflict " in line]
+    conflicts = [line for line in lines if " status=foreign " in line]
     assert len(conflicts) >= 2
     assert all(any(str(path) in line for line in conflicts) for path in before)
     assert lines[-1] == "DRY_RUN writes=0 ready=false no_changes=false"
@@ -405,7 +648,7 @@ def test_plan_reports_all_conflicts_and_apply_writes_nothing(
     assert not (config.parent / "rollback").exists()
 
 
-def test_receipt_owned_old_bytes_conflict_with_new_desired_before_writes(
+def test_receipt_owned_old_bytes_are_managed_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_root = tmp_path / "install"
@@ -454,15 +697,13 @@ def test_receipt_owned_old_bytes_conflict_with_new_desired_before_writes(
     )
 
     def forbidden(*_args, **_kwargs):
-        raise AssertionError("conflict crossed the preflight boundary")
+        raise AssertionError("synthetic plan must stay read-only")
 
     monkeypatch.setattr(installer_module, "require_fresh", forbidden)
     monkeypatch.setattr(installer_module, "_snapshot", forbidden)
     lines = plan_install(tmp_path, plan.config_path, plan.state_root, plan.source_root, None)
-    assert any(line.startswith("TARGET managed status=conflict ") for line in lines)
-    assert lines[-1] == "DRY_RUN writes=0 ready=false no_changes=false"
-    with pytest.raises(ConfigError, match="^INSTALL_CONFLICT install plan ready=false$"):
-        apply_install(tmp_path, plan.config_path, plan.state_root, plan.source_root, None, force=False)
+    assert any(line.startswith("TARGET managed status=managed-update ") for line in lines)
+    assert lines[-1] == "DRY_RUN writes=0 ready=true no_changes=false"
     assert target.read_bytes() == old_content
     assert receipt_path.read_bytes() == receipt_before
     assert not (receipt_path.parent / "rollback").exists()
@@ -505,7 +746,7 @@ def test_runtime_config_directory_collision_is_conflict_before_writes(
     monkeypatch.setattr(installer_module, "_snapshot", forbidden)
     lines = plan_install(tmp_path, plan.config_path, plan.state_root, plan.source_root, None)
     assert any(
-        line.startswith("TARGET runtime-config:claude-code status=conflict ")
+            line.startswith("TARGET runtime-config:claude-code status=foreign ")
         for line in lines
     )
     assert lines[-1] == "DRY_RUN writes=0 ready=false no_changes=false"
@@ -545,7 +786,7 @@ def test_install_verify_failure_rolls_back_every_target(
 
     planned = plan_install(ROOT, config, state, ROOT, manifest)
     assert any(
-        line.startswith("TARGET runtime-config:claude-code status=missing ")
+            line.startswith("TARGET runtime-config:claude-code status=managed-update ")
         for line in planned
     )
     assert not missing.exists()
@@ -576,14 +817,14 @@ def test_receipt_write_failure_rolls_back_pin_and_all_installed_objects(
     state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
     from agent_core import installer as installer_module
 
-    original = installer_module._atomic_write
+    original = installer_module._replace_owned_bytes
 
-    def fail_receipt(path: Path, content: bytes, *, executable: bool = False) -> None:
-        if path.name == "install-receipt.json":
+    def fail_receipt(*args, **kwargs) -> None:
+        if kwargs.get("key") == "install-receipt" or (len(args) >= 6 and args[5] == "install-receipt"):
             raise OSError("INJECTED_RECEIPT_FAILURE")
-        original(path, content, executable=executable)
+        original(*args, **kwargs)
 
-    monkeypatch.setattr(installer_module, "_atomic_write", fail_receipt)
+    monkeypatch.setattr(installer_module, "_replace_owned_bytes", fail_receipt)
     with pytest.raises(ConfigError, match="FAIL_INSTALL"):
         apply_install(ROOT, config, state, ROOT, manifest, force=False)
     assert not (install_root / "engine-pin.json").exists()
@@ -591,14 +832,14 @@ def test_receipt_write_failure_rolls_back_pin_and_all_installed_objects(
     assert not (config.parent / "install-receipt.json").exists()
 
 
-def test_existing_version_directory_is_immutable_even_with_force(
+def test_existing_version_directory_is_foreign_even_with_force(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
     version_root = install_root / "engine" / "0.1.0.dev0"
     version_root.mkdir(parents=True)
     (version_root / "foreign.txt").write_text("different artifact", encoding="utf-8")
-    with pytest.raises(ConfigError, match="FAIL_IMMUTABLE_ARTIFACT"):
+    with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
         apply_install(ROOT, config, state, ROOT, manifest, force=True)
     assert (version_root / "foreign.txt").read_text(encoding="utf-8") == "different artifact"
 
@@ -694,3 +935,346 @@ def test_public_install_force_is_rejected_before_apply(
     assert exc_info.value.code == 2
     assert called is False
     assert "unrecognized arguments: --force" in capsys.readouterr().err
+
+
+def test_install_apply_requires_the_exact_reviewed_plan_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("token boundary reached install planning")
+
+    monkeypatch.setattr(installer_module, "_build_plan", forbidden)
+    assert installer_module.main(["install", "--config", str(config), "--apply"]) == 1
+    assert "FAIL_PLAN_HASH" in capsys.readouterr().err
+    assert installer_module.main(["install", "--config", str(config), "--plan-hash", "0" * 64]) == 1
+    assert "FAIL_PLAN_HASH" in capsys.readouterr().err
+    assert not install_root.exists()
+
+
+def test_reviewed_plan_token_rejects_target_drift_before_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    lines = plan_install(ROOT, config, state, ROOT, manifest)
+    token = next(line.split(" ", 1)[1] for line in lines if line.startswith("PLAN_HASH "))
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    target = Path(payload["targets"][0]["root"]) / payload["targets"][0]["rules_target"]
+    target.parent.mkdir(parents=True)
+    drift = b"reviewer-target-drift\n"
+    target.write_bytes(drift)
+    with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=False, plan_hash=token)
+    assert target.read_bytes() == drift
+    assert not install_root.exists()
+    assert not (config.parent / "rollback").exists()
+
+
+def test_interrupted_first_binding_marker_is_diagnostic_then_replan_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    binding = binding_receipt_path(config)
+    binding.unlink()
+    config_before = config.read_bytes()
+    lines = plan_install(
+        ROOT, config, state, ROOT, manifest, confirm_private_remote=True,
+    )
+    token = next(line.split(" ", 1)[1] for line in lines if line.startswith("PLAN_HASH "))
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt("after first-binding host writes")
+
+    original_install_engine = installer_module._install_engine
+    monkeypatch.setattr(installer_module, "_install_engine", interrupted)
+    with pytest.raises(KeyboardInterrupt, match="after first-binding host writes"):
+        apply_install(
+            ROOT, config, state, ROOT, manifest, force=False,
+            confirm_private_remote=True, plan_hash=token,
+        )
+    pending = config.parent / "install-pending.json"
+    assert pending.is_file() and binding.exists() and config.read_bytes() == config_before
+    marker_before = pending.read_bytes()
+    with pytest.raises(ConfigError, match="FAIL_INSTALL_RECOVERY") as planned:
+        plan_install(ROOT, config, state, ROOT, manifest)
+    assert "inspect and clear pending install marker" in str(planned.value)
+    with pytest.raises(ConfigError, match="FAIL_INSTALL_RECOVERY"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=False, plan_hash=token)
+    assert pending.read_bytes() == marker_before
+    assert binding.exists() and config.read_bytes() == config_before and not install_root.exists()
+
+    # The user explicitly clears only the diagnostic marker, then reviews a new plan.
+    pending.unlink()
+    monkeypatch.setattr(installer_module, "_install_engine", original_install_engine)
+    replan = plan_install(ROOT, config, state, ROOT, manifest)
+    replan_token = next(line.split(" ", 1)[1] for line in replan if line.startswith("PLAN_HASH "))
+    applied = apply_install(
+        ROOT, config, state, ROOT, manifest, force=False, plan_hash=replan_token,
+    )
+    assert applied[-1].startswith("PASS artifact_sha256=")
+    assert binding.is_file() and (config.parent / "install-receipt.json").is_file()
+
+
+def test_interrupted_exact_hooks_are_adopted_without_rewrite_before_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
+    initial = plan_install(ROOT, config, state, ROOT, manifest)
+    token = next(line.split(" ", 1)[1] for line in initial if line.startswith("PLAN_HASH "))
+    original_replace = installer_module._replace_owned_bytes
+
+    def interrupt_receipt(*args, **kwargs) -> None:
+        key = kwargs.get("key") or (args[5] if len(args) >= 6 else None)
+        if key == "install-receipt":
+            raise KeyboardInterrupt("receipt publication boundary")
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(installer_module, "_replace_owned_bytes", interrupt_receipt)
+    with pytest.raises(KeyboardInterrupt, match="receipt publication boundary"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=False, plan_hash=token)
+    pending = config.parent / "install-pending.json"
+    receipt_path = config.parent / "install-receipt.json"
+    assert pending.is_file() and not receipt_path.exists()
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    settings = [
+        Path(target["root"]) / ("settings.json" if target["runtime"] == "claude-code" else "hooks.json")
+        for target in payload["targets"] if target["runtime"] in {"claude-code", "codex"}
+    ]
+    before = {path: path.read_bytes() for path in settings}
+
+    pending.unlink()
+    replan = plan_install(ROOT, config, state, ROOT, manifest)
+    assert sum(" status=adopt-identical " in line for line in replan) == len(settings)
+    replan_token = next(line.split(" ", 1)[1] for line in replan if line.startswith("PLAN_HASH "))
+    writes: list[str] = []
+
+    def record_hook_replacement(*args, **kwargs) -> None:
+        key = kwargs.get("key") or (args[5] if len(args) >= 6 else None)
+        writes.append(str(key))
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(installer_module, "_replace_owned_bytes", record_hook_replacement)
+    apply_install(ROOT, config, state, ROOT, manifest, force=False, plan_hash=replan_token)
+    assert not any(key.startswith("hook-") for key in writes)
+    assert {path: path.read_bytes() for path in settings} == before
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert {
+        item["installed_sha256"] for item in receipt["hook_bindings"]
+    } == {hashlib.sha256(content).hexdigest() for content in before.values()}
+
+
+def test_competing_install_fails_before_snapshot_while_first_holds_operation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    entered_snapshot = threading.Event()
+    release_first = threading.Event()
+    first_errors: list[BaseException] = []
+    original_snapshot = installer_module._snapshot
+
+    def pause_first(*args, **kwargs):
+        entered_snapshot.set()
+        if not release_first.wait(timeout=30):
+            raise AssertionError("first install did not receive release")
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(installer_module, "_snapshot", pause_first)
+
+    def first_apply() -> None:
+        try:
+            apply_install(ROOT, config, state, ROOT, manifest, force=False)
+        except BaseException as exc:  # Preserve assertion failures from the worker thread.
+            first_errors.append(exc)
+
+    worker = threading.Thread(target=first_apply, daemon=True)
+    worker.start()
+    assert entered_snapshot.wait(timeout=30)
+    before = {
+        "config": config.read_bytes(),
+        "receipt": (config.parent / "install-receipt.json").exists(),
+        "marker": (config.parent / "install-pending.json").exists(),
+        "install": install_root.exists(),
+    }
+    with pytest.raises(ConfigError, match="FAIL_LOCKED"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=False)
+    assert config.read_bytes() == before["config"]
+    assert (config.parent / "install-receipt.json").exists() is before["receipt"]
+    assert (config.parent / "install-pending.json").exists() is before["marker"]
+    assert install_root.exists() is before["install"]
+    release_first.set()
+    worker.join(timeout=120)
+    assert not worker.is_alive() and not first_errors
+    assert (config.parent / "install-receipt.json").is_file()
+
+
+def test_first_attach_revalidates_complete_binding_evidence_before_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    binding = binding_receipt_path(config)
+    binding.unlink()
+    config_before = config.read_bytes()
+    plan = installer_module._build_plan(
+        ROOT, config, state, ROOT, manifest, confirm_private_remote=True,
+    )
+    plan, *_ignored = installer_module._reviewed_install_plan(plan)
+    real_validate = installer_module.validate_state_binding
+
+    def changed_evidence(*args, **kwargs):
+        evidence = real_validate(*args, **kwargs)
+        return replace(evidence, config_sha256="f" * 64)
+
+    monkeypatch.setattr(installer_module, "validate_state_binding", changed_evidence)
+    with pytest.raises(ConfigError, match="^FAIL_STATE_BINDING binding changed after install plan$"):
+        installer_module._apply_install_plan(plan, force=False)
+    assert config.read_bytes() == config_before
+    assert not binding.exists() and not install_root.exists()
+    assert not (config.parent / "install-pending.json").exists()
+
+
+def test_pending_marker_is_read_only_even_with_hash_consistent_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    snapshot = config.parent / "rollback" / ("install-" + "a" * 32)
+    snapshot.mkdir(parents=True)
+    snapshot_bytes = b'{"schema":"install-snapshot/1","objects":[],"hook_bindings":[],"host_records":[]}'
+    (snapshot / "snapshot.json").write_bytes(snapshot_bytes)
+    marker = config.parent / "install-pending.json"
+    marker.write_text(json.dumps({
+        "schema": "install-pending/1", "snapshot_id": snapshot.name,
+        "snapshot_sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+    }) + "\n", encoding="utf-8")
+    marker_before = marker.read_bytes()
+    snapshot_before = (snapshot / "snapshot.json").read_bytes()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("pending marker crossed the read-only install boundary")
+
+    monkeypatch.setattr(installer_module, "_build_plan", forbidden)
+    with pytest.raises(ConfigError, match="FAIL_INSTALL_RECOVERY") as planned:
+        plan_install(ROOT, config, state, ROOT, manifest)
+    assert str(marker) in str(planned.value)
+    with pytest.raises(ConfigError, match="FAIL_INSTALL_RECOVERY"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=False)
+    assert marker.read_bytes() == marker_before
+    assert (snapshot / "snapshot.json").read_bytes() == snapshot_before
+    assert not install_root.exists()
+
+
+def test_foreign_and_indeterminate_targets_coexist_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    runtime = Path(payload["targets"][0]["root"])
+    foreign = runtime / payload["targets"][0]["rules_target"]
+    foreign.parent.mkdir(parents=True)
+    foreign.write_bytes(b"foreign target\n")
+    wrong_type = install_root / "engine" / "0.1.0.dev0"
+    wrong_type.parent.mkdir(parents=True)
+    wrong_type.write_bytes(b"not a managed directory\n")
+    before = {foreign: foreign.read_bytes(), wrong_type: wrong_type.read_bytes()}
+    lines = plan_install(ROOT, config, state, ROOT, manifest)
+    assert any(" status=foreign " in line for line in lines)
+    assert any(" status=indeterminate " in line for line in lines)
+    assert lines[-1] == "DRY_RUN writes=0 ready=false no_changes=false"
+    with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=False)
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (config.parent / "rollback").exists()
+
+
+def test_apply_detach_race_preserves_recreated_destination_and_preimage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    initial = plan_install(ROOT, config, state, ROOT, manifest)
+    initial_token = next(line.split(" ", 1)[1] for line in initial if line.startswith("PLAN_HASH "))
+    apply_install(ROOT, config, state, ROOT, manifest, force=False, plan_hash=initial_token)
+
+    source = tmp_path / "updated-engine"
+    shutil.copytree(ROOT, source)
+    (source / "NOTICE").write_text("agent-core\nCopyright 2026 Synthetic Update\n", encoding="utf-8")
+    updated_manifest = tmp_path / "updated-release-manifest.json"
+    updated_manifest.write_text(
+        json.dumps(build_release_manifest(source), indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    plan = installer_module._build_plan(ROOT, config, state, source, updated_manifest)
+    plan, *_ignored = installer_module._reviewed_install_plan(plan)
+    old_engine_hash = plan.object_preimages[0]
+    assert old_engine_hash is not None
+    receipt_before = plan.receipt_path.read_bytes()
+    competitor = b"competitor-raced-bytes\n"
+    original_move = installer_module._move_no_replace
+
+    def recreate_before_place(source_path: Path, destination: Path) -> None:
+        if destination == plan.engine_root and source_path.name.startswith(".engine-install-"):
+            destination.mkdir(parents=True)
+            (destination / "competitor.txt").write_bytes(competitor)
+        original_move(source_path, destination)
+
+    monkeypatch.setattr(installer_module, "_move_no_replace", recreate_before_place)
+    with pytest.raises(ConfigError, match="^FAIL_INSTALL_RACE"):
+        installer_module._apply_install_plan(plan, force=False)
+    assert (plan.engine_root / "competitor.txt").read_bytes() == competitor
+    snapshots = sorted((config.parent / "rollback").glob("install-*"))
+    assert len(snapshots) == 2
+    detached = next(snapshot / "detached" / "object-0" for snapshot in snapshots
+                    if (snapshot / "detached" / "object-0").exists())
+    assert installer_module._path_hash(detached, "dir") == old_engine_hash
+    assert plan.receipt_path.read_bytes() == receipt_before
+
+
+def test_apply_detached_preimage_mismatch_preserves_raced_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
+    initial = plan_install(ROOT, config, state, ROOT, manifest)
+    initial_token = next(line.split(" ", 1)[1] for line in initial if line.startswith("PLAN_HASH "))
+    apply_install(ROOT, config, state, ROOT, manifest, force=False, plan_hash=initial_token)
+    source = tmp_path / "updated-engine"
+    shutil.copytree(ROOT, source)
+    (source / "NOTICE").write_text("agent-core\nCopyright 2026 Synthetic Update\n", encoding="utf-8")
+    updated_manifest = tmp_path / "updated-release-manifest.json"
+    updated_manifest.write_text(
+        json.dumps(build_release_manifest(source), indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    plan = installer_module._build_plan(ROOT, config, state, source, updated_manifest)
+    plan, *_ignored = installer_module._reviewed_install_plan(plan)
+    old_engine_hash = plan.object_preimages[0]
+    assert old_engine_hash is not None
+    raced_notice = b"raced-after-detach\n"
+    original_move = installer_module._move_no_replace
+
+    def alter_detached(source_path: Path, destination: Path) -> None:
+        original_move(source_path, destination)
+        if destination.name == "object-0" and destination.parent.name == "detached":
+            (destination / "NOTICE").write_bytes(raced_notice)
+
+    monkeypatch.setattr(installer_module, "_move_no_replace", alter_detached)
+    with pytest.raises(ConfigError, match="^FAIL_INSTALL_RACE"):
+        installer_module._apply_install_plan(plan, force=False)
+    assert (plan.engine_root / "NOTICE").read_bytes() == raced_notice
+    snapshot = next(item for item in (config.parent / "rollback").glob("install-*")
+                    if installer_module._path_hash(item / "objects" / "0", "dir") == old_engine_hash)
+    assert snapshot.is_dir()
+
+
+def test_invalid_install_receipt_is_indeterminate_and_zero_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
+    apply_install(ROOT, config, state, ROOT, manifest, force=False)
+    receipt_path = config.parent / "install-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["objects"][0]["installed_sha256"] = "G" * 64
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    before = receipt_path.read_bytes()
+    rollback_before = sorted((config.parent / "rollback").iterdir())
+    lines = plan_install(ROOT, config, state, ROOT, manifest)
+    assert any(" status=indeterminate " in line for line in lines)
+    assert lines[-1] == "DRY_RUN writes=0 ready=false no_changes=false"
+    assert receipt_path.read_bytes() == before
+    assert sorted((config.parent / "rollback").iterdir()) == rollback_before

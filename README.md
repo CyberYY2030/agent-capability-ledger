@@ -19,7 +19,7 @@ The public `CyberYY2030/agent-capability-ledger` repository is a one-way whiteli
 
 ## V0.1 CLI
 
-- `install` plans or applies the engine to configured local runtimes through the accepted C1 `missing`, `identical`, and `conflict` states.
+- `install` performs first private binding and receipt-owned engine updates through `absent`, `identical`, `managed-update`, `foreign`, and `indeterminate` states.
 - `sync` materializes configured private state into local runtimes; Git itself carries that state between machines.
 - `doctor` reports whether the configured engine, state, and runtime boundaries are healthy.
 - `lessons` accesses the private lessons workflows behind the single supported lessons entry point.
@@ -33,8 +33,8 @@ FAIL_COMMAND_FROZEN promote
 The shortest supported journey is plan, apply, verify, then retrieve a lesson:
 
 ```console
-$ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>'
-$ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --apply
+$ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote
+$ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote --apply --plan-hash '<REVIEWED_INSTALL_PLAN_HASH>'
 $ agent-core sync --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --apply
 $ agent-core doctor --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>'
 $ agent-core lessons match --stage prompt --text '<TASK>' --explain
@@ -44,31 +44,33 @@ The first two lines are the plan/apply phases of the single `install` command, s
 
 ## Installation preview
 
-C1 installation planning and apply passed clean-tree acceptance in the isolated C2 Windows environment. Preview every managed target before apply:
+C1 installation planning and apply passed clean-tree acceptance in the isolated C2 environment. Preview every managed target before apply:
 
 ```console
-$ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>'
+$ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote
 PLAN operation=install version=<VERSION>
-TARGET <LABEL> status=missing|identical|conflict path=<TARGET>
+EXPECTED_REMOTE_SHA <REVIEWED_REMOTE_SHA>
+PLAN_HASH <REVIEWED_INSTALL_PLAN_HASH>
+TARGET <LABEL> status=absent|identical|managed-update|foreign|indeterminate path=<TARGET>
 DRY_RUN writes=0 ready=true|false no_changes=true|false
 ```
 
 Apply only a reviewed plan with `ready=true`:
 
 ```console
-$ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --apply
+$ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote --apply --plan-hash '<REVIEWED_INSTALL_PLAN_HASH>'
 ```
 
-`conflict` means user-owned or previously managed bytes differ. Stop, resolve every reported target manually, then plan again. The public installer has no force option and does not recommend overwriting conflicts.
+For a later receipt-owned update, omit `--confirm-private-remote` while the existing binding remains valid. After a valid engine or private-state change invalidates that binding, pass explicit `--state` and `--confirm-private-remote` to review and apply its transactional reacceptance with a new exact `PLAN_HASH`. `foreign` and `indeterminate` make the whole plan not ready and apply writes nothing. `managed-update` is allowed only when a valid receipt owns the exact path, type, hook identity, and current installed bytes. The installer has no force option. If an interrupted first binding leaves a pending marker, inspect its retained pre-image evidence, remove that host-local marker only after accepting it, then create and apply a new install plan; V0.1 never restores runtime, business, or config paths from that marker. Windows flushes pre-image files and uses no-replace placement, but has no portable directory-fsync equivalent and cannot promise zero overwrite against a non-cooperating writer that retains an open handle.
 
-Always run and review the plan before `install --apply`. The current Windows machine has passed live cutover acceptance; every future apply must still stop whenever the plan reports a conflict.
+Always run and review the plan before `install --apply`. First binding and explicit reacceptance of an invalid binding require the confirmation flag; later valid bound installs do not. `sync` materializes private state after ordinary Git synchronization. Other real-machine environments remain pending acceptance.
 
 ## Current limits
 
 - C1 clean-tree acceptance in C2 covered 222 `missing` targets, install, 222 `identical` targets, conflict zero-write behavior, the public no-force boundary, and injected-failure restoration of original bytes, prior absence, and residue cleanup.
-- C2 Windows acceptance includes live cutover on the current machine: 215 materializations classified as 7 `missing`, 150 `identical`, and 58 `conflict`, with `hook_conflict=0`; after the reviewed migration, all four installed wrapper commands returned zero, canonical bytes matched, and foreign hook fields were preserved.
-- The earlier isolated Windows run also covered doctor verification of the installed pin and manifest, ordinary Git push plus `pull --ff-only` before materialization, private lessons visibility, and a second sync with `writes=0`.
-- A second full workspace, macOS, and cross-machine evidence remain pending C3.
+- C2 acceptance includes live cutover on the current machine: 215 materializations classified as 7 `missing`, 150 `identical`, and 58 `conflict`, with `hook_conflict=0`; after the reviewed migration, all four installed wrapper commands returned zero, canonical bytes matched, and foreign hook fields were preserved.
+- The earlier isolated run also covered doctor verification of the installed pin and manifest, ordinary Git push plus `pull --ff-only` before materialization, private lessons visibility, and a second sync with `writes=0`.
+- A second full workspace and other real-machine evidence remain pending C3.
 - C4 exported the engine through the one-way whitelist to `CyberYY2030/agent-capability-ledger` and passed the public privacy gate. Each subsequent release, including the export of current fixes, remains gated before publication.
 - Complex transaction modules are retained as frozen implementation and are outside the V0.1 user path.
 

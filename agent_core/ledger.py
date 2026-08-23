@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import unicodedata
+from dataclasses import dataclass
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -32,6 +33,54 @@ TEXT_EXT = {'.md', '.py', '.txt', '.json', '.rs', '.ts', '.tsx', '.js', '.mjs'}
 SCHEMAS = {'lessons-ledger/1', 'lessons-ledger/2'}
 ROUTING_SCHEMA = 'lessons-routing/1'
 PROFILE_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
+ACTIVE_RULE_RE = re.compile(
+    rf'^\s*-\s+\*\*(?:({LEGACY_ID})|\[\[lesson:({SCOPED_ID})\]\])'
+    r'\s*\[[^\]]+\]\s*(.*?)\*\*'
+)
+
+
+@dataclass(frozen=True)
+class ActiveLesson:
+    """One active lesson identity with its deliberately narrow duplicate key."""
+
+    lesson_id: str
+    scope: str
+    store: str
+    source: str
+    line: int
+    rule: str
+    normalized_rule: str
+
+
+def normalize_rule(rule: str) -> str:
+    """Canonical exact-duplicate key: NFC plus collapsed Unicode whitespace."""
+    return re.sub(r'\s+', ' ', unicodedata.normalize('NFC', rule)).strip()
+
+
+def active_lessons(sources):
+    """Return active lesson identity and exact-normalized rule for resolver sources."""
+    result = []
+    for scope, store, source in sources:
+        try:
+            text = read_text(source)
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(f'cannot read lessons source: {source}') from exc
+        active = False
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if line.strip().startswith('## '):
+                active = is_active_heading(line.strip()[3:])
+                continue
+            if not active:
+                continue
+            match = ACTIVE_RULE_RE.match(line)
+            if not match:
+                continue
+            lesson_id = match.group(1) or match.group(2)
+            rule = match.group(3)
+            result.append(ActiveLesson(
+                lesson_id, scope, store, str(source), line_number, rule, normalize_rule(rule),
+            ))
+    return tuple(result)
 
 
 def read_text(path):

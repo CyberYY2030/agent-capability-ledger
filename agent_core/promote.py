@@ -2770,10 +2770,89 @@ def _validate_project_ledger(path: Path, project_id: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _project_resolved_sources(repo: Path, project_id: str, state_root: Path | None) -> tuple[tuple[str, str, str], ...]:
+    """Resolve project plus optional configured state stores for exact conflict checks."""
+    project_only = (("project", project_id, str(repo / PROJECT_LEDGER)),)
+    if state_root is None:
+        return project_only
+    global_ledger = state_root.resolve() / GLOBAL_LEDGER
+    if not global_ledger.is_file():
+        raise ConfigError("FAIL_LESSON_ROUTING", "configured global lessons ledger")
+    sources, errors, _warnings = ledger.resolve_sources(str(global_ledger), str(repo))
+    if errors:
+        raise ConfigError("FAIL_LESSON_ROUTING", "configured lessons sources")
+    for source in sources:
+        _defined, validation_errors, _validation_warnings = ledger.validate_sources([source])
+        if validation_errors:
+            raise ConfigError("FAIL_LESSON_ROUTING", "configured lessons source")
+    return tuple(sources)
+
+
+def _exact_rule_conflict(
+    sources: tuple[tuple[str, str, str], ...], rule: str, *, project_id: str,
+    excluded_pointer: tuple[str, str, str] | None = None,
+) -> None:
+    """Reject only conflicts involving the candidate rule, never historic debt."""
+    normalized = ledger.normalize_rule(rule)
+    try:
+        active = ledger.active_lessons(sources)
+    except ValueError as exc:
+        raise ConfigError("FAIL_LESSON_ROUTING", "configured lessons source") from exc
+    conflicts = [
+        entry for entry in active
+        if entry.normalized_rule == normalized
+        and (entry.scope, entry.store, entry.lesson_id) != excluded_pointer
+    ]
+    same_scope = [entry for entry in conflicts if entry.scope == "project" and entry.store == project_id]
+    if same_scope:
+        raise ConfigError("FAIL_EXACT_DUPLICATE", f"project:{project_id}:{same_scope[0].lesson_id}")
+    if conflicts:
+        entry = conflicts[0]
+        raise ConfigError("FAIL_SCOPE_REVIEW", f"{entry.scope}:{entry.store}:{entry.lesson_id}")
+
+
+def _project_active_target(ledger_text: str, lesson_id: str, project_id: str) -> None:
+    del project_id
+    is_active = False
+    for line in ledger_text.splitlines():
+        if line.strip().startswith("## "):
+            is_active = ledger.is_active_heading(line.strip()[3:])
+            continue
+        match = ledger.ENTRY_RE.match(line)
+        if is_active and match and (match.group(1) or match.group(2)) == lesson_id:
+            return
+    raise ConfigError("FAIL_UPDATE_TARGET", lesson_id)
+
+
+def _assert_project_index_clean(repo: Path, paths: tuple[Path, ...]) -> None:
+    relative = tuple(path.relative_to(repo).as_posix() for path in paths)
+    result = _git(repo, "diff", "--cached", "--quiet", "--", *relative, check=False)
+    if result.returncode == 1:
+        raise ConfigError("FAIL_INDEX_CONFLICT", "project promotion paths")
+    if result.returncode != 0:
+        raise ConfigError("FAIL_INDEX_CONFLICT", "project promotion index")
+
+
+def _project_similarity_lines(
+    sources: tuple[tuple[str, str, str], ...], rule: str,
+) -> tuple[str, ...]:
+    """Emit advisory fuzzy hits with their resolved-store identity."""
+    lines: list[str] = []
+    for scope, store, source in sources:
+        try:
+            text = Path(source).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ConfigError("FAIL_LESSON_ROUTING", "configured lessons source") from exc
+        for lesson_id, score in _similarities(text, rule):
+            lines.append(f"SIMILAR scope={scope} store={store} id={lesson_id} score={score:.3f}")
+    return tuple(lines)
+
+
 def _project_plan(
     candidate_id: str, *, project_id: str, lesson_id: str,
     candidate_sha256: str, canonical_sha256: str,
-    supersedes: str | None, force_new: bool,
+    supersedes: str | None, force_new: bool, update: str | None,
+    state_root: Path | None,
 ) -> Plan:
     payload = {
         "operation": "project-promote",
@@ -2786,6 +2865,8 @@ def _project_plan(
         "canonical_sha256": canonical_sha256,
         "supersedes": supersedes,
         "force_new": force_new,
+        "update": update,
+        "state_root": str(state_root.resolve()) if state_root is not None else None,
     }
     digest = _canonical_hash(payload)
     lines = (
@@ -2801,7 +2882,8 @@ def _project_plan(
 
 def plan_project_promote(
     workspace: Path, control_root: Path, candidate_id: str, *,
-    supersedes: str | None = None, force_new: bool = False,
+    supersedes: str | None = None, force_new: bool = False, update: str | None = None,
+    state_root: Path | None = None,
 ) -> Plan:
     del control_root  # Planning is read-only; apply owns the operation lock.
     repo, project_id = _project_context(workspace)
@@ -2813,21 +2895,36 @@ def plan_project_promote(
         raise ConfigError("FAIL_PROJECT_CONTEXT", item["scope_hint"])
     ledger_path = repo / ledger_relative
     ledger_text = _validate_project_ledger(ledger_path, project_id)
+    if sum(value is not None and value is not False for value in (supersedes, force_new, update)) > 1:
+        raise ConfigError("FAIL_PLAN_HASH", "project promote choice")
+    if update is not None:
+        _project_active_target(ledger_text, update, project_id)
     previous = _already_promoted(ledger_text, candidate_id)
     if previous:
         raise ConfigError("FAIL_ALREADY_PROMOTED", previous)
-    similarities = _similarities(ledger_text, item["rule"])
-    _review_similarities(similarities, supersedes=supersedes, force_new=force_new)
+    source = _project_candidate_path(repo, candidate_id)
+    consumed = repo / PROJECT_CONSUMED / source.name
+    _assert_project_index_clean(repo, (ledger_path, source, consumed))
+    sources = _project_resolved_sources(repo, project_id, state_root)
+    excluded_pointer = ("project", project_id, update) if update is not None else None
+    _exact_rule_conflict(sources, item["rule"], project_id=project_id, excluded_pointer=excluded_pointer)
+    project_similarities = _similarities(ledger_text, item["rule"])
+    if supersedes is not None:
+        _project_active_target(ledger_text, supersedes, project_id)
+        if supersedes not in {lesson_id for lesson_id, _score in project_similarities}:
+            raise ConfigError("FAIL_SUPERSEDES", supersedes)
     plan = _project_plan(
         candidate_id,
         project_id=project_id,
-        lesson_id=_next_id(ledger_text, scope, prefix),
+        lesson_id=update or _next_id(ledger_text, scope, prefix),
         candidate_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         canonical_sha256=hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
         supersedes=supersedes,
         force_new=force_new,
+        update=update,
+        state_root=state_root,
     )
-    extra = tuple(f"SIMILAR {item_id} {score:.3f}" for item_id, score in similarities)
+    extra = _project_similarity_lines(sources, item["rule"])
     return replace(plan, lines=extra + plan.lines)
 
 
@@ -2844,6 +2941,42 @@ def _atomic_write_text(path: Path, text: str) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _project_entry(item: dict[str, str], lesson_id: str, label: str,
+                   supersedes: str | None) -> str:
+    """Render project rules verbatim; exact identity must survive a round trip."""
+    suffix = f" supersedes: {supersedes}." if supersedes else ""
+    rendered_id = f"[[lesson:{lesson_id}]]"
+    when = f" when: {item['when']}" if "when" in item else ""
+    return (f"- **{rendered_id} [pending·{label}] {item['rule']}** 触发: {item['trigger']}. "
+            f"代价: {item['cost']}. from: {item['id']}.{suffix} sink → {item['sink']}.{when}")
+
+
+def _append_project_lesson(text: str, item: dict[str, str], lesson_id: str,
+                           label: str, supersedes: str | None) -> str:
+    if supersedes:
+        text = _archive_superseded(text, supersedes, lesson_id)
+    marker = "\n## 归档"
+    if marker not in text:
+        raise ConfigError("FAIL_LEDGER", "missing archive heading")
+    return text.replace(marker, f"\n{_project_entry(item, lesson_id, label, supersedes)}\n{marker}", 1)
+
+
+def _rewrite_project_lesson(text: str, item: dict[str, str], lesson_id: str,
+                            label: str) -> str:
+    lines = text.splitlines()
+    active = False
+    replacement = _project_entry(item, lesson_id, label, None)
+    for index, line in enumerate(lines):
+        if line.strip().startswith("## "):
+            active = ledger.is_active_heading(line.strip()[3:])
+            continue
+        match = ledger.ENTRY_RE.match(line)
+        if active and match and (match.group(1) or match.group(2)) == lesson_id:
+            lines[index] = replacement
+            return "\n".join(lines) + "\n"
+    raise ConfigError("FAIL_UPDATE_TARGET", lesson_id)
 
 
 def _verify_project_plan(plan: Plan, plan_hash: str) -> None:
@@ -2865,6 +2998,11 @@ def apply_project_promote(
         ledger_relative, scope, label, prefix = _ledger_target(item, project_root=repo)
         ledger_path = repo / ledger_relative
         ledger_text = _validate_project_ledger(ledger_path, project_id)
+        update = plan.payload["update"]
+        if update is not None:
+            _project_active_target(ledger_text, update, project_id)
+        consumed = repo / PROJECT_CONSUMED / source.name
+        _assert_project_index_clean(repo, (ledger_path, source, consumed))
         live_candidate_hash = hashlib.sha256(source.read_bytes()).hexdigest()
         live_canonical_hash = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
         expected_values = {
@@ -2872,22 +3010,28 @@ def apply_project_promote(
             "ledger_path": ledger_relative.as_posix(),
             "candidate_sha256": live_candidate_hash,
             "canonical_sha256": live_canonical_hash,
-            "lesson_id": _next_id(ledger_text, scope, prefix),
+            "lesson_id": plan.payload["update"] or _next_id(ledger_text, scope, prefix),
+            "update": plan.payload["update"],
         }
         if any(plan.payload.get(key) != value for key, value in expected_values.items()):
             raise ConfigError("FAIL_INPUT_CHANGED", plan.candidate_id)
         previous = _already_promoted(ledger_text, plan.candidate_id)
         if previous:
             raise ConfigError("FAIL_ALREADY_PROMOTED", previous)
-        rendered = _append_lesson(
-            ledger_text, item, plan.payload["lesson_id"], label, plan.payload["supersedes"],
-        )
+        state_value = plan.payload.get("state_root")
+        state_root = Path(state_value) if isinstance(state_value, str) else None
+        sources = _project_resolved_sources(repo, project_id, state_root)
+        excluded_pointer = ("project", project_id, update) if update is not None else None
+        _exact_rule_conflict(sources, item["rule"], project_id=project_id,
+                             excluded_pointer=excluded_pointer)
+        rendered = (_rewrite_project_lesson(ledger_text, item, update, label) if update is not None else
+                    _append_project_lesson(ledger_text, item, plan.payload["lesson_id"], label,
+                                           plan.payload["supersedes"]))
         _ids, errors, _warnings = ledger.parse_ledger(
             rendered, "project", ledger_relative.as_posix(),
         )
         if errors:
             raise ConfigError("FAIL_LEDGER", "; ".join(errors))
-        consumed = repo / PROJECT_CONSUMED / source.name
         if consumed.exists():
             raise ConfigError("FAIL_CANDIDATE_STATE", plan.candidate_id)
         consumed.parent.mkdir(parents=True, exist_ok=True)
@@ -2901,7 +3045,7 @@ def apply_project_promote(
         ).returncode == 0
         if tracked:
             stage_paths.append(source_relative)
-        _git(repo, "add", "-A", "--", *stage_paths)
+        _git(repo, "add", "--", *stage_paths)
         return ProjectResult(plan.payload["lesson_id"], tuple(stage_paths))
 
 

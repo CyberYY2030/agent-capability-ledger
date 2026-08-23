@@ -22,6 +22,17 @@ def ledger_text(scope: str, name: str | None = None, entry: str = "") -> str:
     )
 
 
+def test_active_rule_normalization_is_nfc_whitespace_only(tmp_path: Path) -> None:
+    path = tmp_path / "LESSONS.md"
+    write(path, ledger_text(
+        "global", entry="- **L-1 [pending·通用] A\u030a  spaced\t rule.** 触发:x. 代价:y. sink → z.",
+    ))
+    active = ledger.active_lessons((("global", "global", str(path)),))
+    assert active[0].normalized_rule == ledger.normalize_rule("Å spaced rule.")
+    assert ledger.normalize_rule("Rule") != ledger.normalize_rule("rule")
+    assert ledger.normalize_rule("Rule.") != ledger.normalize_rule("Rule!")
+
+
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
@@ -160,4 +171,3 @@ class TestLessonRouting:
         assert lines[0].startswith("SOURCE global:global ")
         assert lines[1].startswith("SUMMARY global:global ")
         assert lines[-1].startswith("PASS  ")
-

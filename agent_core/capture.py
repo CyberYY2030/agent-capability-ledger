@@ -123,6 +123,38 @@ def _similarity_lines(root: Path, scope_hint: str, rule: str) -> tuple[str, ...]
     )
 
 
+def _project_capture_sources(
+    config: dict, explicit_state: Path | None, project_root: Path, project_id: str,
+) -> tuple[tuple[str, str, str], ...]:
+    """Resolve project capture stores without turning an offline project into a state operation."""
+    project_only = (("project", project_id, str(project_root / ".agents" / "LESSONS.md")),)
+    try:
+        state = _state_root(config, explicit_state)
+    except ConfigError as exc:
+        if exc.code == "FAIL_STATE_UNBOUND":
+            return project_only
+        raise
+    global_ledger = state / "experience" / "LESSONS.md"
+    if not global_ledger.is_file():
+        return project_only
+    sources, errors, _warnings = ledger.resolve_sources(str(global_ledger), str(project_root))
+    if errors:
+        raise ConfigError("FAIL_LESSON_ROUTING", "configured lessons sources")
+    return tuple(sources)
+
+
+def _resolved_similarity_lines(sources: tuple[tuple[str, str, str], ...], rule: str) -> tuple[str, ...]:
+    lines: list[str] = []
+    for scope, store, source in sources:
+        try:
+            text = Path(source).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ConfigError("FAIL_LESSON_ROUTING", "configured lessons source") from exc
+        for lesson_id, score in _similarities(text, rule):
+            lines.append(f"SIMILAR scope={scope} store={store} id={lesson_id} score={score:.3f}")
+    return tuple(lines)
+
+
 def capture(
     *, config_path: Path, explicit_state: Path | None, control_root: Path,
     workspace: Path, agent: str, rule: str, trigger: str, cost: str,
@@ -167,6 +199,8 @@ def capture(
         forbidden = {str(project_root), str(project_root).replace("\\", "/")}
         _reject_private_values(private_values, (), tuple(forbidden))
         base_revision = f"{_local_head(project_root)} unverified"
+        sources = _project_capture_sources(config, explicit_state, project_root, project_id)
+        lines = list(_resolved_similarity_lines(sources, rule))
         path = create_candidate(
             project_root, control_root, host=host, agent=agent, rule=rule,
             trigger=trigger, cost=cost, sink=sink, scope_hint=expected_scope,
@@ -175,7 +209,6 @@ def capture(
             require_state_freshness=False, allow_project=True,
             when=when,
         )
-        lines = list(_similarity_lines(project_root, expected_scope, rule))
         if rule_warning:
             lines.insert(0, rule_warning)
         return path, tuple(lines)

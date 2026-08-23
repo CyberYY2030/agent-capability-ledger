@@ -6,18 +6,24 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import ConfigError
+from .config import ConfigError, default_config_path, load_config
 from .promote import apply_project_promote, plan_project_promote
+
+
+ENGINE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-core lessons promote")
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--control-root", type=Path, default=Path.home() / ".agent-core")
+    parser.add_argument("--config", type=Path, default=default_config_path(ENGINE_ROOT))
+    parser.add_argument("--state", type=Path)
     parser.add_argument("--id", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--plan-hash")
     choice = parser.add_mutually_exclusive_group()
+    choice.add_argument("--update")
     choice.add_argument("--supersedes")
     choice.add_argument("--force-new", action="store_true")
     return parser
@@ -26,9 +32,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        state_root = args.state
+        if state_root is None:
+            configured = load_config(args.config)["state_root"]
+            if not (configured.startswith("<") and configured.endswith(">")):
+                state_root = Path(configured).expanduser()
         plan = plan_project_promote(
             args.workspace, args.control_root, args.id,
-            supersedes=args.supersedes, force_new=args.force_new,
+            supersedes=args.supersedes, force_new=args.force_new, update=args.update,
+            state_root=state_root,
         )
         if not args.apply:
             for line in plan.lines:

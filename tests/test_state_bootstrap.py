@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from agent_core.cli import main as cli_main
 from agent_core.config import ConfigError
 from agent_core.promote import create_candidate, plan_promote, plan_publish
 from agent_core.state import (
@@ -93,10 +92,9 @@ def test_state_init_plan_is_zero_write(tmp_path: Path) -> None:
 def test_state_init_apply_creates_seeded_clean_main_repo(tmp_path: Path) -> None:
     target = tmp_path / "state"
     target.mkdir()
-    assert cli_main([
-        "state", "init", "--path", str(target), "--apply",
-        "--git-name", "Synthetic Owner", "--git-email", TEST_EMAIL,
-    ]) == 0
+    # State bootstrap remains an internal primitive; the public CLI freezes
+    # historical `state` commands before parsing or writing.
+    apply_init(ROOT, target, git_name="Synthetic Owner", git_email=TEST_EMAIL)
     assert git(target, "branch", "--show-current").stdout.strip() == "main"
     assert git(target, "status", "--porcelain").stdout == ""
     assert git(target, "remote").stdout == ""

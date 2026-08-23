@@ -10,7 +10,7 @@ import pytest
 
 from agent_core.config import ConfigError
 from agent_core.doctor import hook_retrieval_status
-from agent_core.installer import apply_install, apply_uninstall, build_release_manifest
+from agent_core.installer import apply_install, apply_uninstall, build_release_manifest, plan_install
 from agent_core.match import main as match_main
 from agent_core.runtime_config import render_fragment, runtime_hook_path
 from tests.test_install import ROOT, git, installed_fixture
@@ -238,7 +238,7 @@ def test_uninstall_rejects_modified_owned_runtime_hook_group(
     assert "user replacement" in settings.read_text(encoding="utf-8")
 
 
-def test_equivalent_unowned_runtime_hooks_require_force_and_survive_uninstall(
+def test_equivalent_unowned_runtime_hooks_are_foreign_without_a_force_bypass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
@@ -251,13 +251,22 @@ def test_equivalent_unowned_runtime_hooks_require_force_and_survive_uninstall(
         ROOT / "runtimes" / "claude-code" / "hook.fragment.json",
         runtime_root / target["hook_target"],
     )
-    before = json.dumps({"hooks": desired}, separators=(",", ":")).encode("utf-8")
+    ambiguous = json.loads(json.dumps(desired))
+    ambiguous["PreToolUse"].append(ambiguous["PreToolUse"][0])
+    before = json.dumps({"hooks": ambiguous}, separators=(",", ":")).encode("utf-8")
     settings.write_bytes(before)
+    plan = plan_install(ROOT, config, state, ROOT, manifest)
+    assert any(
+        line.startswith("TARGET runtime-config:claude-code status=foreign ") for line in plan
+    )
+    assert plan[-1] == "DRY_RUN writes=0 ready=false no_changes=false"
     with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
         apply_install(ROOT, config, state, ROOT, manifest, force=False)
-    apply_install(ROOT, config, state, ROOT, manifest, force=True)
-    apply_uninstall(config)
+    with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
+        apply_install(ROOT, config, state, ROOT, manifest, force=True)
     assert settings.read_bytes() == before
+    assert not (_install_root / "engine-pin.json").exists()
+    assert not (config.parent / "install-receipt.json").exists()
 
 
 def test_generated_hook_is_fail_open_when_wrapper_returns_nonzero(

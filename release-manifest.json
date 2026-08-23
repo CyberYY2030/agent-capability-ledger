@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "lJo_FXrWWHRglPSA7cKUYW8V4rjshCVEGY0lT_7jKjs",
+  "artifact_sha256": "z6fKVF3JZZzY0JUxHME0jTz9TGEA_l6KWy1CPIqHNfM",
   "files": [
     {
       "path": "LICENSE",
@@ -15,11 +15,11 @@
     },
     {
       "path": "agent_core/capture.py",
-      "sha256": "S21e2MmnWeMmtlZmnomu1tm4sTS3p5kBLQDMGqGG0_I"
+      "sha256": "8-CFn9tClo47B6RcMNr-jIr6zR3mEK9xQi2-29CVPYk"
     },
     {
       "path": "agent_core/cli.py",
-      "sha256": "d6zJZoWLAr4HS0EE-w4ztzY3DWY8PrNG0lvF_QWYBO4"
+      "sha256": "htTKpCYI8f4CZ-LoaQmj9bcDfWBaca2eGNpi2gkTHZc"
     },
     {
       "path": "agent_core/config.py",
@@ -31,7 +31,7 @@
     },
     {
       "path": "agent_core/doctor.py",
-      "sha256": "oUNcN0tNFaFZTzCi99St5sbY_qe7BNYhTcT6AP-X2bs"
+      "sha256": "yAOWsir9AcMycTWvgFM5W5mfu3TIDJrSs8OGbDm22eA"
     },
     {
       "path": "agent_core/fingerprint.py",
@@ -43,7 +43,7 @@
     },
     {
       "path": "agent_core/installer.py",
-      "sha256": "lME_HhOPryljsUqKHZyxHtRqFSWdtkEWXnvq2nJAMSw"
+      "sha256": "Ct40oxsft10St9tE4qajQbsebt6e6syimAnhhD0Gt3I"
     },
     {
       "path": "agent_core/launcher.py",
@@ -51,7 +51,7 @@
     },
     {
       "path": "agent_core/ledger.py",
-      "sha256": "XuNmibW0oi-vogXNcXgwCcciWBooIhqyyY_I1FvyCA0"
+      "sha256": "bTp92mrXScZNHQ_SgDPdDiHd0qcpq77DQu29BGLivow"
     },
     {
       "path": "agent_core/match.py",
@@ -71,11 +71,11 @@
     },
     {
       "path": "agent_core/project_promote.py",
-      "sha256": "PJ0inGVhnDIs8edH-TpNEvI9lp9b_x-ZLwxG6lpayDI"
+      "sha256": "jwK2mPiE028k5JhUDe6mB_dLmhSCbH-GggCGh3j02z8"
     },
     {
       "path": "agent_core/promote.py",
-      "sha256": "tu_GpXdYNH4SsRn3n2ZRQJmqlsDhBgQI9mdLHSA0oOQ"
+      "sha256": "d9qbGyhjo-lQgYHGoNzJcohncmsOppzJvq9e6Y2v_lE"
     },
     {
       "path": "agent_core/provenance.py",
@@ -91,7 +91,7 @@
     },
     {
       "path": "agent_core/runtime_config.py",
-      "sha256": "JSk_uHOuMOt9vd2SVkgvsegmSkcwicWTuWPSIDzi8mc"
+      "sha256": "7x3CTmndd9f0Ug8D1LW9Qbopof7IzqRbwP_2tt22v5s"
     },
     {
       "path": "agent_core/schema/agent-core-lock-1.json",
@@ -167,7 +167,7 @@
     },
     {
       "path": "agent_core/upgrade.py",
-      "sha256": "N8UTT79PSeWoZNVurW5D2KNvq7lk6si98CHf6fhkMkQ"
+      "sha256": "o-wGvqfe-lkTH_8hb4V7DtBMqi43fazWP05m1MziZPk"
     },
     {
       "path": "enforcement/check_active_ledger_roundtrip.py",

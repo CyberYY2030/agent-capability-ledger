@@ -48,6 +48,7 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--config", type=Path, required=True)
     doctor.add_argument("--state", type=Path)
     doctor.add_argument("--state-manifest", type=Path)
+    doctor.add_argument("--workspace", type=Path, default=Path.cwd())
 
     subparsers.add_parser("lessons")
     return parser
@@ -86,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             for line in run_doctor(
                     ENGINE_ROOT, args.config, args.state, args.state_manifest,
-                    require_versioned=args.state is not None):
+                    require_versioned=args.state is not None, workspace=args.workspace):
                 print(line)
             return 0
         parser.print_help()

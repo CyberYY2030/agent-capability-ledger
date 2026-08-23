@@ -150,11 +150,25 @@ def render_plan(plan: UpgradePlan) -> list[str]:
     ]
 
 
+def _install_lock_root(config_path: Path, control_root: Path) -> Path:
+    """Normalize only the two historical upgrade spellings to install's lock."""
+    config_control = config_path.resolve().parent
+    transaction_root = config_control / "txn"
+    try:
+        requested = control_root.resolve()
+    except OSError as exc:
+        raise ConfigError("FAIL_LOCKED", "upgrade control root is unavailable") from exc
+    if requested not in (config_control, transaction_root):
+        raise ConfigError("FAIL_LOCKED", "upgrade control root differs from install lock")
+    return transaction_root
+
+
 def apply_upgrade(
     engine_root: Path, state_root: Path, config_path: Path, source_root: Path,
     manifest_path: Path | None, target_version: str, control_root: Path, plan_hash: str,
 ) -> list[str]:
-    with operation_lock(control_root):
+    install_lock_root = _install_lock_root(config_path, control_root)
+    with operation_lock(install_lock_root):
         plan = plan_upgrade(
             engine_root, state_root, config_path, source_root, manifest_path, target_version,
         )
@@ -166,6 +180,7 @@ def apply_upgrade(
             result = apply_install(
                 engine_root, plan.config_path, plan.state_root, plan.source_root,
                 plan.manifest_path, force=False, expected_version=plan.target_version,
+                already_locked=True,
             )
         except Exception:
             _atomic_write(receipt_path, plan.binding_bytes)
