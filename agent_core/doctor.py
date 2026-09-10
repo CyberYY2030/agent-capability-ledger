@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlsplit
 from . import ledger
 from .config import ConfigError, assert_capability_sources, compose_manifests, load_config
 from .freshness import is_repository, require_fresh
+from .match import HOOK_HEARTBEAT_SCHEMA, HOOK_HEARTBEAT_SCHEMA_V2
 from .privacy import DEFAULT_MAX_BLOB_BYTES, SENSITIVE_IDENTITY_RULES, scan_trees
 from .provenance import EngineLayout, classify_engine_layout, validate_engine_provenance
 from .runtime_config import runtime_hook_path
@@ -122,6 +123,8 @@ def _installed_artifact_line(engine_root: Path, config_path: Path) -> str | None
 def hook_retrieval_status(script: Path) -> tuple[str, str]:
     if not script.is_file():
         raise ConfigError("FAIL_HOOK_MISSING", str(script))
+    if os.name != "nt" and not os.access(script, os.X_OK):
+        raise ConfigError("FAIL_HOOK_NOT_EXECUTABLE", str(script))
     try:
         content = script.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
@@ -135,13 +138,18 @@ def hook_retrieval_status(script: Path) -> tuple[str, str]:
         payload = json.loads(heartbeat.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ConfigError("FAIL_HOOK_HEARTBEAT", str(exc)) from exc
-    expected_fields = {
+    base_fields = {
         "schema", "runtime", "stage", "status", "retrieval_invoked", "result_nonempty",
         "validation_ran", "source_mtime_sha256", "hook_sha256", "observed_utc",
     }
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
+    schema = payload.get("schema") if isinstance(payload, dict) else None
+    expected_fields = {
+        HOOK_HEARTBEAT_SCHEMA: base_fields,
+        HOOK_HEARTBEAT_SCHEMA_V2: base_fields | {"session_id"},
+    }.get(schema)
+    if expected_fields is None or set(payload) != expected_fields:
         raise ConfigError("FAIL_HOOK_HEARTBEAT", "fields mismatch")
-    if payload.get("schema") != "lessons-hook-heartbeat/1" or payload.get("retrieval_invoked") is not True:
+    if payload.get("retrieval_invoked") is not True:
         raise ConfigError("FAIL_HOOK_HEARTBEAT", "retrieval invocation missing")
     if (
         payload.get("runtime") not in {"claude-code", "codex"}
@@ -151,6 +159,11 @@ def hook_retrieval_status(script: Path) -> tuple[str, str]:
         or not isinstance(payload.get("validation_ran"), bool)
         or not isinstance(payload.get("observed_utc"), str)
         or re.fullmatch(r"[0-9a-f]{64}", payload.get("hook_sha256") or "") is None
+        or (
+            schema == HOOK_HEARTBEAT_SCHEMA_V2
+            and payload.get("session_id") is not None
+            and not isinstance(payload.get("session_id"), str)
+        )
     ):
         raise ConfigError("FAIL_HOOK_HEARTBEAT", "value contract mismatch")
     source_signature = payload.get("source_mtime_sha256")
@@ -161,22 +174,16 @@ def hook_retrieval_status(script: Path) -> tuple[str, str]:
     actual_hash = hashlib.sha256(script.read_bytes()).hexdigest()
     if payload.get("hook_sha256") != actual_hash:
         return "WARN", "retrieval_connected_current_version_unobserved"
-    if payload.get("status") == "pass" and payload.get("result_nonempty") is True:
-        return "PASS", f"retrieval_nonempty stage={payload.get('stage')}"
     if payload.get("status") == "warning":
         return "WARN", f"retrieval_warning stage={payload.get('stage')}"
-    return "WARN", f"retrieval_empty stage={payload.get('stage')}"
+    result = "retrieval_nonempty" if payload.get("result_nonempty") is True else "retrieval_empty"
+    return "PASS", f"{result} stage={payload.get('stage')}"
 
 
 def check_remote_parity(state_root: Path, control_root: Path | None = None) -> str:
     """Read and prove that a versioned state checkout matches origin/main."""
     root = control_root or Path.home() / ".agent-core"
-    try:
-        state = require_fresh(state_root, "doctor", root)
-    except ConfigError as exc:
-        if exc.code == "FAIL_REMOTE_PARITY":
-            raise
-        raise ConfigError("FAIL_REMOTE_PARITY", str(exc)) from exc
+    state = require_fresh(state_root, "doctor", root)
     remote = state.remote or ""
     return remote
 
@@ -319,6 +326,20 @@ def assert_repository_separation(engine_root: Path, state_root: Path | None) -> 
 
 def run(engine_root: Path, config_path: Path, state_root: Path | None, state_manifest: Path | None,
         *, require_versioned: bool = False, workspace: Path | None = None) -> list[str]:
+    install_pending = config_path.resolve().parent / "install-pending.json"
+    if os.path.lexists(install_pending):
+        raise ConfigError(
+            "FAIL_INSTALL_RECOVERY",
+            f"pending install transaction requires inspection: {install_pending}",
+        )
+    from .materializer import materialization_pending_path
+
+    materialization_pending = materialization_pending_path(config_path)
+    if os.path.lexists(materialization_pending):
+        raise ConfigError(
+            "FAIL_MATERIALIZATION_RECOVERY",
+            f"pending materialization transaction requires inspection: {materialization_pending}",
+        )
     provenance = None
     installed_line = _installed_artifact_line(engine_root, config_path)
     if installed_line is None:
@@ -353,7 +374,7 @@ def run(engine_root: Path, config_path: Path, state_root: Path | None, state_man
     if duplicate_line is not None:
         lines.append(duplicate_line)
     if state_root is not None and is_repository(state_root):
-        remote = check_remote_parity(state_root)
+        remote = check_remote_parity(state_root, config_path.resolve().parent / "txn")
         lines.append(f"PASS git_remote_parity={remote}")
     for target in config["targets"]:
         active_skills = [
@@ -376,4 +397,27 @@ def run(engine_root: Path, config_path: Path, state_root: Path | None, state_man
         )
         level, detail = hook_retrieval_status(script)
         lines.append(f"{level} lessons_hook target={target['id']} {detail}")
+    if state_root is not None and config.get("targets"):
+        from .materializer import (
+            MaterializationTarget,
+            doctor_materialization_receipt,
+        )
+        from .sync import collect_operations
+
+        operations = collect_operations(engine_root, config, state_root)
+        roots = {
+            target["id"]: Path(target["root"]).expanduser().resolve()
+            for target in config["targets"]
+        }
+        lines.extend(doctor_materialization_receipt(
+            config_path, config, state_root,
+            (
+                MaterializationTarget(
+                    operation.target_id, operation.source_label,
+                    roots[operation.target_id], operation.destination, operation.content,
+                    executable=operation.executable,
+                )
+                for operation in operations
+            ),
+        ))
     return lines

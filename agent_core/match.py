@@ -28,6 +28,7 @@ WHEN_KEYS = {"tasks", "paths", "cmds", "text"}
 SCOPE_ORDER = {"project": 0, "profile": 1, "global": 2}
 STATUS_ORDER = {"pending": 0, "checklist": 1, "enforced": 2}
 HOOK_HEARTBEAT_SCHEMA = "lessons-hook-heartbeat/1"
+HOOK_HEARTBEAT_SCHEMA_V2 = "lessons-hook-heartbeat/2"
 STAGE_FIELDS = {
     "prompt": {"tasks", "text"},
     "dispatch": {"tasks", "paths"},
@@ -285,6 +286,7 @@ def _record_hook_heartbeat(
     *,
     runtime: str,
     stage: str,
+    session_id: str | None,
     source_signature: str | None,
     validation_ran: bool,
     result_nonempty: bool,
@@ -300,9 +302,10 @@ def _record_hook_heartbeat(
         except OSError:
             script_hash = None
     payload = {
-        "schema": HOOK_HEARTBEAT_SCHEMA,
+        "schema": HOOK_HEARTBEAT_SCHEMA_V2,
         "runtime": runtime,
         "stage": stage,
+        "session_id": session_id,
         "status": status,
         "retrieval_invoked": True,
         "result_nonempty": result_nonempty,
@@ -332,8 +335,8 @@ def _record_hook_heartbeat(
 
 def load_fixture_corpus(fixtures: Path) -> list[Lesson]:
     payload = json.loads((fixtures / "corpus.json").read_text(encoding="utf-8"))
-    if payload.get("schema") != "lesson-retrieval-corpus/1" or len(payload.get("entries", [])) != 20:
-        raise MatchError("fixture corpus must contain exactly 20 entries")
+    if payload.get("schema") != "lesson-retrieval-corpus/1" or len(payload.get("entries", [])) != 23:
+        raise MatchError("fixture corpus must contain exactly 23 entries")
     lessons = []
     for index, item in enumerate(payload["entries"], 1):
         raw_when = item.get("when")
@@ -448,8 +451,25 @@ def _quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _retrieval_lines(hit: Hit, stopwords: frozenset[str] | None = None) -> list[str]:
+    if hit.predicate != "text" or hit.lesson.when is None:
+        return []
+    query_tokens = set(tokenize(hit.query_value, stopwords))
+    lines = []
+    for element in hit.lesson.when.get("text", ()):
+        tokens = tokenize(element, stopwords)
+        overlap = sorted(query_tokens & set(tokens))
+        if overlap:
+            lines.append(
+                "RETRIEVAL predicate=when.text mode=any-token any-between-elements"
+                f" element={_quote(element)} tokens={','.join(tokens)}"
+                f" overlap={','.join(overlap)}"
+            )
+    return lines
+
+
 def render(hits: Sequence[Hit], ignored: Sequence[str], budget_chars: int, explain: bool = False,
-           stage: str = "prompt") -> str:
+           stage: str = "prompt", stopwords: frozenset[str] | None = None) -> str:
     if budget_chars < 32:
         raise MatchError("budget_chars must be at least 32")
     lines = []
@@ -463,6 +483,8 @@ def render(hits: Sequence[Hit], ignored: Sequence[str], budget_chars: int, expla
             line += (f" MATCH predicate={hit.predicate} value={_quote(hit.value)}"
                      f" query={_quote(hit.query_value)}")
         lines.append(line)
+        if explain:
+            lines.extend(_retrieval_lines(hit, stopwords))
     if stage == "completion":
         lines.append("CAPTURE review corrections and verified methods; do not write canonical automatically.")
     total = len(lines)
@@ -563,8 +585,8 @@ def evaluate(fixtures: Path, expect_hash: str | None = None) -> tuple[int, list[
     queries = payload.get("queries", [])
     positives = [item for item in queries if item.get("kind") == "positive"]
     negatives = [item for item in queries if item.get("kind") == "negative"]
-    if len(positives) != 30 or len(negatives) != 30:
-        raise MatchError("fixture queries must contain 30 positive and 30 negative cases")
+    if len(positives) != 33 or len(negatives) != 33:
+        raise MatchError("fixture queries must contain 33 positive and 33 negative cases")
     recalled = 0
     false_queries = 0
     unexpected_total = 0
@@ -593,15 +615,15 @@ def evaluate(fixtures: Path, expect_hash: str | None = None) -> tuple[int, list[
             probe_hits, _ = match_lessons(legacy_lessons, Query(stage="prompt", text=probe["text"]))
             if probe["expected_hit"] in [hit.lesson.lesson_id for hit in probe_hits]:
                 legacy_recalled += 1
-    passed = (recalled == 30 and false_queries <= 2 and unexpected_total <= 3
-              and deterministic and legacy_recalled >= 24 and budget_ok)
+    passed = (recalled == 33 and false_queries <= 3 and unexpected_total <= 3
+              and deterministic and legacy_recalled >= 27 and budget_ok)
     lines = [
         f"FIXTURE aggregate_sha256={aggregate}",
-        f"METRIC recall={recalled}/30 threshold=30/30",
-        f"METRIC false_inject={false_queries}/30 threshold<=2/30",
+        f"METRIC recall={recalled}/33 threshold=33/33",
+        f"METRIC false_inject={false_queries}/33 threshold<=3/33",
         f"METRIC unexpected_ids={unexpected_total} threshold<=3",
         f"METRIC deterministic={'yes' if deterministic else 'no'} threshold=yes",
-        f"METRIC legacy_recall={legacy_recalled}/30 threshold>=24/30",
+        f"METRIC legacy_recall={legacy_recalled}/33 threshold>=27/33",
         f"METRIC budget={'pass' if budget_ok else 'fail'} chars={DEFAULT_BUDGET}",
         "PASS lessons eval" if passed else "FAIL lessons eval",
     ]
@@ -625,12 +647,19 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_value = os.environ.get("AGENT_CORE_HOOK_HEARTBEAT")
         heartbeat_path = Path(heartbeat_value).resolve() if heartbeat_value else None
         source_signature: str | None = None
+        session_id: str | None = None
         validation_ran = False
         try:
             if args.event_json:
                 payload = json.loads(args.event_json.read_text(encoding="utf-8"))
             else:
                 payload = json.load(sys.stdin)
+            payload_session_id = payload.get("session_id") if isinstance(payload, Mapping) else None
+            session_id = (
+                payload_session_id
+                if isinstance(payload_session_id, str) and payload_session_id
+                else None
+            )
             workspace = args.workspace
             payload_workspace = payload.get("cwd") if isinstance(payload, Mapping) else None
             if workspace is None and isinstance(payload_workspace, str) and payload_workspace:
@@ -643,10 +672,18 @@ def main(argv: list[str] | None = None) -> int:
             hits, ignored = match_lessons(lessons, query)
             rendered = render(hits, ignored, args.budget_chars, args.explain, query.stage)
             print(rendered, end="")
+            if args.runtime == "claude-code" and args.stage == "completion":
+                from .capture import automatic_completion_capture
+                capture_warning = automatic_completion_capture(
+                    payload, runtime=args.runtime, stage=args.stage, ledger_path=args.ledger,
+                )
+                if capture_warning:
+                    print(capture_warning, file=sys.stderr)
             _record_hook_heartbeat(
                 heartbeat_path,
                 runtime=args.runtime,
                 stage=args.stage,
+                session_id=session_id,
                 source_signature=source_signature,
                 validation_ran=validation_ran,
                 result_nonempty=bool(rendered.strip()),
@@ -658,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
                 heartbeat_path,
                 runtime=args.runtime,
                 stage=args.stage,
+                session_id=session_id,
                 source_signature=source_signature,
                 validation_ran=validation_ran,
                 result_nonempty=False,

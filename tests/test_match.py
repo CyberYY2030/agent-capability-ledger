@@ -29,6 +29,20 @@ def test_tokenization_contract_nfkc_ascii_cjk_stopwords_and_short_terms() -> Non
     assert "这个" not in tokens
 
 
+def test_domain_stopwords_remove_generic_terms_but_preserve_specific_tokens() -> None:
+    domain_stopwords = {
+        "用户", "文件", "配置", "任务", "测试", "步骤",
+        "规则", "修改", "数据", "状态", "目录", "一个",
+    }
+    stopwords = match._load_stopwords()
+
+    assert domain_stopwords <= stopwords
+    assert domain_stopwords.isdisjoint(match.tokenize(" ".join(sorted(domain_stopwords))))
+    assert "全局" in match.tokenize("全局配置")
+    assert "预算" in match.tokenize("测试预算")
+    assert {"运行", "执行"}.isdisjoint(stopwords)
+
+
 def test_when_requires_canonical_json_and_known_string_arrays() -> None:
     assert match.parse_when('{"cmds":["git commit"],"paths":["src/**"]}') == {
         "cmds": ("git commit",), "paths": ("src/**",)
@@ -74,6 +88,31 @@ def test_each_predicate_is_or_matched_and_explained() -> None:
         assert [hit.lesson.lesson_id for hit in hits] == [expected_id]
         assert hits[0].predicate == predicate
         assert f"predicate={predicate}" in match.render(hits, (), 1200, explain=True, stage=query.stage)
+
+
+def test_explain_shows_text_element_tokens_without_changing_default_output() -> None:
+    entry = lesson("SYN-DIAG", "global", "pending", {
+        "text": ("nebula_matrix_crane", "forge --ember", "altitude=0"),
+    })
+    query = match.Query("prompt", text="nebula forge altitude")
+    hits, ignored = match.match_lessons([entry], query)
+
+    plain = match.render(hits, ignored, 1200, stage="prompt")
+    explained = match.render(hits, ignored, 1200, explain=True, stage="prompt")
+
+    assert "RETRIEVAL " not in plain
+    assert 'element="nebula_matrix_crane" tokens=crane,matrix,nebula overlap=nebula' in explained
+    assert 'element="forge --ember" tokens=ember,forge overlap=forge' in explained
+    assert 'element="altitude=0" tokens=altitude overlap=altitude' in explained
+
+
+def test_fixture_precision_shapes_are_present() -> None:
+    payload = json.loads((FIXTURES / "corpus.json").read_text(encoding="utf-8"))
+    entries = {item["id"]: match.parse_when(item["when"]) for item in payload["entries"] if item["when"]}
+    assert {"SYN-BAG", "SYN-ID", "SYN-CJK"} <= set(entries)
+    assert 6 <= len(match.tokenize(entries["SYN-BAG"]["text"][0])) <= 9
+    assert set(match.tokenize(entries["SYN-ID"]["text"][0])) == {"crane", "matrix", "nebula"}
+    assert set(match.tokenize("潮汐车站")) & set(match.tokenize("纸鸢车站")) == {"车站"}
 
 
 def test_prompt_explicitly_ignores_paths_and_commands() -> None:
@@ -126,10 +165,10 @@ def test_fixture_hash_and_eval_gates() -> None:
         match.evaluate(FIXTURES, "0" * 64)
     code, lines = match.evaluate(FIXTURES, actual_hash)
     assert code == 0
-    assert "METRIC recall=30/30 threshold=30/30" in lines
-    assert "METRIC false_inject=0/30 threshold<=2/30" in lines
+    assert "METRIC recall=33/33 threshold=33/33" in lines
+    assert "METRIC false_inject=3/33 threshold<=3/33" in lines
     assert "METRIC deterministic=yes threshold=yes" in lines
-    assert "METRIC legacy_recall=30/30 threshold>=24/30" in lines
+    assert "METRIC legacy_recall=33/33 threshold>=27/33" in lines
 
 
 def test_runtime_payload_fixtures_preserve_stage_field_availability() -> None:

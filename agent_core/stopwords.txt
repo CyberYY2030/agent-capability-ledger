@@ -25,3 +25,16 @@ with
 进行
 需要
 请帮
+# Domain-high-frequency terms admitted by semantic and evidence gates.
+用户
+文件
+配置
+任务
+测试
+步骤
+规则
+修改
+数据
+状态
+目录
+一个

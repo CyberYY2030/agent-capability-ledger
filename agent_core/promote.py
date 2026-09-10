@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import difflib
 import hashlib
 import json
 import os
@@ -23,7 +24,7 @@ from . import ledger
 from .config import ConfigError, HOST_LABEL_RE, load_config
 from .freshness import (CANDIDATE_ID_RE, SHA_RE, load_candidate, parse_candidate_bytes,
                         record_remote_head, require_fresh)
-from .match import parse_markdown, tokenize
+from .match import MatchError, parse_markdown, parse_when, tokenize
 from .project import resolve_project_context
 from .repository import RepositoryContext, _is_reparse_alias, resolve_repository_context
 from .state import _validate_state_binding_context, binding_receipt_path, validate_state_binding
@@ -227,6 +228,12 @@ class StandaloneDispatch:
 @dataclass(frozen=True)
 class ProjectResult:
     lesson_id: str
+    changed_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LocalRejectResult:
+    candidate_id: str
     changed_paths: tuple[str, ...]
 
 
@@ -2719,38 +2726,62 @@ def _clear_last_committed(control_root: Path, sha: str) -> None:
         path.unlink()
 
 
-@contextmanager
-def operation_lock(control_root: Path):
-    path = control_root.resolve() / "locks" / "promote.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stream = path.open("a+b")
-    try:
-        if path.stat().st_size == 0:
-            stream.write(b"0")
-            stream.flush()
-        stream.seek(0)
+def _make_lock_authority():
+    class Token:
+        __slots__ = ()
+
+    active_roots: dict[int, tuple[object, Path]] = {}
+
+    def validate(token: object, control_root: Path) -> None:
+        resolved_root = control_root.resolve()
+        active = active_roots.get(id(token))
+        if active is None or active[0] is not token or active[1] != resolved_root:
+            raise ConfigError("FAIL_LOCK_TOKEN", str(resolved_root))
+
+    @contextmanager
+    def lock(control_root: Path):
+        resolved_root = control_root.resolve()
+        path = resolved_root / "locks" / "promote.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = path.open("a+b")
         try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, BlockingIOError) as exc:
-            raise ConfigError("FAIL_LOCKED", str(path)) from exc
-        yield
-    finally:
-        try:
+            if path.stat().st_size == 0:
+                stream.write(b"0")
+                stream.flush()
             stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        stream.close()
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, BlockingIOError) as exc:
+                raise ConfigError("FAIL_LOCKED", str(path)) from exc
+            token = Token()
+            active_roots[id(token)] = (token, resolved_root)
+            try:
+                yield token
+            finally:
+                active_roots.pop(id(token), None)
+        finally:
+            try:
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            stream.close()
+
+    return lock, validate
+
+
+operation_lock, _validate_lock_token = _make_lock_authority()
+del _make_lock_authority
 
 
 def _project_context(workspace: Path) -> tuple[Path, str]:
@@ -2843,12 +2874,16 @@ def _project_active_target(ledger_text: str, lesson_id: str, project_id: str) ->
 
 
 def _assert_project_index_clean(repo: Path, paths: tuple[Path, ...]) -> None:
+    _assert_local_index_clean(repo, paths, "project promotion")
+
+
+def _assert_local_index_clean(repo: Path, paths: tuple[Path, ...], operation: str) -> None:
     relative = tuple(path.relative_to(repo).as_posix() for path in paths)
     result = _git(repo, "diff", "--cached", "--quiet", "--", *relative, check=False)
     if result.returncode == 1:
-        raise ConfigError("FAIL_INDEX_CONFLICT", "project promotion paths")
+        raise ConfigError("FAIL_INDEX_CONFLICT", f"{operation} paths")
     if result.returncode != 0:
-        raise ConfigError("FAIL_INDEX_CONFLICT", "project promotion index")
+        raise ConfigError("FAIL_INDEX_CONFLICT", f"{operation} index")
 
 
 def _project_similarity_lines(
@@ -3234,6 +3269,39 @@ def _local_update_pointer(value: str | None, scope: str, store: str) -> str | No
     return pieces[2]
 
 
+def _local_effective_when(item: dict[str, str], override: str | None) -> tuple[str | None, str, tuple[str, ...]]:
+    raw = override if override is not None else item.get("when")
+    source = "cli" if override is not None else ("candidate" if raw is not None else "legacy")
+    if raw is None:
+        return None, source, ()
+    try:
+        parsed = parse_when(raw, source="effective when")
+    except MatchError as exc:
+        raise ConfigError("FAIL_WHEN", f"{exc}; RETRY --when <canonical-json>") from exc
+    diagnostics: list[str] = []
+    for predicate, values in parsed.items():
+        for index, value in enumerate(values):
+            tokens = tokenize(value)
+            if not tokens:
+                raise ConfigError(
+                    "FAIL_WHEN",
+                    f"when.{predicate}[{index}] tokenizes empty; RETRY --when <canonical-json>",
+                )
+            diagnostics.append(
+                f"EFFECTIVE_WHEN_TOKENS predicate={predicate} index={index} tokens={','.join(tokens)}"
+            )
+    return raw, source, tuple(diagnostics)
+
+
+def _local_item_with_when(item: dict[str, str], effective_when: str | None) -> dict[str, str]:
+    effective = dict(item)
+    if effective_when is None:
+        effective.pop("when", None)
+    else:
+        effective["when"] = effective_when
+    return effective
+
+
 def _local_entry(item: dict[str, str], lesson_id: str, label: str, *,
                  project: bool, supersedes: str | None = None) -> str:
     rendered_id = lesson_id if label == ledger.SCOPE_LABEL["global"] else f"[[lesson:{lesson_id}]]"
@@ -3268,6 +3336,19 @@ def _local_render(text: str, item: dict[str, str], lesson_id: str, label: str,
             lines[index] = replacement
             return "\n".join(lines) + "\n"
     raise ConfigError("FAIL_UPDATE_TARGET", f"{update}; RETRY with an active target pointer")
+
+
+def _local_preview_lines(preimage: str, postimage: str) -> tuple[str, ...]:
+    """Derive review lines from the exact postimage; re-rendering the entry could drift from bytes written."""
+    before, after = preimage.splitlines(), postimage.splitlines()
+    preview: list[str] = []
+    for tag, before_start, before_end, after_start, after_end in difflib.SequenceMatcher(
+            None, before, after, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        preview.extend(f"POSTIMAGE_REMOVED {line}" for line in before[before_start:before_end] if line.strip())
+        preview.extend(f"POSTIMAGE_ADDED {line}" for line in after[after_start:after_end] if line.strip())
+    return tuple(preview)
 
 
 def _local_exact_and_advisories(sources: tuple[tuple[str, str, Path], ...], rule: str,
@@ -3327,11 +3408,13 @@ def _after_local_promote_canonical_write() -> None:
 def _local_plan(candidate_id: str, *, repo: Path, candidate_path: Path, source: Path, source_kind: str,
                 target: Path, scope: str, store: str, project_id: str | None,
                 state_root: Path | None, config_path: Path | None, control_root: Path,
-                item: dict[str, str], action: str, review_choice: str, update: str | None,
+                item: dict[str, str], effective_when: str | None, effective_when_source: str,
+                effective_when_diagnostics: tuple[str, ...], action: str, review_choice: str, update: str | None,
                 supersedes: str | None, result_id: str,
                 canonical_sha256: str, expected_postimage_sha256: str, source_root: Path, target_root: Path,
                 stage_paths: tuple[str, ...], sources: tuple[tuple[str, str, Path], ...],
-                lines: tuple[str, ...], state: RepositoryContext | None) -> Plan:
+                lines: tuple[str, ...], state: RepositoryContext | None,
+                preview: tuple[str, ...] = ()) -> Plan:
     candidate_token = _local_file_token(candidate_path, "candidate")
     target_token = _local_file_token(target, "target ledger")
     payload = {
@@ -3343,6 +3426,7 @@ def _local_plan(candidate_id: str, *, repo: Path, candidate_path: Path, source: 
         "target_path": target.relative_to(repo).as_posix(), "operation_root": str(repo),
         "target_git_root": str(target_root), "source_git_root": str(source_root),
         "canonical_sha256": canonical_sha256, "expected_postimage_sha256": expected_postimage_sha256,
+        "effective_when": effective_when,
         "action": action, "choice": review_choice,
         "update": update, "supersedes": supersedes,
         "result_id": result_id, "project_id": project_id,
@@ -3364,8 +3448,11 @@ def _local_plan(candidate_id: str, *, repo: Path, candidate_path: Path, source: 
         f"ACTION {action}", f"RESULT_ID {result_id}",
         f"CANDIDATE_SHA256 {payload['candidate_sha256']}",
         f"CANONICAL_SHA256 {canonical_sha256}",
+        f"CANDIDATE_WHEN {item.get('when') or 'null'}",
+        f"EFFECTIVE_WHEN source={effective_when_source} value={effective_when or 'null'}",
+    ) + effective_when_diagnostics + (
         f"EXPECTED_POSTIMAGE_SHA256 {expected_postimage_sha256}", f"PLAN_HASH {plan_hash}",
-    )
+    ) + preview
     return Plan("lessons-promote", candidate_id, "", plan_hash, plan_lines, payload)
 
 
@@ -3439,7 +3526,7 @@ def _local_context_from_plan(plan: Plan) -> LocalPromoteContext:
 
 def plan_local_promote(workspace: Path, control_root: Path | None, candidate_id: str, *,
                        scope_override: str | None = None, supersedes: str | None = None,
-                       force_new: bool = False, update: str | None = None,
+                       force_new: bool = False, update: str | None = None, when: str | None = None,
                        state_root: Path | None = None, config_path: Path | None = None) -> Plan:
     if sum(value is not None and value is not False for value in (supersedes, force_new, update)) != 1:
         raise ConfigError("FAIL_PLAN_HASH", "RETRY choose exactly one --update or --force-new")
@@ -3451,6 +3538,8 @@ def plan_local_promote(workspace: Path, control_root: Path | None, candidate_id:
     state = _local_state_context(state_root)
     candidate_path, source, source_kind = _local_candidate_source(workspace, state, candidate_id)
     item = load_candidate(candidate_path, allow_project=True)
+    effective_when, effective_when_source, effective_when_diagnostics = _local_effective_when(item, when)
+    effective_item = _local_item_with_when(item, effective_when)
     requested_scope = scope_override or item["scope_hint"]
     project_repo: Path | None = None
     project_id: str | None = None
@@ -3481,7 +3570,7 @@ def plan_local_promote(workspace: Path, control_root: Path | None, candidate_id:
         _project_active_target(ledger_text, update_id, project_id or "")
     prior_result_id = _local_existing_result_id(ledger_text, candidate_id)
     result_id = update_id or prior_result_id or _next_id(ledger_text, scope, prefix)
-    expected_entry = _local_entry(item, result_id, label, project=scope == "project", supersedes=supersedes)
+    expected_entry = _local_entry(effective_item, result_id, label, project=scope == "project", supersedes=supersedes)
     existing = _local_promoted_entry(ledger_text, candidate_id, expected_entry)
     consumed = source.parent / "consumed" / source.name
     if state is not None:
@@ -3507,24 +3596,27 @@ def plan_local_promote(workspace: Path, control_root: Path | None, candidate_id:
         current_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
         return _local_plan(candidate_id, repo=repo, candidate_path=candidate_path, source=source, source_kind=source_kind, target=target,
                            scope=scope, store=store, project_id=project_id, state_root=state_root,
-                           config_path=config_path, control_root=control, item=item, action="converge",
+                           config_path=config_path, control_root=control, item=item,
+                           effective_when=effective_when, effective_when_source=effective_when_source,
+                           effective_when_diagnostics=effective_when_diagnostics, action="converge",
                            review_choice="update" if update_id else "force-new", update=update_id,
                            supersedes=supersedes, result_id=existing, canonical_sha256=current_sha256,
                            expected_postimage_sha256=current_sha256,
                            source_root=source_root, target_root=target_root, stage_paths=stage_paths,
                            sources=sources, lines=convergence_advisories, state=state)
     advisories = _local_exact_and_advisories(sources, item["rule"], (scope, store), update_id)
-    expected_postimage_sha256 = hashlib.sha256(
-        _local_render(ledger_text, item, result_id, label, scope, update_id, supersedes).encode("utf-8")
-    ).hexdigest()
+    postimage_text = _local_render(ledger_text, effective_item, result_id, label, scope, update_id, supersedes)
+    expected_postimage_sha256 = hashlib.sha256(postimage_text.encode("utf-8")).hexdigest()
     return _local_plan(candidate_id, repo=repo, candidate_path=candidate_path, source=source, source_kind=source_kind, target=target,
                        scope=scope, store=store, project_id=project_id, state_root=state_root,
                        config_path=config_path, control_root=control, item=item,
+                       effective_when=effective_when, effective_when_source=effective_when_source,
+                       effective_when_diagnostics=effective_when_diagnostics,
                        action="update" if update_id else "force-new", review_choice="update" if update_id else "force-new",
                        update=update_id, supersedes=supersedes, result_id=result_id,
                        canonical_sha256=hashlib.sha256(target.read_bytes()).hexdigest(), source_root=source_root,
                        expected_postimage_sha256=expected_postimage_sha256, target_root=target_root, stage_paths=stage_paths, sources=sources,
-                       lines=advisories, state=state)
+                       lines=advisories, state=state, preview=_local_preview_lines(ledger_text, postimage_text))
 
 
 def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, plan_hash: str, *,
@@ -3546,6 +3638,7 @@ def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, 
                                       supersedes=plan.payload.get("supersedes"),
                                       force_new=plan.payload.get("choice") == "force-new",
                                       update=(f"{plan.payload['target_scope']}:{plan.payload['target_store']}:{plan.payload['update']}" if plan.payload.get("choice") == "update" else None),
+                                      when=plan.payload.get("effective_when"),
                                       state_root=state_root, config_path=bound_config)
         if reviewed.plan_hash != plan.plan_hash:
             raise ConfigError("FAIL_INPUT_CHANGED", "reviewed facts; RETRY replan lessons promote")
@@ -3553,6 +3646,7 @@ def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, 
         context = _local_context_from_plan(reviewed)
         repo, source, target, consumed = context.repo, context.source_path, context.target_path, context.consumed_path
         item = parse_candidate_bytes(context.candidate_raw, reviewed.candidate_id, allow_project=True)
+        effective_item = _local_item_with_when(item, payload.get("effective_when"))
         # Planning uses TextIO's universal-newline view and the atomic writer
         # persists LF.  Render from the same logical ledger text while keeping
         # the raw preimage hash in the reviewed context.
@@ -3560,7 +3654,7 @@ def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, 
         if payload["action"] != "converge":
             if os.path.lexists(consumed):
                 raise ConfigError("FAIL_CANDIDATE_STATE", "consumed candidate; RETRY replan lessons promote")
-            rendered = _local_render(target_text, item, payload["result_id"], ledger.SCOPE_LABEL[payload["target_scope"]],
+            rendered = _local_render(target_text, effective_item, payload["result_id"], ledger.SCOPE_LABEL[payload["target_scope"]],
                                      payload["target_scope"], payload.get("update"), payload.get("supersedes"))
             try:
                 _ids, errors, _warnings = ledger.parse_ledger(
@@ -3574,7 +3668,7 @@ def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, 
             _atomic_write_text(target, rendered)
             _after_local_promote_canonical_write()
         else:
-            expected = _local_entry(item, payload["result_id"], ledger.SCOPE_LABEL[payload["target_scope"]], project=payload["target_scope"] == "project", supersedes=payload.get("supersedes"))
+            expected = _local_entry(effective_item, payload["result_id"], ledger.SCOPE_LABEL[payload["target_scope"]], project=payload["target_scope"] == "project", supersedes=payload.get("supersedes"))
             if (hashlib.sha256(context.target_raw).hexdigest() != payload["expected_postimage_sha256"]
                     or _local_promoted_entry(target_text, plan.candidate_id, expected) != payload["result_id"]):
                 raise ConfigError("FAIL_INPUT_CHANGED", "convergence evidence; RETRY replan lessons promote")
@@ -3594,6 +3688,225 @@ def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, 
             raise ConfigError("FAIL_INPUT_CHANGED", "staging paths; RETRY replan lessons promote")
         _git(repo, "add", "--", *staged)
         return ProjectResult(payload["result_id"], tuple(staged))
+
+
+def _local_reject_locations(workspace: Path, state: RepositoryContext | None,
+                            candidate_id: str) -> tuple[tuple[str, Path, Path, Path], ...]:
+    workspace_repo = _local_git_root(workspace.resolve())
+    project_parent = _resolved_local_path(workspace_repo / PROJECT_INBOX, "candidate")
+    project_source = project_parent / f"{candidate_id}.md"
+    locations = [("project", project_source, project_source.parent / "consumed" / project_source.name,
+                  project_source.parent / "rejected" / project_source.name)]
+    if state is not None:
+        state_source = _safe_state_path(state, INBOX / f"{candidate_id}.md")
+        locations.append((
+            "state", state_source,
+            _safe_state_path(state, CONSUMED / f"{candidate_id}.md"),
+            _safe_state_path(state, INBOX / "rejected" / f"{candidate_id}.md"),
+        ))
+    return tuple(locations)
+
+
+def _local_reject_source(workspace: Path, state: RepositoryContext | None,
+                         candidate_id: str) -> tuple[Path, str, Path]:
+    locations = _local_reject_locations(workspace, state, candidate_id)
+    if any(os.path.lexists(consumed) or os.path.lexists(rejected)
+           for _kind, _source, consumed, rejected in locations):
+        raise ConfigError("FAIL_CANDIDATE_STATE", "consumed/rejected collision; inspect candidate locations")
+    present = [(kind, source, rejected) for kind, source, _consumed, rejected in locations
+               if os.path.lexists(source)]
+    if len(present) != 1:
+        code = "FAIL_CANDIDATE_MISSING" if not present else "FAIL_CANDIDATE_STATE"
+        raise ConfigError(code, "candidate source; inspect project and state inboxes")
+    kind, source, rejected = present[0]
+    try:
+        source = (_local_safe_file(source, "candidate") if kind == "project" else
+                  _local_state_file(state, INBOX / f"{candidate_id}.md", "candidate"))
+        rejected = _resolved_local_path(rejected, "rejected candidate")
+    except ConfigError as exc:
+        raise ConfigError("FAIL_CANDIDATE_STATE", "candidate path identity; inspect candidate locations") from exc
+    return source, kind, rejected
+
+
+def _local_reject_plan(candidate_id: str, *, repo: Path, source: Path, source_kind: str,
+                       destination: Path, raw: bytes, token: OwnedFileToken, head: str,
+                       tracked: bool, state: RepositoryContext | None, state_root: Path | None,
+                       config_path: Path | None, control_root: Path) -> Plan:
+    source_path = source.relative_to(repo).as_posix()
+    destination_path = destination.relative_to(repo).as_posix()
+    stage_paths = (destination_path,) + ((source_path,) if tracked else ())
+    payload = {
+        "operation": "lessons-reject", "candidate_id": candidate_id, "action": "reject",
+        "operation_root": str(repo), "head": head, "source_kind": source_kind,
+        "source_path": source_path, "destination_path": destination_path,
+        "candidate_sha256": hashlib.sha256(raw).hexdigest(),
+        "candidate_identity": (token.device, token.inode, token.size),
+        "source_tracked": tracked, "stage_paths": stage_paths,
+        "state_root": str(state_root.resolve()) if state_root else None,
+        "layout": state.layout if state else None,
+        "state_prefix": state.state_prefix if state else None,
+        "config_path": str(config_path.resolve()) if config_path else None,
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest() if config_path else None,
+        "control_root": str(control_root),
+        "control_filesystem_sha256": _control_filesystem_sha256(control_root),
+    }
+    plan_hash = _canonical_hash(payload)
+    lines = (
+        f"PLAN operation=lessons-reject candidate={candidate_id}",
+        f"SOURCE kind={source_kind} path={source_path} tracked={str(tracked).lower()}",
+        f"SOURCE_IDENTITY device={token.device} inode={token.inode} size={token.size}",
+        f"REPOSITORY root={repo} head={head}",
+        f"STATE root={payload['state_root']} layout={payload['layout']} prefix={payload['state_prefix']}",
+        f"CONFIG path={payload['config_path']} sha256={payload['config_sha256']}",
+        f"CONTROL root={control_root} filesystem_sha256={payload['control_filesystem_sha256']}",
+        f"DESTINATION {destination_path}",
+        f"STAGE_PATHS {','.join(stage_paths)}",
+        f"CANDIDATE_SHA256 {payload['candidate_sha256']}",
+        f"ACTION reject", f"PLAN_HASH {plan_hash}",
+    )
+    return Plan("lessons-reject", candidate_id, "", plan_hash, lines, payload)
+
+
+def plan_local_reject(workspace: Path, control_root: Path | None, candidate_id: str, *,
+                      state_root: Path | None = None, config_path: Path | None = None) -> Plan:
+    if not CANDIDATE_ID_RE.fullmatch(candidate_id):
+        raise ConfigError("FAIL_CANDIDATE", "invalid candidate id; RETRY lessons capture")
+    if config_path is not None and state_root is None:
+        configured = load_config(config_path)["state_root"]
+        if not (configured.startswith("<") and configured.endswith(">")):
+            state_root = Path(configured).expanduser()
+    state = _local_state_context(state_root)
+    source, source_kind, destination = _local_reject_source(workspace, state, candidate_id)
+    repo = _local_git_root(source)
+    raw = source.read_bytes()
+    parse_candidate_bytes(raw, candidate_id, allow_project=source_kind == "project")
+    token = _local_file_token(source, "candidate")
+    head_result = _git(repo, "rev-parse", "HEAD", check=False)
+    head = head_result.stdout.strip()
+    if head_result.returncode != 0 or SHA_RE.fullmatch(head) is None:
+        raise ConfigError("FAIL_GIT", "reject HEAD")
+    tracked = _git(repo, "ls-files", "--error-unmatch", "--", source.relative_to(repo).as_posix(),
+                   check=False).returncode == 0
+    _assert_local_index_clean(repo, (source, destination), "lesson reject")
+    control = _local_control_root(config_path, control_root, state_root)
+    return _local_reject_plan(
+        candidate_id, repo=repo, source=source, source_kind=source_kind, destination=destination,
+        raw=raw, token=token, head=head, tracked=tracked, state=state, state_root=state_root,
+        config_path=config_path, control_root=control,
+    )
+
+
+def _before_local_reject_move(_source: Path, _destination: Path) -> None:
+    """Narrow race-injection seam immediately before no-replace placement."""
+
+
+def _local_directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        entry = os.lstat(path)
+        if _is_reparse_alias(path) or not stat.S_ISDIR(entry.st_mode):
+            raise ValueError
+        return entry.st_dev, entry.st_ino
+    except (OSError, ValueError) as exc:
+        raise ConfigError("FAIL_CANDIDATE_STATE", "rejected parent identity; inspect candidate locations") from exc
+
+
+def _local_move_no_replace(source: Path, destination: Path, token: OwnedFileToken, raw: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = _resolved_local_path(destination, "rejected candidate")
+    parent_identity = _local_directory_identity(destination.parent)
+    if os.path.lexists(destination):
+        raise ConfigError("FAIL_CANDIDATE_STATE", "rejected collision; inspect candidate locations")
+    _before_local_reject_move(source, destination)
+    if _local_directory_identity(destination.parent) != parent_identity:
+        raise ConfigError("FAIL_CANDIDATE_STATE", "rejected parent changed; candidate preserved")
+    try:
+        if os.name == "nt":
+            os.rename(source, destination)
+        else:
+            os.link(source, destination)
+            if not _owned_file_matches(source, token, links=2):
+                raise OSError("hard-link identity changed")
+            source.unlink()
+    except (FileExistsError, OSError) as exc:
+        raise ConfigError("FAIL_CANDIDATE_STATE", "no-replace reject failed; candidate preserved") from exc
+    try:
+        if (not _owned_file_matches(destination, token, links=1) or destination.read_bytes() != raw
+                or os.path.lexists(source)):
+            raise ValueError
+    except (OSError, ValueError) as exc:
+        raise ConfigError("FAIL_CANDIDATE_STATE", "reject move identity changed; inspect both paths") from exc
+
+
+def _local_reject_restore(destination: Path, source: Path, token: OwnedFileToken, raw: bytes) -> None:
+    try:
+        if (os.path.lexists(source) or not _owned_file_matches(destination, token, links=1)
+                or destination.read_bytes() != raw):
+            raise ValueError
+        if os.name == "nt":
+            os.rename(destination, source)
+        else:
+            os.link(destination, source)
+            if not _owned_file_matches(destination, token, links=2):
+                raise OSError("hard-link identity changed")
+            destination.unlink()
+    except (FileExistsError, OSError, ValueError) as exc:
+        raise ConfigError("FAIL_REJECT_RECOVERY", "candidate preserved at rejected path; inspect both paths") from exc
+    if not _owned_file_matches(source, token, links=1) or source.read_bytes() != raw:
+        raise ConfigError("FAIL_REJECT_RECOVERY", "candidate recovery identity changed; inspect both paths")
+
+
+def apply_local_reject(workspace: Path, control_root: Path | None, plan: Plan, plan_hash: str, *,
+                       config_path: Path | None = None) -> LocalRejectResult:
+    if (plan.operation != "lessons-reject" or plan_hash != plan.plan_hash
+            or plan.plan_hash != _canonical_hash(plan.payload)):
+        raise ConfigError("FAIL_INPUT_CHANGED", "RETRY replan lessons reject")
+    payload = plan.payload
+    state_value = payload.get("state_root")
+    state_root = Path(state_value) if isinstance(state_value, str) else None
+    bound_config = Path(payload["config_path"]) if isinstance(payload.get("config_path"), str) else None
+    if bound_config is not None:
+        if (config_path is None or config_path.resolve() != bound_config.resolve()
+                or hashlib.sha256(bound_config.read_bytes()).hexdigest() != payload.get("config_sha256")):
+            raise ConfigError("FAIL_INPUT_CHANGED", "config; RETRY replan lessons reject")
+    control = _local_control_root(bound_config, control_root, state_root)
+    if str(control) != payload.get("control_root"):
+        raise ConfigError("FAIL_INPUT_CHANGED", "lock identity; RETRY replan lessons reject")
+    with operation_lock(control):
+        reviewed = plan_local_reject(
+            workspace, control, plan.candidate_id, state_root=state_root, config_path=bound_config,
+        )
+        if reviewed.plan_hash != plan.plan_hash:
+            raise ConfigError("FAIL_INPUT_CHANGED", "reviewed facts; RETRY replan lessons reject")
+        payload = reviewed.payload
+        repo = Path(payload["operation_root"])
+        source = repo / payload["source_path"]
+        destination = repo / payload["destination_path"]
+        token = _local_file_token(source, "candidate")
+        raw = source.read_bytes()
+        if (tuple(payload["candidate_identity"]) != (token.device, token.inode, token.size)
+                or hashlib.sha256(raw).hexdigest() != payload["candidate_sha256"]):
+            raise ConfigError("FAIL_INPUT_CHANGED", "candidate identity; RETRY replan lessons reject")
+        _assert_local_index_clean(repo, (source, destination), "lesson reject")
+        _local_move_no_replace(source, destination, token, raw)
+        stage_paths = tuple(payload["stage_paths"])
+        try:
+            _git(repo, "add", "--", *stage_paths)
+            staged = tuple(filter(None, _git(
+                repo, "diff", "--cached", "--name-only", "--no-renames", "--", *stage_paths,
+            ).stdout.splitlines()))
+            if set(staged) != set(stage_paths):
+                raise ConfigError("FAIL_INPUT_CHANGED", "staging paths; inspect Git index")
+        except (ConfigError, OSError) as exc:
+            _git(repo, "restore", "--staged", "--", *stage_paths, check=False)
+            remaining = _git(
+                repo, "diff", "--cached", "--name-only", "--no-renames", "--", *stage_paths,
+                check=False,
+            )
+            _local_reject_restore(destination, source, token, raw)
+            if remaining.returncode != 0 or remaining.stdout.strip():
+                raise ConfigError("FAIL_REJECT_RECOVERY", "Git index recovery incomplete; inspect staged paths") from exc
+            raise exc
+        return LocalRejectResult(plan.candidate_id, stage_paths)
 
 
 def apply_prepared(prepared: Prepared, *, retry_inbox_race: bool = False) -> Result:

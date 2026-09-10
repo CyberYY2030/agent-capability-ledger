@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from unicodedata import normalize
@@ -38,6 +39,28 @@ class Freshness:
     unmerged: tuple[str, ...]
     offline: bool
     context: RepositoryContext | None = None
+    remote_issue: str | None = None
+    remote_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class RemoteBaselineFileReview:
+    role: str
+    path: Path
+    exists: bool
+    sha256: str | None
+    last_known_good: str | None
+    status: str
+    action: str
+
+
+@dataclass(frozen=True)
+class RemoteBaselineReview:
+    legacy: RemoteBaselineFileReview
+    current: RemoteBaselineFileReview
+    selected_last_known_good: str | None
+    desired_sha256: str
+    ready: bool
 
 
 def _git(repo: Path, *args: str, timeout: int = 10) -> subprocess.CompletedProcess[str]:
@@ -58,9 +81,24 @@ def _git(repo: Path, *args: str, timeout: int = 10) -> subprocess.CompletedProce
 def _required_git(repo: Path, *args: str) -> str:
     result = _git(repo, *args)
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "git command failed"
-        raise ConfigError("FAIL_GIT", detail)
+        raise ConfigError("FAIL_GIT", _git_failure(args, result))
     return result.stdout.strip()
+
+
+def _git_failure(args: tuple[str, ...], result: subprocess.CompletedProcess[str]) -> str:
+    command = " ".join(args[:2])
+    output = result.stderr.strip() or result.stdout.strip() or "git command failed"
+    first_line = output.splitlines()[0][:240]
+    safe = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@", r"\1***@", first_line)
+    return f"git {command}: {safe}"
+
+
+def _confirmed_offline(result: subprocess.CompletedProcess[str]) -> bool:
+    detail = (result.stderr or result.stdout).casefold()
+    return any(marker in detail for marker in (
+        "could not resolve host", "failed to connect", "network is unreachable",
+        "connection timed out", "connection refused",
+    ))
 
 
 def is_repository(repo: Path) -> bool:
@@ -180,27 +218,189 @@ def _state_path(control_root: Path) -> Path:
     return control_root.resolve() / "remote-state.json"
 
 
+def remote_state_path(config_path: Path) -> Path:
+    return config_path.resolve().parent / "txn" / "remote-state.json"
+
+
+def _is_alias(path: Path) -> bool:
+    junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or bool(callable(junction) and junction())
+
+
+def _remote_state_bytes(path: Path) -> tuple[bytes, str]:
+    if _is_alias(path) or not path.is_file():
+        raise ConfigError("FAIL_REMOTE_STATE", f"not an ordinary file: {path}")
+    try:
+        if path.stat().st_nlink != 1:
+            raise ConfigError("FAIL_REMOTE_STATE", f"remote baseline has aliases: {path}")
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except ConfigError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConfigError("FAIL_REMOTE_STATE", f"invalid remote baseline: {path}") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"last_known_good"}
+        or not isinstance(payload.get("last_known_good"), str)
+        or SHA_RE.fullmatch(payload["last_known_good"]) is None
+    ):
+        raise ConfigError("FAIL_REMOTE_STATE", f"invalid remote baseline: {path}")
+    return raw, payload["last_known_good"]
+
+
+def render_remote_state(sha: str) -> bytes:
+    if SHA_RE.fullmatch(sha) is None:
+        raise ConfigError("FAIL_REMOTE_SHA", sha)
+    return (json.dumps({"last_known_good": sha}, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _baseline_file(role: str, path: Path) -> RemoteBaselineFileReview:
+    if not os.path.lexists(path):
+        return RemoteBaselineFileReview(role, path.resolve(), False, None, None, "absent", "none")
+    raw, known = _remote_state_bytes(path)
+    return RemoteBaselineFileReview(
+        role, path.resolve(), True, sha256(raw).hexdigest(), known, "valid", "none",
+    )
+
+
+def review_remote_state(
+    config_path: Path,
+    repo: Path,
+    remote_revision: str,
+) -> RemoteBaselineReview:
+    """Review install baseline inputs without fetching or writing host state."""
+    resolved_config = config_path.resolve()
+    current = _baseline_file("current", remote_state_path(resolved_config))
+    legacy = _baseline_file("legacy", resolved_config.parent / "remote-state.json")
+    default_config = (Path.home() / ".agent-core" / "host.json").resolve()
+    selected = current if current.exists else (
+        legacy if resolved_config == default_config and legacy.exists else None
+    )
+    selected_role = selected.role if selected is not None else None
+    if current.exists:
+        current = RemoteBaselineFileReview(
+            current.role, current.path, current.exists, current.sha256, current.last_known_good,
+            current.status, "use-current",
+        )
+        if legacy.exists:
+            legacy = RemoteBaselineFileReview(
+                legacy.role, legacy.path, legacy.exists, legacy.sha256, legacy.last_known_good,
+                legacy.status, "preserve-ignored",
+            )
+    elif selected is legacy:
+        legacy = RemoteBaselineFileReview(
+            legacy.role, legacy.path, legacy.exists, legacy.sha256, legacy.last_known_good,
+            legacy.status, "validate-legacy-and-publish",
+        )
+        current = RemoteBaselineFileReview(
+            current.role, current.path, current.exists, current.sha256, current.last_known_good,
+            current.status, "publish-reviewed-remote",
+        )
+    else:
+        current = RemoteBaselineFileReview(
+            current.role, current.path, current.exists, current.sha256, current.last_known_good,
+            current.status, "publish-reviewed-remote",
+        )
+        if legacy.exists:
+            legacy = RemoteBaselineFileReview(
+                legacy.role, legacy.path, legacy.exists, legacy.sha256, legacy.last_known_good,
+                "not-applicable", "preserve-ignored",
+            )
+
+    ready = True
+    selected_known = selected.last_known_good if selected is not None else None
+    if selected_known is not None:
+        context = resolve_repository_context(repo)
+        ancestry = _git(
+            context.repo_root, "merge-base", "--is-ancestor", selected_known, remote_revision,
+        )
+        if ancestry.returncode != 0:
+            ready = False
+            if selected_role == "current":
+                current = RemoteBaselineFileReview(
+                    current.role, current.path, current.exists, current.sha256,
+                    current.last_known_good, "remote-rewind", "block",
+                )
+            else:
+                legacy = RemoteBaselineFileReview(
+                    legacy.role, legacy.path, legacy.exists, legacy.sha256,
+                    legacy.last_known_good, "remote-rewind", "block",
+                )
+    desired = render_remote_state(remote_revision)
+    return RemoteBaselineReview(
+        legacy, current, selected_known, sha256(desired).hexdigest(), ready,
+    )
+
+
 def last_known_remote(control_root: Path) -> str | None:
     path = _state_path(control_root)
-    if not path.is_file():
+    if not os.path.lexists(path):
         return None
+    _raw, value = _remote_state_bytes(path)
+    return value
+
+
+def migrate_legacy_remote_state(
+    config_path: Path,
+    repo: Path,
+    *,
+    lock_token: object,
+) -> bool:
+    """Copy the one legacy default-host baseline without deleting its source."""
+    from .materializer import require_lock_token
+
+    resolved_config = config_path.resolve()
+    control_root = resolved_config.parent / "txn"
+    require_lock_token(lock_token, control_root)
+    current = _state_path(control_root)
+    if os.path.lexists(current):
+        _remote_state_bytes(current)
+        return False
+    default_config = (Path.home() / ".agent-core" / "host.json").resolve()
+    if resolved_config != default_config:
+        return False
+    legacy = resolved_config.parent / "remote-state.json"
+    if not os.path.lexists(legacy):
+        return False
+    raw, _known = _remote_state_bytes(legacy)
+    control_root.mkdir(parents=True, exist_ok=True)
+    if _is_alias(control_root):
+        raise ConfigError("FAIL_REMOTE_STATE", f"control root is an alias: {control_root}")
+    handle, temporary_name = tempfile.mkstemp(prefix="remote-state-migrate-", suffix=".tmp", dir=control_root)
+    temporary = Path(temporary_name)
     try:
-        value = json.loads(path.read_text(encoding="utf-8")).get("last_known_good")
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, str) and SHA_RE.fullmatch(value) else None
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, current)
+        except FileExistsError as exc:
+            raise ConfigError("FAIL_REMOTE_STATE_RACE", str(current)) from exc
+        except OSError as exc:
+            raise ConfigError("FAIL_REMOTE_STATE_RACE", str(current)) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+    copied, _value = _remote_state_bytes(current)
+    if copied != raw:
+        raise ConfigError("FAIL_REMOTE_STATE_RACE", str(current))
+    return True
 
 
 def record_remote_head(control_root: Path, sha: str) -> None:
-    if not SHA_RE.fullmatch(sha):
-        raise ConfigError("FAIL_REMOTE_SHA", sha)
+    desired = render_remote_state(sha)
     path = _state_path(control_root)
+    if os.path.lexists(path):
+        _remote_state_bytes(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_alias(path.parent):
+        raise ConfigError("FAIL_REMOTE_STATE", f"control root is an alias: {path.parent}")
     handle, temporary_name = tempfile.mkstemp(prefix="remote-state-", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(json.dumps({"last_known_good": sha}, sort_keys=True) + "\n")
+            stream.write(desired.decode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
         temporary.replace(path)
@@ -208,43 +408,91 @@ def record_remote_head(control_root: Path, sha: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def inspect(repo: Path, control_root: Path, *, fetch: bool = True) -> Freshness:
+def inspect(
+    repo: Path,
+    control_root: Path,
+    *,
+    fetch: bool = True,
+    reviewed_known_remote: str | None = None,
+    baseline_reviewed: bool = False,
+) -> Freshness:
     context = resolve_repository_context(repo)
     repository = context.repo_root
     head = _required_git(repository, "rev-parse", "HEAD")
     offline = False
-    if fetch:
+    remote_issue: str | None = None
+    remote_detail: str | None = None
+    origin = _git(repository, "remote", "get-url", "origin")
+    if origin.returncode != 0:
+        remote_issue = "origin-missing"
+        remote_detail = _git_failure(("remote", "get-url", "origin"), origin)
+    elif fetch:
         fetched = _git(repository, "fetch", "origin", "--quiet")
-        offline = fetched.returncode != 0
-    remote_result = _git(repository, "rev-parse", "--verify", "origin/main")
-    remote = remote_result.stdout.strip() if remote_result.returncode == 0 else None
-    if fetch and offline:
-        remote = None
+        if fetched.returncode != 0:
+            offline = _confirmed_offline(fetched)
+            remote_issue = "fetch-failed"
+            remote_detail = _git_failure(("fetch", "origin", "--quiet"), fetched)
+    remote = None
+    if remote_issue is None:
+        remote_result = _git(repository, "rev-parse", "--verify", "origin/main")
+        if remote_result.returncode == 0:
+            remote = remote_result.stdout.strip()
+        else:
+            remote_issue = "main-missing"
+            remote_detail = _git_failure(
+                ("rev-parse", "--verify", "origin/main"), remote_result,
+            )
     dirty, unmerged = _status(context)
     behind = ahead = 0
     if remote is not None:
         counts = _required_git(repository, "rev-list", "--left-right", "--count", "HEAD...origin/main").split()
         ahead, behind = (int(counts[0]), int(counts[1]))
-        known = last_known_remote(control_root)
+        known = reviewed_known_remote if baseline_reviewed else last_known_remote(control_root)
         if known and _git(repository, "merge-base", "--is-ancestor", known, remote).returncode != 0:
             raise ConfigError("FAIL_REMOTE_REWIND", f"last={known} remote={remote}")
-    return Freshness(head, remote, behind, ahead, dirty, unmerged, offline or remote is None, context)
+    return Freshness(
+        head, remote, behind, ahead, dirty, unmerged, offline, context,
+        remote_issue, remote_detail,
+    )
 
 
-def require_fresh(repo: Path, operation: str, control_root: Path, *, fetch: bool = True) -> Freshness:
-    state = inspect(repo, control_root, fetch=fetch)
+def require_fresh(
+    repo: Path,
+    operation: str,
+    control_root: Path,
+    *,
+    fetch: bool = True,
+    reviewed_known_remote: str | None = None,
+    baseline_reviewed: bool = False,
+) -> Freshness:
+    state = inspect(
+        repo, control_root, fetch=fetch,
+        reviewed_known_remote=reviewed_known_remote, baseline_reviewed=baseline_reviewed,
+    )
     if state.unmerged:
         raise ConfigError("FAIL_CONFLICT", ",".join(state.unmerged))
     if state.dirty:
         raise ConfigError("FAIL_DIRTY", ",".join(state.dirty))
     if operation == "capture":
         return state
-    if state.offline:
-        code = "FAIL_REMOTE_PARITY" if operation == "doctor" else "REMOTE_REQUIRED"
-        raise ConfigError(code, f"{operation} requires origin/main")
+    if state.remote_issue is not None:
+        if operation == "doctor":
+            code = {
+                "origin-missing": "FAIL_REMOTE_ORIGIN",
+                "fetch-failed": "FAIL_REMOTE_FETCH",
+                "main-missing": "FAIL_REMOTE_REF",
+            }[state.remote_issue]
+        else:
+            code = "REMOTE_REQUIRED"
+        raise ConfigError(code, state.remote_detail or state.remote_issue)
     if state.behind:
-        code = "FAIL_STALE" if operation == "promote" else "FAIL_DIVERGED"
-        raise ConfigError(code, f"behind={state.behind}")
+        code = (
+            "FAIL_STALE" if operation == "promote"
+            else "FAIL_REMOTE_DIVERGED" if operation == "doctor"
+            else "FAIL_DIVERGED"
+        )
+        raise ConfigError(code, f"ahead={state.ahead} behind={state.behind}")
     if state.ahead:
-        raise ConfigError("FAIL_DIVERGED", f"ahead={state.ahead}")
+        code = "FAIL_REMOTE_DIVERGED" if operation == "doctor" else "FAIL_DIVERGED"
+        raise ConfigError(code, f"ahead={state.ahead} behind={state.behind}")
     return state

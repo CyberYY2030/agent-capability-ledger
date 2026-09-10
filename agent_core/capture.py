@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Mapping
 
 from . import ledger, privacy
 from .config import ConfigError, default_config_path, load_config
+from .freshness import load_candidate
 from .match import MatchError, parse_when
 from .project import resolve_project_context
-from .promote import _similarities, create_candidate
+from .promote import _similarities, create_candidate, operation_lock
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +31,29 @@ PROJECT_CAPTURE_RULES = (
 )
 PATH_RULE_IDS = {rule.rule_id for rule in privacy.CAPTURE_ABSOLUTE_PATH_RULES}
 RULE_RETRY = "RETRY use --rule '当 <可观察触发>，先 <一个原子动作>'"
+CAPTURE_SENTINEL = "agent-core-capture"
+CAPTURE_FIELDS = ("rule", "trigger", "cost", "sink")
+CAPTURE_MESSAGE_LIMIT = 64 * 1024
+CAPTURE_SCAN_FILE_LIMIT = 4096
+CAPTURE_SCAN_BYTE_LIMIT = 4 * 1024 * 1024
+CAPTURE_WARNING = "WARNING automatic lesson capture unavailable"
+AUTOMATIC_CAPTURE_GATES = frozenset({
+    "payload-event",
+    "payload-active-missing",
+    "payload-active",
+    "payload-output",
+    "parse",
+    "identity",
+    "lock",
+    "scan",
+    "capture",
+})
+
+
+def _automatic_capture_warning(gate: str) -> str:
+    if gate not in AUTOMATIC_CAPTURE_GATES:
+        raise AssertionError("unknown automatic capture gate")
+    return f"{CAPTURE_WARNING} gate={gate}"
 
 
 def _state_root(config: dict, explicit: Path | None) -> Path:
@@ -159,6 +186,8 @@ def capture(
     *, config_path: Path, explicit_state: Path | None, control_root: Path,
     workspace: Path, agent: str, rule: str, trigger: str, cost: str,
     sink: str, scope: str, evidence: str, when: str | None = None,
+    require_state_freshness: bool = True, base_revision: str | None = None,
+    include_advisories: bool = True,
 ) -> tuple[Path, tuple[str, ...]]:
     for field, value in (("trigger", trigger), ("cost", cost), ("sink", sink)):
         _missing(value, field)
@@ -216,8 +245,11 @@ def capture(
     path = create_candidate(
         state, control_root, host=host, agent=agent, rule=rule, trigger=trigger,
         cost=cost, sink=sink, scope_hint=scope, evidence=evidence,
-        when=when,
+        when=when, require_state_freshness=require_state_freshness,
+        base_revision=base_revision,
     )
+    if not include_advisories:
+        return path, ()
     lines = list(_similarity_lines(state, scope, rule))
     if scope == "global":
         root_text = ledger.find_git_root(str(workspace))
@@ -237,6 +269,183 @@ def capture(
     if rule_warning:
         lines.insert(0, rule_warning)
     return path, tuple(lines)
+
+
+def _strict_capture_object(raw: str) -> dict[str, str]:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ConfigError("REJECTED", "automatic capture malformed JSON") from exc
+    if not isinstance(value, dict) or set(value) != set(CAPTURE_FIELDS):
+        raise ConfigError("REJECTED", "automatic capture fields mismatch")
+    if any(not isinstance(value[field], str) or not value[field].strip() for field in CAPTURE_FIELDS):
+        raise ConfigError("REJECTED", "automatic capture fields must be non-empty strings")
+    try:
+        for field in CAPTURE_FIELDS:
+            value[field].encode("utf-8")
+    except UnicodeError as exc:
+        raise ConfigError("REJECTED", "automatic capture fields are not UTF-8") from exc
+    return {field: value[field] for field in CAPTURE_FIELDS}
+
+
+def parse_completion_capture(message: str) -> dict[str, str] | None:
+    if not isinstance(message, str) or not message:
+        return None
+    try:
+        encoded = message.encode("utf-8")
+    except UnicodeError as exc:
+        raise ConfigError("REJECTED", "automatic capture output is not UTF-8") from exc
+    if len(encoded) > CAPTURE_MESSAGE_LIMIT:
+        raise ConfigError("REJECTED", "automatic capture output exceeds limit")
+    lines = message.splitlines()
+    sentinels: list[int] = []
+    fence: str | None = None
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        marker = "```" if stripped.startswith("```") else ("~~~" if stripped.startswith("~~~") else None)
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+            continue
+        if fence is None and line == CAPTURE_SENTINEL:
+            sentinels.append(index)
+    if not sentinels:
+        return None
+    if len(sentinels) != 1:
+        raise ConfigError("REJECTED", "automatic capture block count")
+    index = sentinels[0]
+    if index + 1 >= len(lines):
+        raise ConfigError("REJECTED", "automatic capture JSON missing")
+    if any(line for line in lines[index + 2:]):
+        raise ConfigError("REJECTED", "automatic capture trailing content")
+    return _strict_capture_object(lines[index + 1])
+
+
+def _request_sha256(fields: Mapping[str, str]) -> str:
+    raw = json.dumps(
+        {field: fields[field] for field in CAPTURE_FIELDS},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _duplicate_request(state: Path, token: str) -> bool:
+    files = 0
+    total = 0
+    for inbox in (state / "inbox", state / "inbox" / "consumed"):
+        if not inbox.exists():
+            continue
+        if not inbox.is_dir() or inbox.is_symlink():
+            raise ConfigError("REJECTED", "automatic capture inbox identity")
+        for path in sorted(inbox.glob("*.md")):
+            files += 1
+            if files > CAPTURE_SCAN_FILE_LIMIT:
+                raise ConfigError("REJECTED", "automatic capture scan budget")
+            info = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ConfigError("REJECTED", "automatic capture candidate identity")
+            total += info.st_size
+            if total > CAPTURE_SCAN_BYTE_LIMIT:
+                raise ConfigError("REJECTED", "automatic capture scan budget")
+            try:
+                candidate = load_candidate(path)
+            except (ConfigError, OSError, UnicodeError, ValueError):
+                continue
+            if token in candidate["evidence"].split():
+                return True
+    return False
+
+
+def automatic_completion_capture(
+    payload: Mapping[str, object], *, runtime: str, stage: str,
+    ledger_path: Path, config_path: Path | None = None,
+) -> str | None:
+    """Fail-open Claude Stop adapter; return one bounded warning or None."""
+    if runtime != "claude-code" or stage != "completion":
+        return None
+
+    try:
+        if payload.get("hook_event_name") != "Stop":
+            return _automatic_capture_warning("payload-event")
+    except Exception:
+        return _automatic_capture_warning("payload-event")
+
+    try:
+        if "stop_hook_active" not in payload:
+            return _automatic_capture_warning("payload-active-missing")
+        if payload.get("stop_hook_active") is not False:
+            return _automatic_capture_warning("payload-active")
+    except Exception:
+        return _automatic_capture_warning("payload-active")
+
+    try:
+        message = payload.get("last_assistant_message")
+        if not isinstance(message, str) or not message:
+            return _automatic_capture_warning("payload-output")
+    except Exception:
+        return _automatic_capture_warning("payload-output")
+
+    try:
+        fields = parse_completion_capture(message)
+        if fields is None:
+            return None
+        request_digest = _request_sha256(fields)
+        output_digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        token = f"request-sha256:{request_digest}"
+        evidence = (
+            f"claude-code-stop {token} "
+            f"assistant-output-sha256:{output_digest}"
+        )
+    except Exception:
+        return _automatic_capture_warning("parse")
+
+    try:
+        resolved_config = (config_path or default_config_path(ENGINE_ROOT)).resolve()
+        config = load_config(resolved_config)
+        state = _state_root(config, None)
+        expected_ledger = (state / "experience" / "LESSONS.md").resolve()
+        if ledger_path.resolve() != expected_ledger:
+            raise ConfigError("REJECTED", "automatic capture ledger identity")
+        control_root = resolved_config.parent / "txn"
+    except Exception:
+        return _automatic_capture_warning("identity")
+
+    try:
+        with operation_lock(control_root):
+            try:
+                base_revision = f"{_local_head(state)} unverified"
+            except Exception:
+                return _automatic_capture_warning("identity")
+            try:
+                duplicate = _duplicate_request(state, token)
+            except Exception:
+                return _automatic_capture_warning("scan")
+            if duplicate:
+                return None
+            try:
+                capture(
+                    config_path=resolved_config, explicit_state=state,
+                    control_root=control_root, workspace=state,
+                    agent="claude-code", rule=fields["rule"], trigger=fields["trigger"],
+                    cost=fields["cost"], sink=fields["sink"], scope="global",
+                    evidence=evidence, require_state_freshness=False,
+                    base_revision=base_revision, include_advisories=False,
+                )
+            except Exception:
+                return _automatic_capture_warning("capture")
+    except Exception:
+        return _automatic_capture_warning("lock")
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:

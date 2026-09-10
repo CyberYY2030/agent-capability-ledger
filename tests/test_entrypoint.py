@@ -88,4 +88,4 @@ def test_wrapper_version_from_temporary_cwd(tmp_path: Path) -> None:
         command = ["sh", str(ROOT / "agent-core"), "--version"]
     result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "0.1.0.dev2"
+    assert result.stdout.strip() == "0.1.0.dev9"

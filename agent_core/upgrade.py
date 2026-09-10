@@ -168,7 +168,7 @@ def apply_upgrade(
     manifest_path: Path | None, target_version: str, control_root: Path, plan_hash: str,
 ) -> list[str]:
     install_lock_root = _install_lock_root(config_path, control_root)
-    with operation_lock(install_lock_root):
+    with operation_lock(install_lock_root) as lock_token:
         plan = plan_upgrade(
             engine_root, state_root, config_path, source_root, manifest_path, target_version,
         )
@@ -180,7 +180,7 @@ def apply_upgrade(
             result = apply_install(
                 engine_root, plan.config_path, plan.state_root, plan.source_root,
                 plan.manifest_path, force=False, expected_version=plan.target_version,
-                already_locked=True,
+                lock_token=lock_token,
             )
         except Exception:
             _atomic_write(receipt_path, plan.binding_bytes)

@@ -46,8 +46,13 @@ PASS remote_sha=<SHA> rollback=<ROLLBACK_ID>
 ```
 
 ```console
-$ python -m agent_core.cli sync --config '<CONFIG>' --state '<STATE>' --apply
-PASS backup_created=True
+$ python -m agent_core.cli sync --config '<CONFIG>' --state '<STATE>' --dry-run
+PLAN_HASH <SYNC_PLAN_HASH>
+```
+
+```console
+$ python -m agent_core.cli sync --config '<CONFIG>' --state '<STATE>' --apply --plan-hash '<SYNC_PLAN_HASH>'
+PASS backup_created=False
 ```
 
 ```console
