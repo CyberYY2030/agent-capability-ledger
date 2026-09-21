@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "ybRVFKg2GCKtyPAka_cl7E8-QfvHde6GPGbWYI-Mo54",
+  "artifact_sha256": "Zh5ToTIpNLs0T4hmcVaLlZVk936gNR6mUo0VayKaThc",
   "files": [
     {
       "path": "LICENSE",
@@ -11,7 +11,7 @@
     },
     {
       "path": "agent_core/__init__.py",
-      "sha256": "74agu_mO5E21yh-HLV4B5_gBgQlzAFmJ9WglMfBw5Xw"
+      "sha256": "qe533swggxaTiqRzVU8d1QeHSW_KLxPN6evg5ebWKAI"
     },
     {
       "path": "agent_core/capture.py",
@@ -43,7 +43,7 @@
     },
     {
       "path": "agent_core/installer.py",
-      "sha256": "lUF6XtPU4LpCzaezc0USXZzsrVCKFphk4GXdL-AlIQo"
+      "sha256": "d-vsaJAzlIMDqMq4xCKZCFxlOD-o4qBHHDlIPV6r4DI"
     },
     {
       "path": "agent_core/launcher.py",
@@ -223,7 +223,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "sApPiJAROEGv1aGx3hjglwH3Aq1ItG0IxTFhdnqzZGo"
+      "sha256": "w9GfPzcPLD5exneMk9n_4XHxN42Vi9UVS92Dtzlxhok"
     },
     {
       "path": "runtimes/claude-code/head.md",
@@ -311,5 +311,5 @@
     }
   ],
   "schema": "release-manifest/1",
-  "version": "0.1.0.dev11"
+  "version": "0.1.0.dev12"
 }

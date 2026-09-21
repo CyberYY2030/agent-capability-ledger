@@ -380,6 +380,8 @@ def _move_no_replace(source: Path, destination: Path) -> None:
             os.rename(source, destination)
         elif sys.platform == "darwin":
             _darwin_move_no_replace(source, destination)
+        elif sys.platform.startswith("linux") and source.is_dir() and not source.is_symlink():
+            _linux_move_no_replace(source, destination)
         elif source.is_file():
             # A hard-link publication is exclusive on POSIX; directory replacement is not.
             os.link(source, destination)
@@ -408,6 +410,33 @@ def _darwin_move_no_replace(source: Path, destination: Path) -> None:
     observed_errno = ctypes.get_errno()
     if observed_errno == errno.EEXIST:
         raise ConfigError("FAIL_INSTALL_RACE", "destination was recreated during install")
+    raise ConfigError("FAIL_INSTALL_RACE", "no-replace placement failed") from OSError(
+        observed_errno, os.strerror(observed_errno), destination,
+    )
+
+
+def _linux_move_no_replace(source: Path, destination: Path) -> None:
+    """Use Linux renameat2 for kernel-enforced exclusive directory placement."""
+    import ctypes
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as exc:
+        raise ConfigError("FAIL_INSTALL_RACE", "no-replace placement is unavailable") from exc
+    renameat2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if renameat2(
+        -100, os.fsencode(source), -100, os.fsencode(destination), 0x00000001,
+    ) == 0:
+        return
+    observed_errno = ctypes.get_errno()
+    if observed_errno == errno.EEXIST:
+        raise ConfigError("FAIL_INSTALL_RACE", "destination was recreated during install")
+    if observed_errno in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}:
+        raise ConfigError("FAIL_INSTALL_RACE", "no-replace placement is unavailable")
     raise ConfigError("FAIL_INSTALL_RACE", "no-replace placement failed") from OSError(
         observed_errno, os.strerror(observed_errno), destination,
     )

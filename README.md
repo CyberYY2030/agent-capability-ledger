@@ -7,7 +7,7 @@ useful guidance can reach the agent without loading the whole ledger.
 
 The public repository is a reviewable engine export. Real use requires your own
 private state and host configuration; this checkout contains neither. It is a
-single-owner prototype, not a hosted service. Candidate version: **0.1.0.dev11**.
+single-owner prototype, not a hosted service. Candidate version: **0.1.0.dev12**.
 
 ## Try a synthetic lesson (no installation)
 

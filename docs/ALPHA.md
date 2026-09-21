@@ -1,8 +1,9 @@
-# Alpha candidate: 0.1.0.dev11
+# Alpha candidate: 0.1.0.dev12
 
-This candidate prepares one update from the current public dev2 engine. It
-combines the previously reviewed first-use and publication work with the newer
-lessons delivery, evaluation, and shell-format work. Publication and runtime
+This candidate repairs Linux directory publication in the dev11 first-use
+journey while retaining the lessons delivery, evaluation, and shell-format work.
+It uses the kernel no-replace rename operation and fails closed when that
+operation is unavailable; an existing target is never overwritten. Publication and runtime
 activation are separate reviewed actions. No private data or private Git
 history accompanies the public export.
 
@@ -44,7 +45,7 @@ From a public candidate checkout, create an isolated Python 3.11+ environment,
 install `requirements-dev.txt`, and use that environment's `python`:
 
 ```sh
-python -m pytest tests/test_entrypoint.py tests/test_public_content_contract.py tests/test_publication_policy.py tests/test_public_setup.py tests/test_shell_format.py tests/test_privacy.py::PrivacyTreeTests tests/test_privacy.py::PrivacyGitTests tests/test_privacy.py::RuleContractTests -q
+python -m pytest tests/test_entrypoint.py tests/test_public_content_contract.py tests/test_publication_policy.py tests/test_public_setup.py tests/test_no_replace.py tests/test_shell_format.py tests/test_privacy.py::PrivacyTreeTests tests/test_privacy.py::PrivacyGitTests tests/test_privacy.py::RuleContractTests -q
 python templates/check_shell_format.py install.sh runtimes/generic/user_prompt.sh
 python -m agent_core.privacy --tree . --publication --strict
 python -m agent_core.privacy --git-repo . --publication --strict
