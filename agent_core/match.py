@@ -28,6 +28,7 @@ WHEN_KEYS = {"tasks", "paths", "cmds", "text"}
 SCOPE_ORDER = {"project": 0, "profile": 1, "global": 2}
 STATUS_ORDER = {"pending": 0, "checklist": 1, "enforced": 2}
 HOOK_HEARTBEAT_SCHEMA = "lessons-hook-heartbeat/1"
+HOOK_HEARTBEAT_SCHEMA_V2 = "lessons-hook-heartbeat/2"
 STAGE_FIELDS = {
     "prompt": {"tasks", "text"},
     "dispatch": {"tasks", "paths"},
@@ -285,6 +286,7 @@ def _record_hook_heartbeat(
     *,
     runtime: str,
     stage: str,
+    session_id: str | None,
     source_signature: str | None,
     validation_ran: bool,
     result_nonempty: bool,
@@ -300,9 +302,10 @@ def _record_hook_heartbeat(
         except OSError:
             script_hash = None
     payload = {
-        "schema": HOOK_HEARTBEAT_SCHEMA,
+        "schema": HOOK_HEARTBEAT_SCHEMA_V2,
         "runtime": runtime,
         "stage": stage,
+        "session_id": session_id,
         "status": status,
         "retrieval_invoked": True,
         "result_nonempty": result_nonempty,
@@ -332,8 +335,8 @@ def _record_hook_heartbeat(
 
 def load_fixture_corpus(fixtures: Path) -> list[Lesson]:
     payload = json.loads((fixtures / "corpus.json").read_text(encoding="utf-8"))
-    if payload.get("schema") != "lesson-retrieval-corpus/1" or len(payload.get("entries", [])) != 20:
-        raise MatchError("fixture corpus must contain exactly 20 entries")
+    if payload.get("schema") != "lesson-retrieval-corpus/1" or len(payload.get("entries", [])) != 23:
+        raise MatchError("fixture corpus must contain exactly 23 entries")
     lessons = []
     for index, item in enumerate(payload["entries"], 1):
         raw_when = item.get("when")
@@ -448,32 +451,64 @@ def _quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def render(hits: Sequence[Hit], ignored: Sequence[str], budget_chars: int, explain: bool = False,
-           stage: str = "prompt") -> str:
+def _retrieval_lines(hit: Hit, stopwords: frozenset[str] | None = None) -> list[str]:
+    if hit.predicate != "text" or hit.lesson.when is None:
+        return []
+    query_tokens = set(tokenize(hit.query_value, stopwords))
+    lines = []
+    for element in hit.lesson.when.get("text", ()):
+        tokens = tokenize(element, stopwords)
+        overlap = sorted(query_tokens & set(tokens))
+        if overlap:
+            lines.append(
+                "RETRIEVAL predicate=when.text mode=any-token any-between-elements"
+                f" element={_quote(element)} tokens={','.join(tokens)}"
+                f" overlap={','.join(overlap)}"
+            )
+    return lines
+
+
+def _render_with_hits(
+    hits: Sequence[Hit],
+    ignored: Sequence[str],
+    budget_chars: int,
+    explain: bool = False,
+    stage: str = "prompt",
+    stopwords: frozenset[str] | None = None,
+) -> tuple[str, tuple[Hit, ...]]:
     if budget_chars < 32:
         raise MatchError("budget_chars must be at least 32")
-    lines = []
+    lines: list[tuple[str, Hit | None]] = []
     if explain:
         lines.extend(
-            f"IGNORED predicate={field} reason=unavailable-at-{stage}" for field in sorted(ignored)
+            (f"IGNORED predicate={field} reason=unavailable-at-{stage}", None)
+            for field in sorted(ignored)
         )
     for hit in hits:
         line = f"LESSON {hit.lesson.lesson_id}: {hit.lesson.rule} sink={hit.lesson.sink}"
         if explain:
             line += (f" MATCH predicate={hit.predicate} value={_quote(hit.value)}"
                      f" query={_quote(hit.query_value)}")
-        lines.append(line)
-    if stage == "completion":
-        lines.append("CAPTURE review corrections and verified methods; do not write canonical automatically.")
+        lines.append((line, hit))
+        if explain:
+            lines.extend((diagnostic, None) for diagnostic in _retrieval_lines(hit, stopwords))
     total = len(lines)
     for keep in range(total, -1, -1):
         candidate = lines[:keep]
+        output_lines = [line for line, _hit in candidate]
         if keep < total:
-            candidate.append(f"TRUNCATED {total - keep} entries omitted")
-        rendered = "\n".join(candidate) + ("\n" if candidate else "")
+            output_lines.append(f"TRUNCATED {total - keep} entries omitted")
+        rendered = "\n".join(output_lines) + ("\n" if output_lines else "")
         if len(rendered) <= budget_chars:
-            return rendered
+            return rendered, tuple(hit for _line, hit in candidate if hit is not None)
     raise MatchError("budget_chars cannot hold truncation marker")
+
+
+def render(hits: Sequence[Hit], ignored: Sequence[str], budget_chars: int, explain: bool = False,
+           stage: str = "prompt", stopwords: frozenset[str] | None = None) -> str:
+    return _render_with_hits(
+        hits, ignored, budget_chars, explain=explain, stage=stage, stopwords=stopwords,
+    )[0]
 
 
 def query_from_payload(runtime: str, stage: str, payload: Mapping[str, object]) -> Query:
@@ -534,7 +569,10 @@ def _add_query_args(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agent-core lessons")
+    parser = argparse.ArgumentParser(
+        prog="agent-core lessons",
+        epilog="public commands routed by agent-core: capture, promote, reject, retire",
+    )
     commands = parser.add_subparsers(dest="lessons_command", required=True)
     match_parser = commands.add_parser("match")
     _add_source_args(match_parser)
@@ -563,14 +601,19 @@ def evaluate(fixtures: Path, expect_hash: str | None = None) -> tuple[int, list[
     queries = payload.get("queries", [])
     positives = [item for item in queries if item.get("kind") == "positive"]
     negatives = [item for item in queries if item.get("kind") == "negative"]
-    if len(positives) != 30 or len(negatives) != 30:
-        raise MatchError("fixture queries must contain 30 positive and 30 negative cases")
+    if len(positives) != 33 or len(negatives) != 33:
+        raise MatchError("fixture queries must contain 33 positive and 33 negative cases")
     recalled = 0
     false_queries = 0
     unexpected_total = 0
     legacy_recalled = 0
     deterministic = True
     budget_ok = True
+    rendered_recalled = 0
+    rendered_omissions = 0
+    omission_lines: list[str] = []
+    production_deterministic = True
+    production_budget_ok = True
     for item in queries:
         query = Query(stage=item["stage"], task=item.get("task", "unknown"),
                       paths=tuple(item.get("paths", ())), cmds=tuple(item.get("cmds", ())),
@@ -584,8 +627,38 @@ def evaluate(fixtures: Path, expect_hash: str | None = None) -> tuple[int, list[
         if item["kind"] == "negative" and unexpected:
             false_queries += 1
         unexpected_total += len(unexpected)
+        production, rendered_hits = _render_with_hits(
+            hits, ignored, DEFAULT_BUDGET, explain=False, stage=query.stage,
+        )
+        repeated_hits, repeated_ignored = match_lessons(lessons, query)
+        repeated_production, _ = _render_with_hits(
+            repeated_hits, repeated_ignored, DEFAULT_BUDGET, explain=False, stage=query.stage,
+        )
+        rendered_actual = [hit.lesson.lesson_id for hit in rendered_hits]
+        if item["kind"] == "positive" and all(
+            lesson_id in rendered_actual for lesson_id in expected
+        ):
+            rendered_recalled += 1
+        rendered_omissions += len(hits) - len(rendered_hits)
+        rendered_hit_identities = {id(hit) for hit in rendered_hits}
+        omission_lines.extend(
+            "OMISSION"
+            f" query={item['id']}"
+            f" scope={hit.lesson.scope}"
+            f" source={hit.lesson.source}"
+            f" lesson={hit.lesson.lesson_id}"
+            for hit in hits
+            if id(hit) not in rendered_hit_identities
+        )
+        production_deterministic = (
+            production_deterministic
+            and production.encode("utf-8") == repeated_production.encode("utf-8")
+        )
+        production_budget_ok = production_budget_ok and len(production) <= DEFAULT_BUDGET
         first = render(hits, ignored, DEFAULT_BUDGET, explain=True, stage=query.stage)
-        second = render(*match_lessons(lessons, query), DEFAULT_BUDGET, explain=True, stage=query.stage)
+        second = render(
+            repeated_hits, repeated_ignored, DEFAULT_BUDGET, explain=True, stage=query.stage,
+        )
         deterministic = deterministic and first.encode("utf-8") == second.encode("utf-8")
         budget_ok = budget_ok and len(first) <= DEFAULT_BUDGET
         probe = item.get("legacy_probe")
@@ -593,16 +666,32 @@ def evaluate(fixtures: Path, expect_hash: str | None = None) -> tuple[int, list[
             probe_hits, _ = match_lessons(legacy_lessons, Query(stage="prompt", text=probe["text"]))
             if probe["expected_hit"] in [hit.lesson.lesson_id for hit in probe_hits]:
                 legacy_recalled += 1
-    passed = (recalled == 30 and false_queries <= 2 and unexpected_total <= 3
-              and deterministic and legacy_recalled >= 24 and budget_ok)
+    passed = (
+        recalled == 33
+        and rendered_recalled == 33
+        and false_queries <= 3
+        and unexpected_total <= 3
+        and deterministic
+        and production_deterministic
+        and legacy_recalled >= 27
+        and budget_ok
+        and production_budget_ok
+    )
     lines = [
         f"FIXTURE aggregate_sha256={aggregate}",
-        f"METRIC recall={recalled}/30 threshold=30/30",
-        f"METRIC false_inject={false_queries}/30 threshold<=2/30",
+        f"METRIC recall={recalled}/33 threshold=33/33",
+        f"METRIC rendered_recall={rendered_recalled}/33 threshold=33/33",
+        f"METRIC rendered_omissions={rendered_omissions}",
+        f"METRIC false_inject={false_queries}/33 threshold<=3/33",
         f"METRIC unexpected_ids={unexpected_total} threshold<=3",
         f"METRIC deterministic={'yes' if deterministic else 'no'} threshold=yes",
-        f"METRIC legacy_recall={legacy_recalled}/30 threshold>=24/30",
+        f"METRIC production_deterministic={'yes' if production_deterministic else 'no'} threshold=yes",
+        f"METRIC explain_deterministic={'yes' if deterministic else 'no'} threshold=yes",
+        f"METRIC legacy_recall={legacy_recalled}/33 threshold>=27/33",
         f"METRIC budget={'pass' if budget_ok else 'fail'} chars={DEFAULT_BUDGET}",
+        f"METRIC production_budget={'pass' if production_budget_ok else 'fail'} chars={DEFAULT_BUDGET}",
+        f"METRIC explain_budget={'pass' if budget_ok else 'fail'} chars={DEFAULT_BUDGET}",
+        *omission_lines,
         "PASS lessons eval" if passed else "FAIL lessons eval",
     ]
     return (0 if passed else 1), lines
@@ -625,12 +714,19 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_value = os.environ.get("AGENT_CORE_HOOK_HEARTBEAT")
         heartbeat_path = Path(heartbeat_value).resolve() if heartbeat_value else None
         source_signature: str | None = None
+        session_id: str | None = None
         validation_ran = False
         try:
             if args.event_json:
                 payload = json.loads(args.event_json.read_text(encoding="utf-8"))
             else:
                 payload = json.load(sys.stdin)
+            payload_session_id = payload.get("session_id") if isinstance(payload, Mapping) else None
+            session_id = (
+                payload_session_id
+                if isinstance(payload_session_id, str) and payload_session_id
+                else None
+            )
             workspace = args.workspace
             payload_workspace = payload.get("cwd") if isinstance(payload, Mapping) else None
             if workspace is None and isinstance(payload_workspace, str) and payload_workspace:
@@ -642,14 +738,32 @@ def main(argv: list[str] | None = None) -> int:
             query = query_from_payload(args.runtime, args.stage, payload)
             hits, ignored = match_lessons(lessons, query)
             rendered = render(hits, ignored, args.budget_chars, args.explain, query.stage)
-            print(rendered, end="")
+            hook_output = rendered
+            if args.stage == "completion":
+                hook_output = ""
+            elif args.stage == "pretool" and rendered:
+                hook_output = json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": rendered,
+                    },
+                }, ensure_ascii=False, separators=(",", ":")) + "\n"
+            print(hook_output, end="")
+            if args.runtime == "claude-code" and args.stage == "completion":
+                from .capture import automatic_completion_capture
+                capture_warning = automatic_completion_capture(
+                    payload, runtime=args.runtime, stage=args.stage, ledger_path=args.ledger,
+                )
+                if capture_warning:
+                    print(capture_warning, file=sys.stderr)
             _record_hook_heartbeat(
                 heartbeat_path,
                 runtime=args.runtime,
                 stage=args.stage,
+                session_id=session_id,
                 source_signature=source_signature,
                 validation_ran=validation_ran,
-                result_nonempty=bool(rendered.strip()),
+                result_nonempty=bool(hook_output.strip()),
                 status="pass",
             )
         except Exception as exc:  # Hook contract is deliberately fail-open.
@@ -658,6 +772,7 @@ def main(argv: list[str] | None = None) -> int:
                 heartbeat_path,
                 runtime=args.runtime,
                 stage=args.stage,
+                session_id=session_id,
                 source_signature=source_signature,
                 validation_ran=validation_ran,
                 result_nonempty=False,

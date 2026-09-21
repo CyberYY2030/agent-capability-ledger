@@ -29,6 +29,20 @@ def test_tokenization_contract_nfkc_ascii_cjk_stopwords_and_short_terms() -> Non
     assert "这个" not in tokens
 
 
+def test_domain_stopwords_remove_generic_terms_but_preserve_specific_tokens() -> None:
+    domain_stopwords = {
+        "用户", "文件", "配置", "任务", "测试", "步骤",
+        "规则", "修改", "数据", "状态", "目录", "一个",
+    }
+    stopwords = match._load_stopwords()
+
+    assert domain_stopwords <= stopwords
+    assert domain_stopwords.isdisjoint(match.tokenize(" ".join(sorted(domain_stopwords))))
+    assert "全局" in match.tokenize("全局配置")
+    assert "预算" in match.tokenize("测试预算")
+    assert {"运行", "执行"}.isdisjoint(stopwords)
+
+
 def test_when_requires_canonical_json_and_known_string_arrays() -> None:
     assert match.parse_when('{"cmds":["git commit"],"paths":["src/**"]}') == {
         "cmds": ("git commit",), "paths": ("src/**",)
@@ -74,6 +88,31 @@ def test_each_predicate_is_or_matched_and_explained() -> None:
         assert [hit.lesson.lesson_id for hit in hits] == [expected_id]
         assert hits[0].predicate == predicate
         assert f"predicate={predicate}" in match.render(hits, (), 1200, explain=True, stage=query.stage)
+
+
+def test_explain_shows_text_element_tokens_without_changing_default_output() -> None:
+    entry = lesson("SYN-DIAG", "global", "pending", {
+        "text": ("nebula_matrix_crane", "forge --ember", "altitude=0"),
+    })
+    query = match.Query("prompt", text="nebula forge altitude")
+    hits, ignored = match.match_lessons([entry], query)
+
+    plain = match.render(hits, ignored, 1200, stage="prompt")
+    explained = match.render(hits, ignored, 1200, explain=True, stage="prompt")
+
+    assert "RETRIEVAL " not in plain
+    assert 'element="nebula_matrix_crane" tokens=crane,matrix,nebula overlap=nebula' in explained
+    assert 'element="forge --ember" tokens=ember,forge overlap=forge' in explained
+    assert 'element="altitude=0" tokens=altitude overlap=altitude' in explained
+
+
+def test_fixture_precision_shapes_are_present() -> None:
+    payload = json.loads((FIXTURES / "corpus.json").read_text(encoding="utf-8"))
+    entries = {item["id"]: match.parse_when(item["when"]) for item in payload["entries"] if item["when"]}
+    assert {"SYN-BAG", "SYN-ID", "SYN-CJK"} <= set(entries)
+    assert 6 <= len(match.tokenize(entries["SYN-BAG"]["text"][0])) <= 9
+    assert set(match.tokenize(entries["SYN-ID"]["text"][0])) == {"crane", "matrix", "nebula"}
+    assert set(match.tokenize("潮汐车站")) & set(match.tokenize("纸鸢车站")) == {"车站"}
 
 
 def test_prompt_explicitly_ignores_paths_and_commands() -> None:
@@ -126,10 +165,16 @@ def test_fixture_hash_and_eval_gates() -> None:
         match.evaluate(FIXTURES, "0" * 64)
     code, lines = match.evaluate(FIXTURES, actual_hash)
     assert code == 0
-    assert "METRIC recall=30/30 threshold=30/30" in lines
-    assert "METRIC false_inject=0/30 threshold<=2/30" in lines
+    assert "METRIC recall=33/33 threshold=33/33" in lines
+    assert "METRIC rendered_recall=33/33 threshold=33/33" in lines
+    assert "METRIC rendered_omissions=0" in lines
+    assert "METRIC false_inject=3/33 threshold<=3/33" in lines
     assert "METRIC deterministic=yes threshold=yes" in lines
-    assert "METRIC legacy_recall=30/30 threshold>=24/30" in lines
+    assert "METRIC production_deterministic=yes threshold=yes" in lines
+    assert "METRIC explain_deterministic=yes threshold=yes" in lines
+    assert "METRIC legacy_recall=33/33 threshold>=27/33" in lines
+    assert "METRIC production_budget=pass chars=1200" in lines
+    assert "METRIC explain_budget=pass chars=1200" in lines
 
 
 def test_runtime_payload_fixtures_preserve_stage_field_availability() -> None:
@@ -142,10 +187,63 @@ def test_runtime_payload_fixtures_preserve_stage_field_availability() -> None:
     assert match.query_from_payload("claude-code", "pretool", claude).paths == ("agent_core/match.py",)
 
 
-def test_completion_emits_capture_prompt_without_writing() -> None:
-    output = match.render([], (), 1200, stage="completion")
-    assert output.startswith("CAPTURE ")
-    assert "do not write canonical automatically" in output
+def test_completion_match_renders_lessons_without_fixed_capture_advice() -> None:
+    entry = lesson("L-1", "global", "pending", {"text": ("shared constant",)})
+    hits, ignored = match.match_lessons(
+        [entry], match.Query("completion", text="review the shared constant"),
+    )
+
+    output = match.render(hits, ignored, 1200, stage="completion")
+
+    assert output.startswith("LESSON L-1:")
+    assert "CAPTURE review corrections" not in output
+
+
+def test_eval_fails_when_expected_matches_do_not_survive_production_budget(
+    tmp_path: Path,
+) -> None:
+    fixtures = tmp_path / "retrieval"
+    fixtures.mkdir()
+    for name in ("corpus.json", "queries.json"):
+        payload = json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+        if name == "corpus.json":
+            for entry in payload["entries"]:
+                entry["rule"] = "x" * (match.DEFAULT_BUDGET + 1)
+        (fixtures / name).write_text(json.dumps(payload), encoding="utf-8")
+
+    code, lines = match.evaluate(fixtures)
+
+    assert code == 1
+    assert "METRIC recall=33/33 threshold=33/33" in lines
+    assert "METRIC rendered_recall=0/33 threshold=33/33" in lines
+    assert "METRIC rendered_omissions=38" in lines
+    omission_lines = [line for line in lines if line.startswith("OMISSION ")]
+    assert len(omission_lines) == 38
+    assert all(" query=" in line and " scope=" in line for line in omission_lines)
+    assert all(" source=corpus.json lesson=" in line for line in omission_lines)
+    assert lines[-1] == "FAIL lessons eval"
+
+
+def test_budget_tracking_counts_same_id_lessons_by_scope() -> None:
+    entries = [
+        lesson("L-7", "project", "pending", {"tasks": ("build",)}),
+        lesson("L-7", "global", "pending", {"tasks": ("build",)}),
+    ]
+    hits, ignored = match.match_lessons(entries, match.Query("dispatch", task="build"))
+    budget = len("LESSON L-7: Rule L-7. sink=checks/L-7.md\nTRUNCATED 1 entries omitted\n")
+
+    output, rendered_hits = match._render_with_hits(
+        hits, ignored, budget, stage="dispatch",
+    )
+
+    assert "TRUNCATED 1 entries omitted" in output
+    assert [(hit.lesson.scope, hit.lesson.lesson_id) for hit in rendered_hits] == [
+        ("project", "L-7"),
+    ]
+    omitted = [hit for hit in hits if id(hit) not in {id(item) for item in rendered_hits}]
+    assert [(hit.lesson.scope, hit.lesson.lesson_id) for hit in omitted] == [
+        ("global", "L-7"),
+    ]
 
 
 def test_hook_invalid_payload_is_fail_open(capsys: pytest.CaptureFixture[str]) -> None:

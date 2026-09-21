@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,9 +15,18 @@ from agent_core import doctor as doctor_module
 from agent_core.cli import main as cli_main
 from agent_core.installer import build_release_manifest
 from agent_core.provenance import EngineLayout
+from agent_core.materializer import (
+    MaterializationTarget,
+    doctor_materialization_receipt,
+    materialization_pending_path,
+    publish_materialization_receipt,
+    review_materialization,
+)
+from agent_core.promote import operation_lock
 from agent_core.doctor import (
     assert_repository_separation,
     assert_remote_role,
+    hook_retrieval_status,
     run,
 )
 from agent_core.privacy import DEFAULT_MAX_BLOB_BYTES
@@ -39,6 +50,45 @@ def repo_with_remote(tmp_path: Path, url: str, name: str = "repo") -> Path:
     return repo
 
 
+@pytest.mark.parametrize(
+    ("status", "result_nonempty", "hash_matches", "expected"),
+    (
+        ("pass", False, True, ("PASS", "retrieval_empty stage=prompt")),
+        ("warning", False, True, ("WARN", "retrieval_warning stage=prompt")),
+        ("pass", False, False, ("WARN", "retrieval_connected_current_version_unobserved")),
+    ),
+)
+def test_hook_health_uses_status_and_keeps_empty_result_detail(
+    tmp_path: Path, status: str, result_nonempty: bool,
+    hash_matches: bool, expected: tuple[str, str],
+) -> None:
+    hook = tmp_path / "hooks" / "user_prompt.sh"
+    hook.parent.mkdir()
+    hook.write_text(
+        "#!/bin/sh\n# agent-core-lessons-hook/1\nagent-core lessons hook\n",
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        hook.chmod(0o755)
+    heartbeat = hook.parent / ".lessons-hook-heartbeat.json"
+    payload = {
+        "schema": "lessons-hook-heartbeat/1",
+        "runtime": "codex",
+        "stage": "prompt",
+        "status": status,
+        "retrieval_invoked": True,
+        "result_nonempty": result_nonempty,
+        "validation_ran": status == "pass",
+        "source_mtime_sha256": "1" * 64 if status == "pass" else None,
+        "hook_sha256": (
+            hashlib.sha256(hook.read_bytes()).hexdigest() if hash_matches else "0" * 64
+        ),
+        "observed_utc": "2026-09-04T00:00:00Z",
+    }
+    heartbeat.write_text(json.dumps(payload), encoding="utf-8")
+    assert hook_retrieval_status(hook) == expected
+
+
 def installed_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
     install_root = tmp_path / "agent-core"
     config = tmp_path / "host" / "host.json"
@@ -59,6 +109,285 @@ def installed_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
     pin_path = install_root / "engine-pin.json"
     pin_path.write_text(json.dumps(pin, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     return engine, config, pin_path, pin
+
+
+def materialization_fixture(
+    tmp_path: Path,
+) -> tuple[Path, dict, Path, list[MaterializationTarget]]:
+    runtime = tmp_path / "runtime"
+    state = tmp_path / "state"
+    state.mkdir()
+    config = tmp_path / "host" / "host.json"
+    config.parent.mkdir()
+    payload = {"targets": [{
+        "id": "codex", "root": str(runtime),
+        "rules_target": "AGENTS.md", "lessons_target": "LESSONS.md",
+    }]}
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    targets = [
+        MaterializationTarget("codex", "rules", runtime, runtime / "AGENTS.md", b"rules\n"),
+        MaterializationTarget("codex", "lessons", runtime, runtime / "LESSONS.md", b"lessons\n"),
+    ]
+    for target in targets:
+        target.path.parent.mkdir(parents=True, exist_ok=True)
+        target.path.write_bytes(target.content)
+    review = review_materialization(
+        config, payload, state, targets, repository_root_sha=None,
+        head=None, remote_revision=None,
+    )
+    control = config.parent / "txn"
+    with operation_lock(control) as token:
+        publish_materialization_receipt(
+            review, tmp_path / "transaction", control_root=control, lock_token=token,
+        )
+    return config, payload, state, targets
+
+
+def test_doctor_materialization_receipt_healthy_missing_corrupt_and_drift(
+    tmp_path: Path,
+) -> None:
+    config, payload, state, targets = materialization_fixture(tmp_path)
+    healthy = doctor_materialization_receipt(config, payload, state, targets)
+    assert healthy[0].startswith("PASS materialization_receipt schema=materialization-receipt/1 ")
+
+    targets[0].path.write_bytes(b"unknown-writer\n")
+    with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_DRIFT"):
+        doctor_materialization_receipt(config, payload, state, targets)
+    targets[0].path.write_bytes(targets[0].content)
+
+    receipt = config.parent / "materialization-receipt.json"
+    raw = receipt.read_bytes()
+    receipt.write_text("{}", encoding="utf-8")
+    with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECEIPT"):
+        doctor_materialization_receipt(config, payload, state, targets)
+    receipt.write_bytes(raw)
+    receipt.unlink()
+    with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECEIPT"):
+        doctor_materialization_receipt(config, payload, state, targets)
+
+
+def test_doctor_rejects_config_bytes_and_reproves_canonical_lineage(tmp_path: Path) -> None:
+    fixture_root = tmp_path / "config-drift"
+    fixture_root.mkdir()
+    config, payload, state, targets = materialization_fixture(fixture_root)
+    receipt = config.parent / "materialization-receipt.json"
+    receipt_before = receipt.read_bytes()
+    runtime_before = {target.path: target.path.read_bytes() for target in targets}
+    config.write_bytes(config.read_bytes() + b"\n")
+
+    with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECEIPT"):
+        doctor_materialization_receipt(config, payload, state, targets)
+    assert receipt.read_bytes() == receipt_before
+    assert {path: path.read_bytes() for path in runtime_before} == runtime_before
+    control = config.parent / "txn"
+    semantic_noop = review_materialization(
+        config, payload, state, targets, repository_root_sha=None,
+        head=None, remote_revision=None,
+    )
+    assert semantic_noop.ready is True
+    assert semantic_noop.receipt_changed is True
+    with operation_lock(control) as token:
+        publish_materialization_receipt(
+            semantic_noop, fixture_root / "transaction-semantic-noop",
+            control_root=control, lock_token=token,
+        )
+    assert doctor_materialization_receipt(config, payload, state, targets)[0].startswith(
+        "PASS materialization_receipt"
+    )
+
+    payload["targets"][0]["runtime"] = "codex"
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECEIPT"):
+        doctor_materialization_receipt(config, payload, state, targets)
+    legal_change = review_materialization(
+        config, payload, state, targets, repository_root_sha=None,
+        head=None, remote_revision=None,
+    )
+    assert legal_change.ready is True
+    assert legal_change.receipt_changed is True
+    with operation_lock(control) as token:
+        publish_materialization_receipt(
+            legal_change, fixture_root / "transaction-legal-change",
+            control_root=control, lock_token=token,
+        )
+    assert doctor_materialization_receipt(config, payload, state, targets)[0].startswith(
+        "PASS materialization_receipt"
+    )
+
+    repository = tmp_path / "canonical"
+    canonical_state = repository / "state"
+    (repository / "engine").mkdir(parents=True)
+    canonical_state.mkdir()
+    (repository / "engine" / "marker.txt").write_text("engine\n", encoding="utf-8")
+    (canonical_state / "marker.txt").write_text("state\n", encoding="utf-8")
+    git(repository, "init", "-q")
+    git(repository, "add", "engine/marker.txt", "state/marker.txt")
+    git(
+        repository, "-c", "user.name=G19b Test", "-c", "user.email=g19b@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-q", "-m", "initial",
+    )
+    root_sha = subprocess.run(
+        [
+            "git", "-c", f"safe.directory={repository.resolve().as_posix()}",
+            "-C", str(repository), "rev-list", "--max-parents=0", "HEAD",
+        ],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout.strip()
+    runtime = tmp_path / "canonical-runtime"
+    canonical_config = tmp_path / "canonical-host" / "host.json"
+    canonical_config.parent.mkdir()
+    canonical_payload = {"targets": [{
+        "id": "codex", "root": str(runtime), "rules_target": "AGENTS.md",
+    }]}
+    canonical_config.write_text(json.dumps(canonical_payload), encoding="utf-8")
+    canonical_targets = [
+        MaterializationTarget("codex", "rules", runtime, runtime / "AGENTS.md", b"rules\n"),
+    ]
+    canonical_targets[0].path.parent.mkdir(parents=True)
+    canonical_targets[0].path.write_bytes(canonical_targets[0].content)
+    review = review_materialization(
+        canonical_config, canonical_payload, canonical_state, canonical_targets,
+        repository_root_sha=root_sha, head=root_sha, remote_revision=None,
+    )
+    control = canonical_config.parent / "txn"
+    with operation_lock(control) as token:
+        publish_materialization_receipt(
+            review, tmp_path / "canonical-transaction",
+            control_root=control, lock_token=token,
+        )
+    assert doctor_materialization_receipt(
+        canonical_config, canonical_payload, canonical_state, canonical_targets,
+    )[0].startswith("PASS materialization_receipt")
+
+    canonical_receipt = canonical_config.parent / "materialization-receipt.json"
+    changed = json.loads(canonical_receipt.read_text(encoding="utf-8"))
+    changed["state"]["repository_root_sha"] = "0" * 40
+    canonical_receipt.write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECEIPT"):
+        doctor_materialization_receipt(
+            canonical_config, canonical_payload, canonical_state, canonical_targets,
+        )
+
+
+def test_doctor_materialization_pending_and_retained_are_visible(tmp_path: Path) -> None:
+    config, payload, state, targets = materialization_fixture(tmp_path)
+    control = config.parent / "txn"
+    review = review_materialization(
+        config, payload, state, targets[:1], repository_root_sha=None,
+        head=None, remote_revision=None,
+    )
+    with operation_lock(control) as token:
+        publish_materialization_receipt(
+            review, tmp_path / "transaction-2", control_root=control, lock_token=token,
+        )
+    lines = doctor_materialization_receipt(config, payload, state, targets[:1])
+    assert any(line == f"RETAIN materialization_receipt path={targets[1].path}" for line in lines)
+
+    pending = materialization_pending_path(config)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text("{}", encoding="utf-8")
+    with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECOVERY"):
+        doctor_materialization_receipt(config, payload, state, targets[:1])
+
+
+def test_doctor_rejects_install_pending_without_writes(tmp_path: Path) -> None:
+    config, payload, state, targets = materialization_fixture(tmp_path)
+    receipt = config.parent / "materialization-receipt.json"
+    receipt_before = receipt.read_bytes()
+    runtime_before = {target.path: target.path.read_bytes() for target in targets}
+    pending = config.parent / "install-pending.json"
+    pending.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="FAIL_INSTALL_RECOVERY"):
+        doctor_materialization_receipt(config, payload, state, targets)
+
+    assert pending.read_text(encoding="utf-8") == "{}"
+    assert receipt.read_bytes() == receipt_before
+    assert {path: path.read_bytes() for path in runtime_before} == runtime_before
+
+
+@pytest.mark.parametrize(
+    ("marker_kind", "entrypoint", "expected"),
+    (
+        ("install", "run", "FAIL_INSTALL_RECOVERY"),
+        ("materialization", "cli", "FAIL_MATERIALIZATION_RECOVERY"),
+    ),
+)
+def test_doctor_top_level_pending_precedes_consumers_and_preserves_remote_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    marker_kind: str, entrypoint: str, expected: str,
+) -> None:
+    config = tmp_path / "host" / "host.json"
+    config.parent.mkdir()
+    config.write_text("{}\n", encoding="utf-8")
+    state = tmp_path / "state"
+    state.mkdir()
+    runtime = tmp_path / "runtime"
+    payload = {"targets": [{
+        "id": "codex", "runtime": "codex", "root": str(runtime),
+        "skills_root": "skills", "hook_target": "hooks/user_prompt.sh",
+    }]}
+    monkeypatch.setattr(doctor_module, "load_config", lambda _path: payload)
+
+    def masked(*_args, **_kwargs):
+        raise AssertionError("pending guard must precede composition and consumers")
+
+    monkeypatch.setattr(doctor_module, "compose_manifests", masked)
+    txn = config.parent / "txn"
+    txn.mkdir()
+    remote = txn / "remote-state.json"
+    remote.write_bytes(b'{"baseline":"preserve"}\n')
+    marker = (
+        config.parent / "install-pending.json"
+        if marker_kind == "install"
+        else txn / "materialization-pending.json"
+    )
+    marker.write_text("{}", encoding="utf-8")
+
+    if entrypoint == "run":
+        with pytest.raises(ConfigError, match=expected):
+            run(tmp_path / "engine", config, state, state / "manifest.yaml")
+    else:
+        assert cli_main([
+            "doctor", "--config", str(config), "--state", str(state),
+            "--state-manifest", str(state / "manifest.yaml"),
+        ]) == 1
+        assert expected in capsys.readouterr().err
+    assert marker.read_text(encoding="utf-8") == "{}"
+    assert remote.read_bytes() == b'{"baseline":"preserve"}\n'
+
+
+@pytest.mark.parametrize(
+    ("config_state", "marker_kind", "entrypoint", "expected"),
+    (
+        ("missing", "install", "run", "FAIL_INSTALL_RECOVERY"),
+        ("invalid", "materialization", "cli", "FAIL_MATERIALIZATION_RECOVERY"),
+    ),
+)
+def test_doctor_pending_precedes_missing_or_invalid_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], config_state: str,
+    marker_kind: str, entrypoint: str, expected: str,
+) -> None:
+    config = tmp_path / "host" / "host.json"
+    config.parent.mkdir()
+    if config_state == "invalid":
+        config.write_text("{invalid", encoding="utf-8")
+    txn = config.parent / "txn"
+    txn.mkdir()
+    marker = (
+        config.parent / "install-pending.json"
+        if marker_kind == "install"
+        else txn / "materialization-pending.json"
+    )
+    marker.write_text("{}", encoding="utf-8")
+
+    if entrypoint == "run":
+        with pytest.raises(ConfigError, match=expected):
+            run(tmp_path / "engine", config, None, None)
+    else:
+        assert cli_main(["doctor", "--config", str(config)]) == 1
+        assert expected in capsys.readouterr().err
+    assert marker.read_text(encoding="utf-8") == "{}"
 
 
 def test_remote_role_rejects_matching_hosted_identity_without_leaking_url(tmp_path: Path) -> None:

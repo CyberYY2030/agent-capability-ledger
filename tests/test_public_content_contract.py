@@ -15,6 +15,7 @@ PROFILE = ROOT / "seed" / "profiles" / "example-domain" / "LESSONS.md"
 def test_public_example_inventory_and_rule_placeholder_are_exact() -> None:
     assert {path.name for path in EXAMPLES.iterdir() if path.is_file()} == {
         "host.example.json", "manifest.custom.example.yaml", "rules.global.example.md",
+        "prepare_private.py",
     }
     text = (EXAMPLES / "rules.global.example.md").read_text(encoding="utf-8")
     assert text == (
@@ -47,7 +48,7 @@ def test_public_identifiers_are_closed_over_an_exact_synthetic_allowlist() -> No
         "backup_root": "<HOST_DATA>/backups",
         "prompt_injection": {"lines": [
             "Read matched lessons before acting.",
-            "At completion, report any evidence-backed lesson candidate.",
+            "Only Claude Code: for a user correction or evidence-verified method that warrants one reusable, costly lesson with an observable trigger and checkable sink, run \"<INSTALL_ROOT>/bin/agent-core\" lessons capture with all required fields to create at most one inbox candidate; otherwise skip; never write canonical lessons or promote automatically; other runtimes skip.",
         ]},
         "targets": [
             {

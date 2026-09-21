@@ -29,7 +29,9 @@ def environment(tmp_path: Path) -> tuple[Path, Path, list[Path]]:
 
 def test_fingerprint_is_deterministic_and_parity_detects_required_drift(tmp_path: Path) -> None:
     state, config, targets = environment(tmp_path)
-    execute(ROOT, config, state, apply=True)
+    preview = execute(ROOT, config, state, apply=False)
+    token = next(line.removeprefix("PLAN_HASH ") for line in preview if line.startswith("PLAN_HASH "))
+    execute(ROOT, config, state, apply=True, plan_hash=token)
     first = generate(ROOT, config, state, state / "manifest.yaml")
     second = generate(ROOT, config, state, state / "manifest.yaml")
     assert canonical_json(first) == canonical_json(second)

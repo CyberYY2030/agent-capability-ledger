@@ -6,8 +6,9 @@ import json
 import os
 import subprocess
 import sys
+import re
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 
 def _fail(code: str, detail: str) -> int:
@@ -23,6 +24,19 @@ def _load_object(path: Path, code: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{code} root must be an object")
     return value
+
+
+def _python_floor(path: Path) -> tuple[int, int]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"FAIL_PYTHON_FLOOR cannot read {path}: {exc}") from exc
+    matched = re.search(
+        r'^requires-python\s*=\s*">=([0-9]+)\.([0-9]+)"\s*$', text, re.MULTILINE,
+    )
+    if matched is None:
+        raise ValueError("FAIL_PYTHON_FLOOR requires-python must be a >=major.minor floor")
+    return int(matched.group(1)), int(matched.group(2))
 
 
 def _state_from_args(args: list[str], config: dict) -> tuple[Path, list[str]]:
@@ -48,7 +62,7 @@ def _inject_state(args: list[str], state_root: Path) -> list[str]:
             return args
         return [
             *args[:2], "--ledger", str(state_root / "experience" / "LESSONS.md"),
-            "--all-profiles", *args[2:],
+            *args[2:],
         ]
     if args[:2] == ["engine", "upgrade"]:
         return [*args[:2], "--state", str(state_root), *args[2:]]
@@ -59,14 +73,18 @@ def _inject_state(args: list[str], state_root: Path) -> list[str]:
     return args
 
 
-def run(argv: Sequence[str] | None = None, *, launcher_path: Path | None = None) -> int:
+def run(argv: Optional[Sequence[str]] = None, *, launcher_path: Optional[Path] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     launcher = (launcher_path or Path(__file__)).resolve()
     install_root = launcher.parent.parent
     pin_path = install_root / "engine-pin.json"
     try:
-        if sys.version_info < (3, 11):
-            raise ValueError("FAIL_PYTHON_VERSION requires Python >=3.11")
+        source_pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        floor = _python_floor(source_pyproject) if source_pyproject.is_file() else None
+        if floor is not None and sys.version_info < floor:
+            raise ValueError(
+                f"FAIL_PYTHON_VERSION requires Python >={floor[0]}.{floor[1]}"
+            )
         if args.count("--state") > 1:
             raise ValueError("FAIL_STATE_ARGUMENT duplicate --state")
         pin = _load_object(pin_path, "FAIL_ENGINE_PIN")
@@ -74,6 +92,14 @@ def run(argv: Sequence[str] | None = None, *, launcher_path: Path | None = None)
             raise ValueError("FAIL_ENGINE_PIN fields mismatch")
         if pin.get("schema") != "engine-pin/1":
             raise ValueError("FAIL_ENGINE_PIN schema mismatch")
+        if floor is None:
+            floor = _python_floor(
+                install_root / "engine" / str(pin.get("version")) / "pyproject.toml"
+            )
+            if sys.version_info < floor:
+                raise ValueError(
+                    f"FAIL_PYTHON_VERSION requires Python >={floor[0]}.{floor[1]}"
+                )
         config_path = Path(pin.get("config_path", "")).expanduser().resolve()
         config = _load_object(config_path, "FAIL_CONFIG")
         state_root, forwarded = _state_from_args(args, config)
@@ -118,7 +144,7 @@ def run(argv: Sequence[str] | None = None, *, launcher_path: Path | None = None)
     return completed.returncode
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     return run(argv)
 
 

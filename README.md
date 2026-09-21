@@ -1,8 +1,58 @@
 # agent-core
 
-`agent-core` V0.1 is a private, single-owner prototype for installing an agent capability engine, materializing private state into local runtimes, checking that setup, and using a private lessons ledger.
+`agent-core` is a personal alpha for keeping reusable agent rules, skills, and
+lessons in one private Git source, delivering them to local agent runtimes,
+and checking what was actually installed. Lessons are retrieved for a task so
+useful guidance can reach the agent without loading the whole ledger.
 
-The exported `engine/` tree is also maintained as a small, reviewable public work. It demonstrates the portable mechanism without publishing private state or becoming part of the private runtime path.
+The public repository is a reviewable engine export. Real use requires your own
+private state and host configuration; this checkout contains neither. It is a
+single-owner prototype, not a hosted service. Candidate version: **0.1.0.dev11**.
+
+## Try a synthetic lesson (no installation)
+
+From this checkout's root, with Python 3.11 or newer:
+
+```sh
+python3 -m agent_core.cli --version
+python3 -m agent_core.cli lessons match --ledger seed/profiles/example-domain/LESSONS.md --workspace seed --stage prompt --text "public fixture" --explain
+```
+
+The retrieval output includes `EXAMPLE-1` and `Keep public fixtures synthetic.`
+The supplied ledger is **synthetic demonstration data**. The explicit ledger
+and workspace keep this read-only example separate from installed private
+sources. No install, sync, account, or host config is needed. On Windows use a
+compatible `python` interpreter in place of `python3`. This demonstrates
+retrieval mechanics, not natural-work recall, P1 samples, or business benefit.
+
+See [alpha changes and evidence limits](docs/ALPHA.md) for the changes since
+the current public main release.
+
+## First installation with your own private data
+
+Use Python 3.11 or newer and Git. You need a private Git remote you control,
+a new private workspace, a separate host-config location, and the target
+runtime directory for Claude Code or Codex. The public checkout supplies only
+engine code and synthetic seed data; it does not need access to the author's
+private repository.
+
+Start with the source-distributed preparation helper:
+
+```sh
+python3 examples/prepare_private.py --help
+```
+
+Follow the [complete first-installation walkthrough](docs/QUICKSTART.md). It
+prepares a new private `engine/` and `state/` repository and host config, then
+uses the existing reviewed `install` flow. Preparation never overwrites an
+existing workspace/config, contacts a remote, or activates a runtime. You
+confirm your own private remote and publish your own initial private commit
+before binding it. No frozen `state init` or `state attach` CLI is needed.
+
+The helper is optional source setup, not a fifth installed command. Existing
+users retain `install`, `sync`, `doctor`, and `lessons`. Host approval/trust for
+hooks is still a user action; a successful shell test cannot grant that trust
+or prove a Desktop app emitted an event.
 
 ## Requirements
 
@@ -10,6 +60,11 @@ The exported `engine/` tree is also maintained as a small, reviewable public wor
 - A private state repository and reviewed host configuration for real use.
 
 If `python` is unavailable on `PATH`, install Python or set `AGENT_CORE_PYTHON` for the current process to a compatible interpreter before invoking the wrapper. Do not persist a machine-specific bundled interpreter path as shared configuration.
+
+For the portable Claude capture action, replace `<INSTALL_ROOT>` in the host
+example with the installed engine root, then approve exactly one matching Claude
+allow for that launcher invocation and its `lessons capture` subcommand. Do not
+copy a machine-specific interpreter path or settings file into shared config.
 
 ## Source of truth
 
@@ -21,9 +76,9 @@ state, host bindings, credentials, sessions, caches, or machine-specific paths.
 
 ## V0.1 CLI
 
-- `install` performs first private binding and receipt-owned engine updates through `absent`, `identical`, `managed-update`, `foreign`, and `indeterminate` states.
-- `sync` materializes configured private state into local runtimes; Git itself carries that state between machines.
-- `doctor` reports whether the configured engine, state, and runtime boundaries are healthy.
+- `install` performs first private binding and receipt-owned engine updates. Runtime rows use the shared materialization receipt; engine, wrapper, pin, and hook rows retain the install receipt.
+- `sync` materializes configured private state into local runtimes and publishes `materialization-receipt/1`; Git itself carries private state between machines.
+- `doctor` verifies the configured engine, state, active and retained materialization rows, pending markers, and runtime bytes.
 - `lessons` accesses the private lessons workflows behind the single supported lessons entry point.
 
 `agent-core --version` remains available. Historical lifecycle, transaction, migration, maintenance, documentation, privacy, and uninstall entry points are frozen. Their implementation may remain in the source tree, but the public CLI rejects them before parsing or side effects:
@@ -37,7 +92,8 @@ The shortest supported journey is plan, apply, verify, then retrieve a lesson:
 ```console
 $ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote
 $ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote --apply --plan-hash '<REVIEWED_INSTALL_PLAN_HASH>'
-$ agent-core sync --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --apply
+$ agent-core sync --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>'
+$ agent-core sync --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --apply --plan-hash '<REVIEWED_SYNC_PLAN_HASH>'
 $ agent-core doctor --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>'
 $ agent-core lessons match --stage prompt --text '<TASK>' --explain
 ```
@@ -47,6 +103,14 @@ The first two lines are the plan/apply phases of the single `install` command, s
 ### Lessons promotion
 
 `agent-core lessons promote --id <CANDIDATE>` reviews one local promotion and stops at the worktree/index boundary. Choose exactly one `--force-new` or scoped `--update <scope:store:lesson-id>`; `--scope global`, `--scope profile:<declared>`, and `--scope project:<current-project-id>` select the destination. An explicit same-repository override may move a project candidate into a bound global or declared profile ledger. A cross-repository request writes nothing and directs recapture in the target inbox. The reviewed plan hash binds the candidate, target, selected action, configuration, and exact staged paths. Apply uses the install transaction lock, writes the canonical ledger and consumed candidate only, and never syncs, commits, pushes, fetches, or contacts a remote.
+
+## Lessons workflow and hook contract
+
+See [Lessons workflow](docs/LESSONS_WORKFLOW.md) for explicit capture with scope, trigger predicates and evidence, whole-entry updates, and the read-only shell delivery check. Host authorization controls whether an agent may capture automatically.
+
+`lessons hook` keeps prompt output as text and emits nonempty PreToolUse context as JSON `hookSpecificOutput.additionalContext`, without permission decisions or rewritten inputs. Stop output is empty; the existing Claude completion capture still runs and warnings go to stderr. The heartbeat describes retrieval/output only, not capture success or model adoption. Claude reads tool-event context on a subsequent model request; a reminder is not a guard on the tool call already selected. Actual delivery remains host/version-specific. [Claude hooks](https://code.claude.com/docs/en/hooks#add-context-for-claude), [Codex hooks](https://learn.chatgpt.com/docs/hooks#pretooluse).
+
+`lessons eval --report` is a repository development check: its default fixtures live in `tests/fixtures/retrieval`, which the installed artifact does not ship. Use the source checkout, or pass `--fixtures` pointing to the reviewed fixture directory. Matching metrics and budgeted production rendering are evaluated separately; neither proves host delivery or real-work value.
 
 ## Installation preview
 
@@ -67,18 +131,20 @@ Apply only a reviewed plan with `ready=true`:
 $ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote --apply --plan-hash '<REVIEWED_INSTALL_PLAN_HASH>'
 ```
 
-For a later receipt-owned update, omit `--confirm-private-remote` while the existing binding remains valid. After a valid engine or private-state change invalidates that binding, pass explicit `--state` and `--confirm-private-remote` to review and apply its transactional reacceptance with a new exact `PLAN_HASH`. `foreign` and `indeterminate` make the whole plan not ready and apply writes nothing. `managed-update` is allowed only when a valid receipt owns the exact path, type, hook identity, and current installed bytes. The installer has no force option. If an interrupted first binding leaves a pending marker, inspect its retained pre-image evidence, remove that host-local marker only after accepting it, then create and apply a new install plan; V0.1 never restores runtime, business, or config paths from that marker. Windows flushes pre-image files and uses no-replace placement, but has no portable directory-fsync equivalent and cannot promise zero overwrite against a non-cooperating writer that retains an open handle.
+For a later receipt-owned update, omit `--confirm-private-remote` while the existing binding remains valid. After a valid engine or private-state change invalidates that binding, pass explicit `--state` and `--confirm-private-remote` to review and apply its transactional reacceptance with a new exact `PLAN_HASH`. `foreign` and `indeterminate` make the whole plan not ready and apply writes nothing. Runtime `managed-update` requires the shared receipt's exact root/path/current SHA; a legacy install runtime row is accepted only once while the shared receipt is absent and its SHA exactly matches current bytes. Exact unowned desired bytes are visibly adopted without a runtime rewrite. The installer has no force option. A pending install or materialization marker blocks both writers until its retained evidence is inspected and the marker is deliberately cleared. Windows flushes pre-image files and uses no-replace placement, but has no portable directory-fsync equivalent and cannot promise zero overwrite against a non-cooperating writer that retains an open handle.
 
-Always run and review the plan before `install --apply`. First binding and explicit reacceptance of an invalid binding require the confirmation flag; later valid bound installs do not. `sync` materializes private state after ordinary Git synchronization. Other real-machine environments remain pending acceptance.
+Always run and review the plan before `install --apply` or `sync --apply`. First binding and explicit reacceptance of an invalid binding require the confirmation flag; later valid bound installs do not. `sync` materializes private state after ordinary Git synchronization and requires the exact `PLAN_HASH` printed by its dry-run. Removed desired paths remain as verified `retained` rows; retained drift blocks the whole plan, and uninstall never rewinds runtime bytes through an old install snapshot. Other real-machine environments remain pending acceptance.
 
 ## Current limits
 
 - C1 clean-tree acceptance in C2 covered 222 `missing` targets, install, 222 `identical` targets, conflict zero-write behavior, the public no-force boundary, and injected-failure restoration of original bytes, prior absence, and residue cleanup.
 - C2 acceptance includes live cutover on the current machine: 215 materializations classified as 7 `missing`, 150 `identical`, and 58 `conflict`, with `hook_conflict=0`; after the reviewed migration, all four installed wrapper commands returned zero, canonical bytes matched, and foreign hook fields were preserved.
-- The earlier isolated run also covered doctor verification of the installed pin and manifest, ordinary Git push plus `pull --ff-only` before materialization, private lessons visibility, and a second sync with `writes=0`.
-- A second full workspace and other real-machine evidence remain pending C3.
-- C4 exported the engine through the one-way whitelist to `CyberYY2030/agent-capability-ledger` and passed the public privacy gate. Each subsequent release, including the export of current fixes, remains gated before publication.
-- Complex transaction modules are retained as frozen implementation and are outside the V0.1 user path.
+- The reviewed dev7 closeout accepted private Git propagation, receipt/byte parity, zero-write follow-up, and native Claude and Codex Desktop prompt delivery on the tested Mac. This is a sanitized summary of bounded evidence, not a dev11 live-installation result or a claim about arbitrary machines or app versions.
+- Current Windows Desktop automatic dispatch remains unproven. A registered hook or successful shell replay does not prove that a host emitted an event. PreToolUse context reaches a subsequent model request and cannot guard a tool call already selected.
+- Natural-work retrieval quality, reduced rework, and benefits exceeding lesson-maintenance costs remain unproven. Synthetic retrieval, rendered-evaluation fixtures, and shell-format demonstrations do not establish those outcomes.
+- Installation needs a clean reviewed private source window. Some Git failure diagnostics remain coarse. The release manifest binds content, not POSIX executable mode; delivery checks must also inspect required execution bits.
+- Historical transaction, migration, and uninstall modules remain frozen and outside the four-command public path. `docs/commands.json` is retained historical developer material, not a quickstart.
+- Every public update requires the [export/privacy/review gate](docs/PUBLICATION.md). Preparing a private workspace or passing the public gate does not activate this candidate in an existing runtime.
 
 ## Development safety
 

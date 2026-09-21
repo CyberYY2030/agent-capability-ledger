@@ -234,11 +234,46 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _publication_safe_match(rule: Rule, match: re.Match[str]) -> bool:
+    """Recognize generic values only for the original shared built-in rules.
+
+    External rules always retain their meaning, including an owner rule matching
+    a generic value. This policy never examines comments or grants line immunity.
+    """
+    if not any(rule is builtin for builtin in ABSOLUTE_PATH_RULES + SENSITIVE_IDENTITY_RULES):
+        return False
+    value = match.group()
+    if rule.rule_id == "home_reference":
+        return True
+    if rule.rule_id == "email_address":
+        # The strict regex can stop before a suffix such as '-old'.
+        # Such partial matches cannot prove that the whole domain is reserved.
+        tail = match.string[match.end():]
+        if tail and (tail[0].isalnum() or tail[0] in "-_.%+"):
+            return False
+        domain = value.rsplit("@", 1)[1].lower()
+        return domain.endswith((".invalid", ".test"))
+    if rule.rule_id == "absolute_windows_path":
+        # Enumerate complete values; no user directory or arbitrary descendants.
+        synthetic = "C:/Users/__AGENT_CORE_SYNTHETIC__/fixture.txt"
+        tail = match.string[match.end():]
+        if value == synthetic:
+            return not tail or tail[0] in "\"'"
+        # Spaces terminate the strict match. Prove the remaining standard root
+        # and its literal boundary rather than accepting the truncated prefix.
+        roots = ("C:" + "\\" + "Program", "C:" + "\\\\" + "Program")
+        if value in roots and match.start() and match.string[match.start() - 1] in "\"'":
+            quote = match.string[match.start() - 1]
+            return tail.startswith(" Files" + quote)
+    return False
+
+
 def _scan_bytes(
     data: bytes,
     display_path: str,
     rules: Sequence[Rule],
     max_blob_bytes: int,
+    publication: bool = False,
 ) -> tuple[list[Finding], str | None]:
     findings: list[Finding] = []
     name = Path(display_path).name.lower()
@@ -257,7 +292,10 @@ def _scan_bytes(
         return findings, None
     for line_number, line in enumerate(text.splitlines(), 1):
         for rule in rules:
-            if rule.regex.search(line):
+            if any(
+                not publication or not _publication_safe_match(rule, match)
+                for match in rule.regex.finditer(line)
+            ):
                 findings.append(Finding(rule.rule_id, "content", display_path, line_number))
     return findings, _sha256(data)
 
@@ -326,6 +364,7 @@ def scan_trees(
     rules: Sequence[Rule],
     allowlist: dict[tuple[str, str, str], dict],
     max_blob_bytes: int,
+    publication: bool = False,
 ) -> tuple[list[Finding], int]:
     findings: list[Finding] = []
     digests: dict[str, str] = {}
@@ -341,7 +380,7 @@ def scan_trees(
                 relative = path.relative_to(root).as_posix()
                 display = f"{root.name}/{relative}" if multiple else relative
             data = path.read_bytes()
-            scanned, digest = _scan_bytes(data, display, rules, max_blob_bytes)
+            scanned, digest = _scan_bytes(data, display, rules, max_blob_bytes, publication)
             findings.extend(scanned)
             if digest is not None:
                 digests[display] = digest
@@ -400,6 +439,7 @@ def scan_git_repo(
     repo: Path,
     rules: Sequence[Rule],
     max_blob_bytes: int,
+    publication: bool = False,
 ) -> list[Finding]:
     inside = _git(repo, ["rev-parse", "--is-inside-work-tree"])
     bare = _git(repo, ["rev-parse", "--is-bare-repository"])
@@ -423,7 +463,7 @@ def scan_git_repo(
             continue
         seen_blobs.add(object_id)
         display = f"git:{object_id}:{Path(object_path or '<unknown>').as_posix()}"
-        scanned, _ = _scan_bytes(_git_blob(repo, object_id), display, rules, max_blob_bytes)
+        scanned, _ = _scan_bytes(_git_blob(repo, object_id), display, rules, max_blob_bytes, publication)
         findings.extend(scanned)
     fsck = _git(repo, ["fsck", "--unreachable", "--no-reflogs"])
     fsck_text = (fsck.stdout + "\n" + fsck.stderr).splitlines()
@@ -444,13 +484,15 @@ def _discover_git_repos(root: Path) -> list[Path]:
     )
 
 
-def scan_git_fixture(root: Path, rules: Sequence[Rule], max_blob_bytes: int) -> list[Finding]:
+def scan_git_fixture(
+    root: Path, rules: Sequence[Rule], max_blob_bytes: int, publication: bool = False,
+) -> list[Finding]:
     repos = _discover_git_repos(root)
     if not repos:
         return [Finding("missing_git_fixture", "git", root.as_posix())]
     findings: list[Finding] = []
     for repo in repos:
-        findings.extend(scan_git_repo(repo, rules, max_blob_bytes))
+        findings.extend(scan_git_repo(repo, rules, max_blob_bytes, publication))
     return sorted(set(findings))
 
 
@@ -459,6 +501,7 @@ def scan_bundle(
     rules: Sequence[Rule],
     allowlist: dict[tuple[str, str, str], dict],
     max_blob_bytes: int,
+    publication: bool = False,
 ) -> tuple[list[Finding], int]:
     executable = shutil.which("git")
     if executable is None:
@@ -475,7 +518,7 @@ def scan_bundle(
         repo = Path(tmp)
         return _apply_git_allowlist(
             repo,
-            scan_git_repo(repo, rules, max_blob_bytes),
+            scan_git_repo(repo, rules, max_blob_bytes, publication),
             allowlist,
         )
 
@@ -532,6 +575,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allowlist", type=Path)
     parser.add_argument("--max-blob-bytes", type=int, default=DEFAULT_MAX_BLOB_BYTES)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--publication", action="store_true",
+                        help="recognize narrowly defined generic publication literals")
     return parser
 
 
@@ -548,20 +593,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         exemptions = 0
         if args.tree:
             allowlist = _load_allowlist(args.allowlist)
-            findings, exemptions = scan_trees(args.tree, rules, allowlist, args.max_blob_bytes)
+            findings, exemptions = scan_trees(args.tree, rules, allowlist, args.max_blob_bytes, args.publication)
         elif args.git_fixture:
-            findings = scan_git_fixture(args.git_fixture, rules, args.max_blob_bytes)
+            findings = scan_git_fixture(args.git_fixture, rules, args.max_blob_bytes, args.publication)
         elif args.git_repo:
             allowlist = _load_allowlist(args.allowlist)
             findings, exemptions = _apply_git_allowlist(
                 args.git_repo,
-                scan_git_repo(args.git_repo, rules, args.max_blob_bytes),
+                scan_git_repo(args.git_repo, rules, args.max_blob_bytes, args.publication),
                 allowlist,
             )
         elif args.bundle:
             allowlist = _load_allowlist(args.allowlist)
             findings, exemptions = scan_bundle(
-                args.bundle, rules, allowlist, args.max_blob_bytes
+                args.bundle, rules, allowlist, args.max_blob_bytes, args.publication
             )
         else:
             if args.repo is None or args.contract is None:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_core import cli
+from agent_core import __version__, cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +39,18 @@ def test_top_level_help_only_lists_v01_product_commands(capsys: pytest.CaptureFi
                     "engine", "check", "manifest", "fingerprint", "parity", "docs",
                     "privacy", "uninstall"):
         assert command not in output
+
+
+def test_lessons_help_discovers_all_public_and_retrieval_commands(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["lessons", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "{match,eval,hook}" in output
+    assert "public commands routed by agent-core: capture, promote, reject, retire" in output
 
 
 @pytest.mark.parametrize(("argv", "command"), FROZEN_COMMANDS)
@@ -88,4 +100,4 @@ def test_wrapper_version_from_temporary_cwd(tmp_path: Path) -> None:
         command = ["sh", str(ROOT / "agent-core"), "--version"]
     result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "0.1.0.dev2"
+    assert result.stdout.strip() == __version__

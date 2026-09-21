@@ -17,6 +17,8 @@ HOST_LABEL_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 RUNTIMES = {"claude-code", "codex", "generic"}
 CAPABILITY_STATES = {"active", "disabled"}
 REQUIREMENTS = {"required", "optional"}
+POSIX_DATA_HOME_SUFFIX = (".local", "share")
+PRODUCT_DIRECTORY = "agent-core"
 
 
 class ConfigError(ValueError):
@@ -26,6 +28,25 @@ class ConfigError(ValueError):
         super().__init__(f"{code} {detail}")
         self.code = code
         self.detail = detail
+
+
+def user_data_root() -> Path:
+    if os.name == "nt":
+        value = os.environ.get("LOCALAPPDATA")
+        if not value:
+            raise ConfigError("FAIL_USER_DATA", "LOCALAPPDATA is unavailable")
+        return Path(value).resolve() / PRODUCT_DIRECTORY
+    value = os.environ.get("XDG_DATA_HOME")
+    base = (
+        Path(value).expanduser().resolve()
+        if value else Path.home().joinpath(*POSIX_DATA_HOME_SUFFIX)
+    )
+    return base / PRODUCT_DIRECTORY
+
+
+def posix_user_data_root_shell() -> str:
+    default = "$HOME/" + "/".join(POSIX_DATA_HOME_SUFFIX)
+    return f"${{XDG_DATA_HOME:-{default}}}/{PRODUCT_DIRECTORY}"
 
 
 @dataclass(frozen=True)

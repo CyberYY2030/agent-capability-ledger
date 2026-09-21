@@ -39,7 +39,7 @@ def test_docs_fixture_ignores_host_git_signing_configuration(
     host_config.write_text("[commit]\n\tgpgsign = true\n", encoding="utf-8")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(host_config))
     results = verify_commands(ROOT, COMMANDS)
-    assert len(results) == 11
+    assert len(results) == 12
 
 
 def test_readme_and_lifecycle_generated_blocks_are_current() -> None:
@@ -55,6 +55,26 @@ def test_readme_and_lifecycle_generated_blocks_are_current() -> None:
     assert readme.count("<!-- COMMANDS:quickstart:START -->") == 1
     lifecycle = (ROOT / "docs" / "LIFECYCLE.md").read_text(encoding="utf-8")
     assert lifecycle.count("<!-- COMMANDS:lifecycle:START -->") == 1
+
+
+def test_active_sync_apply_examples_require_the_reviewed_plan_hash() -> None:
+    paths = [
+        ROOT.parent / "README.md",
+        ROOT / "README.md",
+        ROOT / "docs" / "PLAN.md",
+        ROOT / "docs" / "LIFECYCLE.md",
+    ]
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "sync" in line and "--apply" in line and line.lstrip().startswith(("$", "agent-core", "~")):
+                assert "--plan-hash" in line, f"unreviewed sync apply example: {path}:{line}"
+    commands = json.loads(COMMANDS.read_text(encoding="utf-8"))
+    applies = [
+        step for step in commands["steps"]
+        if "sync" in step["argv"] and "--apply" in step["argv"]
+    ]
+    assert applies
+    assert all("--plan-hash" in step["argv"] for step in applies)
 
 
 def test_render_check_rejects_drift_inside_bounded_block(tmp_path: Path) -> None:

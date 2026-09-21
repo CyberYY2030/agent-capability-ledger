@@ -22,7 +22,8 @@ This document records the selected boundaries, the rejected alternatives, and th
 
 ## 4. Capture writes to inbox before canonical content
 
-- Decision: write captured material to the append-only inbox, then promote a reviewed candidate.
+- Decision: capture only appends immutable candidate bytes; reviewed promotion moves a candidate to
+  `consumed/`, and reviewed rejection moves it to `rejected/`.
 - Rejected alternative: direct writes to canonical content.
 - Evidence: in incident B, two agent sessions implemented the same integration work from the same baseline; only one result could become canonical after manual comparison.
 - Cost: candidate review and promotion add a separate step before canonical content changes.
@@ -35,4 +36,4 @@ This document records the selected boundaries, the rejected alternatives, and th
 
 ## Trust boundaries
 
-V1 does not import third-party lessons or skills automatically. State consumes only content that its owner explicitly places and marks as trusted; unknown sources are rejected from injection and installation. Text normalization does not create trust for instructional content. Any future import capability requires a separate threat model, source or signature design, preview, and approval work.
+V0.1 does not import third-party lessons or skills automatically. State consumes only content that its owner explicitly places and marks as trusted; unknown sources are rejected from injection and installation. Text normalization does not create trust for instructional content. Any future import capability requires a separate threat model, source or signature design, preview, and approval work.

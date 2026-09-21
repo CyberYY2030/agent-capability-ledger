@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, capture, installer, match as lesson_match, project_promote, retire
+from . import __version__, capture, installer, match as lesson_match, project_promote, reject, retire
 from .config import ConfigError
 from .doctor import run as run_doctor
 from .sync import execute as execute_sync
@@ -37,12 +37,19 @@ def _parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("install")
 
-    sync = subparsers.add_parser("sync")
+    sync = subparsers.add_parser(
+        "sync",
+        description=(
+            "Preview what would be written. Repository write eligibility is checked only "
+            "when applying."
+        ),
+    )
     sync.add_argument("--config", type=Path)
     sync.add_argument("--state", type=Path)
     mode = sync.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
+    sync.add_argument("--plan-hash", help="required with --apply; use the exact dry-run PLAN_HASH")
 
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument("--config", type=Path, required=True)
@@ -68,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
         return capture.main(argv[2:])
     if argv[:2] == ["lessons", "promote"]:
         return project_promote.main(argv[2:])
+    if argv[:2] == ["lessons", "reject"]:
+        return reject.main(argv[2:])
     if argv and argv[0] == "lessons":
         return lesson_match.main(argv[1:])
     if argv and argv[0] == "install":
@@ -81,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "sync":
             for line in execute_sync(
                     ENGINE_ROOT, args.config, args.state, apply=args.apply,
-                    require_versioned=args.apply):
+                    require_versioned=args.apply, plan_hash=args.plan_hash):
                 print(line)
             return 0
         if args.command == "doctor":

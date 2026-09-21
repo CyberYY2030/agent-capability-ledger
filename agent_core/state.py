@@ -18,7 +18,14 @@ from typing import Any, Sequence
 
 from . import __version__, ledger
 from .config import ConfigError, load_config, load_manifest
-from .freshness import SHA_RE, is_repository, require_fresh
+from .freshness import (
+    SHA_RE,
+    inspect as inspect_freshness,
+    is_repository,
+    migrate_legacy_remote_state,
+    remote_state_path,
+    require_fresh,
+)
 from .repository import RepositoryContext, _is_reparse_alias, resolve_repository_context
 
 
@@ -320,16 +327,21 @@ def _host_path_outside_repository(path: Path, repo_root: Path, label: str) -> Pa
 
 
 def _binding_git(repo: Path, *args: str) -> str:
+    verb = args[0] if args else "?"
     try:
         result = _git(repo, *args)
     except ConfigError as exc:
-        _binding_fail("git identity check failed", exc)
+        stage = "timeout" if isinstance(exc.__cause__, subprocess.TimeoutExpired) else "spawn"
+        _binding_fail(f"git identity check failed op={verb} stage={stage}", exc)
     if result.returncode != 0:
-        _binding_fail("git identity check failed")
+        _binding_fail(
+            f"git identity check failed op={verb} stage=exit rc={result.returncode}",
+        )
     return result.stdout
 
 
 def _binding_git_bytes(repo: Path, *args: str) -> bytes:
+    verb = args[0] if args else "?"
     resolved = Path(repo).resolve()
     environment = os.environ.copy()
     environment.setdefault("GIT_TERMINAL_PROMPT", "0")
@@ -339,10 +351,14 @@ def _binding_git_bytes(repo: Path, *args: str) -> bytes:
             ["git", "-c", f"safe.directory={resolved.as_posix()}", "-C", str(resolved), *args],
             check=False, capture_output=True, timeout=15, env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        _binding_fail("git identity check failed", exc)
+    except subprocess.TimeoutExpired as exc:
+        _binding_fail(f"git identity check failed op={verb} stage=timeout", exc)
+    except OSError as exc:
+        _binding_fail(f"git identity check failed op={verb} stage=spawn", exc)
     if result.returncode != 0:
-        _binding_fail("git identity check failed")
+        _binding_fail(
+            f"git identity check failed op={verb} stage=exit rc={result.returncode}",
+        )
     return result.stdout
 
 
@@ -666,7 +682,53 @@ def apply_attach(
     config_path: Path,
     *,
     confirm_private_remote: bool,
+    lock_token: object | None = None,
+    _defer_remote_state: bool = False,
+    _reviewed_known_remote: str | None = None,
+    _reviewed_config_bytes: bytes | None = None,
 ) -> list[str]:
+    from .materializer import require_lock_token
+    from .promote import operation_lock
+
+    control_root = config_path.resolve().parent / "txn"
+    if _defer_remote_state and lock_token is None:
+        raise ConfigError("FAIL_LOCK_TOKEN", "deferred remote state requires outer lock ownership")
+    if not _defer_remote_state and _reviewed_known_remote is not None:
+        raise ConfigError("FAIL_ARGUMENT", "reviewed remote state requires deferred publication")
+    if not _defer_remote_state and _reviewed_config_bytes is not None:
+        raise ConfigError("FAIL_ARGUMENT", "reviewed config requires deferred publication")
+    if _reviewed_known_remote is not None and SHA_RE.fullmatch(_reviewed_known_remote) is None:
+        raise ConfigError("FAIL_REMOTE_SHA", _reviewed_known_remote)
+    if lock_token is not None:
+        require_lock_token(lock_token, control_root)
+        return _apply_attach_locked(
+            state_root, config_path, confirm_private_remote=confirm_private_remote,
+            lock_token=lock_token,
+            _defer_remote_state=_defer_remote_state,
+            _reviewed_known_remote=_reviewed_known_remote,
+            _reviewed_config_bytes=_reviewed_config_bytes,
+        )
+    with operation_lock(control_root) as held_token:
+        return _apply_attach_locked(
+            state_root, config_path, confirm_private_remote=confirm_private_remote,
+            lock_token=held_token,
+        )
+
+
+def _apply_attach_locked(
+    state_root: Path,
+    config_path: Path,
+    *,
+    confirm_private_remote: bool,
+    lock_token: object,
+    _defer_remote_state: bool = False,
+    _reviewed_known_remote: str | None = None,
+    _reviewed_config_bytes: bytes | None = None,
+) -> list[str]:
+    from .materializer import require_lock_token
+
+    control_root = config_path.resolve().parent / "txn"
+    require_lock_token(lock_token, control_root)
     context, config, previous_config, lock_content, remote_sha256, advertised_sha, root_sha, provenance_sha = _validate_attach(
         state_root, config_path, confirm_private_remote=confirm_private_remote,
     )
@@ -674,14 +736,16 @@ def apply_attach(
     receipt_path = _host_path_outside_repository(
         binding_receipt_path(config_path), context.repo_root, "binding receipt",
     )
-    remote_state_path = _host_path_outside_repository(
-        config_path.parent / "remote-state.json", context.repo_root, "remote state",
+    remote_path = _host_path_outside_repository(
+        remote_state_path(config_path), context.repo_root, "remote state",
     )
     previous_remote_state = (
-        _ordinary_file(remote_state_path, "remote state", single_link=True)
-        if os.path.lexists(remote_state_path)
+        _ordinary_file(remote_path, "remote state", single_link=True)
+        if not _defer_remote_state and os.path.lexists(remote_path)
         else None
     )
+    if not _defer_remote_state:
+        migrate_legacy_remote_state(config_path, context.state_root, lock_token=lock_token)
     fetched = _git(context.state_root, "fetch", "origin", "--quiet")
     if fetched.returncode != 0:
         raise ConfigError("REMOTE_REQUIRED", "state attach requires a fetchable origin/main")
@@ -696,8 +760,19 @@ def apply_attach(
     ):
         raise ConfigError("FAIL_REMOTE_RACE", "attachment identity changed during fetch")
     remote_sha = fresh_sha
+    observed = inspect_freshness(
+        context.state_root, control_root, fetch=False,
+        reviewed_known_remote=_reviewed_known_remote,
+        baseline_reviewed=_defer_remote_state,
+    )
+    if observed.remote != remote_sha:
+        raise ConfigError("FAIL_REMOTE_RACE", "attachment remote changed after fetch")
     config["state_root"] = str(context.state_root)
     rendered_config = _json_bytes(config)
+    if _reviewed_config_bytes is not None:
+        if rendered_config != _reviewed_config_bytes:
+            raise ConfigError("FAIL_STATE_BINDING", "reviewed config postimage changed")
+        rendered_config = _reviewed_config_bytes
     previous_receipt = receipt_path.read_bytes() if receipt_path.is_file() else None
     receipt = _json_bytes({
         "schema": BINDING_SCHEMA_V2 if context.layout == "canonical" else BINDING_SCHEMA_V1,
@@ -718,16 +793,19 @@ def apply_attach(
     try:
         _atomic_write(config_path, rendered_config)
         _atomic_write(receipt_path, receipt)
-        _atomic_write(remote_state_path, remote_state)
+        if not _defer_remote_state:
+            _atomic_write(remote_path, remote_state)
         _ordinary_file(config_path, "host config", single_link=True)
         _ordinary_file(receipt_path, "binding receipt", single_link=True)
-        _ordinary_file(remote_state_path, "remote state", single_link=True)
+        if not _defer_remote_state:
+            _ordinary_file(remote_path, "remote state", single_link=True)
     except Exception as exc:
         try:
-            if previous_remote_state is None:
-                remote_state_path.unlink(missing_ok=True)
-            else:
-                _atomic_write(remote_state_path, previous_remote_state)
+            if not _defer_remote_state:
+                if previous_remote_state is None:
+                    remote_path.unlink(missing_ok=True)
+                else:
+                    _atomic_write(remote_path, previous_remote_state)
             if previous_receipt is None:
                 receipt_path.unlink(missing_ok=True)
             else:

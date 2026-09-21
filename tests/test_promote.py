@@ -32,7 +32,7 @@ from agent_core.promote import (
 )
 from agent_core.cli import main as cli_main
 from agent_core.freshness import load_candidate
-from agent_core.match import parse_markdown
+from agent_core.match import Query, match_lessons, parse_markdown, render
 from agent_core.project_promote import main as project_promote_main
 
 
@@ -1082,6 +1082,162 @@ def test_local_promote_global_scoped_update_moves_candidate_under_install_lock(t
     assert f"D\t{source_relative}" in git(repo, "diff", "--cached", "--name-status", "--no-renames").stdout
 
 
+def test_local_promote_force_new_previews_exact_added_entry_after_plan_hash(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "preview-force-new", rule="Preview force-new rule")
+    plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                              state_root=repo, config_path=config)
+    added = [line for line in plan.lines if line.startswith("POSTIMAGE_ADDED ")]
+    removed = [line for line in plan.lines if line.startswith("POSTIMAGE_REMOVED ")]
+    assert added == [
+        f"POSTIMAGE_ADDED - **L-2 [pending·通用] Preview force-new rule.** "
+        f"触发: local preview-force-new. 代价: lost local lesson. from: {item}. "
+        "sink → checks/preview-force-new.md."
+    ]
+    assert removed == []
+    assert plan.lines.index(added[0]) > next(
+        index for index, line in enumerate(plan.lines) if line.startswith("PLAN_HASH "))
+
+
+def test_local_promote_update_preview_exposes_removed_when_field(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    ledger_path = repo / "experience" / "LESSONS.md"
+    ledger_text = ledger_path.read_text(encoding="utf-8")
+    ledger_path.write_text(
+        ledger_text.replace(
+            "sink → checks/existing.md.",
+            'sink → checks/existing.md. when: {"paths":["engine/**"]}',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    item = local_state_candidate(repo, control, "preview-update", rule="Replacement without predicate")
+    assert "when" not in load_candidate(repo / "inbox" / f"{item}.md", allow_project=True)
+    plan = plan_local_promote(
+        repo, None, item, scope_override="global", update="global:global:L-1",
+        state_root=repo, config_path=config,
+    )
+    removed = [line for line in plan.lines if line.startswith("POSTIMAGE_REMOVED ")]
+    added = [line for line in plan.lines if line.startswith("POSTIMAGE_ADDED ")]
+    assert any("when:" in line for line in removed)
+    assert added and all("when:" not in line for line in added)
+
+
+def test_local_promote_supersedes_preview_shows_archive_move(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "preview-supersedes", rule="Replacement with archive")
+    plan = plan_local_promote(repo, None, item, scope_override="global", supersedes="L-1",
+                              state_root=repo, config_path=config)
+    removed = [line for line in plan.lines if line.startswith("POSTIMAGE_REMOVED ")]
+    added = [line for line in plan.lines if line.startswith("POSTIMAGE_ADDED ")]
+    assert any("- **L-1 " in line for line in removed)
+    assert any("- **L-1 " in line and "superseded_by: L-2." in line for line in added)
+    assert any(f"from: {item}. supersedes: L-1." in line for line in added)
+
+
+def test_local_promote_payload_key_set_is_frozen(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "payload-keys", rule="Payload key guard")
+    plan = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
+                              state_root=repo, config_path=config)
+    assert set(plan.payload) == {
+        "operation", "candidate_id", "expected_remote_sha", "source_path", "candidate_path",
+        "source_kind", "candidate_sha256", "target_scope", "target_store", "target_path",
+        "operation_root", "target_git_root", "source_git_root", "canonical_sha256",
+        "expected_postimage_sha256", "effective_when", "action", "choice", "update", "supersedes", "result_id",
+        "project_id", "state_root", "config_path", "config_sha256", "control_root", "stage_paths",
+        "candidate_identity", "target_identity", "resolved_sources", "exact_facts_sha256", "layout",
+        "state_prefix",
+    }
+
+
+@pytest.mark.parametrize(("predicate", "value", "query"), [
+    ("text", "atomic ledger update", Query(stage="prompt", text="atomic ledger update")),
+    ("tasks", "build", Query(stage="dispatch", task="build")),
+    ("cmds", "git status", Query(stage="pretool", cmds=("git status --short",))),
+    ("paths", "src/*.py", Query(stage="pretool", paths=("src/example.py",))),
+])
+def test_local_promote_when_override_is_plan_bound_rendered_and_retrievable(
+        tmp_path: Path, predicate: str, value: str, query: Query) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, f"when-{predicate}", rule=f"Predicate {predicate}")
+    candidate_path = repo / "inbox" / f"{item}.md"
+    candidate_before = candidate_path.read_bytes()
+    when = json.dumps({predicate: [value]}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    plan = plan_local_promote(
+        repo, None, item, scope_override="global", force_new=True, when=when,
+        state_root=repo, config_path=config,
+    )
+    assert plan.payload["effective_when"] == when
+    assert f"EFFECTIVE_WHEN source=cli value={when}" in plan.lines
+    assert any(line.startswith(f"EFFECTIVE_WHEN_TOKENS predicate={predicate}") for line in plan.lines)
+    result = apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    consumed = repo / "inbox" / "consumed" / f"{item}.md"
+    assert consumed.read_bytes() == candidate_before
+    lessons = parse_markdown((repo / "experience" / "LESSONS.md").read_text(encoding="utf-8"), "global", "test")
+    promoted = next(lesson for lesson in lessons if lesson.lesson_id == result.lesson_id)
+    assert promoted.when == {predicate: (value,)}
+    hits, ignored = match_lessons([promoted], query)
+    assert result.lesson_id in render(hits, ignored, 20000)
+
+
+def test_local_promote_when_override_replaces_candidate_when_without_mutating_candidate(tmp_path: Path) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    original = '{"text":["original predicate"]}'
+    replacement = '{"text":["replacement predicate"]}'
+    item = project_candidate(repo, control, "when-replace", when=original)
+    candidate_path = repo / PROJECT_INBOX / f"{item}.md"
+    before = candidate_path.read_bytes()
+    plan = plan_local_promote(
+        repo, None, item, scope_override="project:sample-app", force_new=True, when=replacement,
+        state_root=repo, config_path=config,
+    )
+    assert f"CANDIDATE_WHEN {original}" in plan.lines
+    apply_local_promote(repo, None, plan, plan.plan_hash, config_path=config)
+    consumed = repo / PROJECT_CONSUMED / f"{item}.md"
+    assert consumed.read_bytes() == before
+    lesson = next(item for item in parse_markdown(
+        (repo / PROJECT_LEDGER).read_text(encoding="utf-8"), "project", "test",
+    ) if item.lesson_id == "SAMPLE-2")
+    assert lesson.when == {"text": ("replacement predicate",)}
+
+
+@pytest.mark.parametrize("when", [
+    '{"text": ["not canonical"]}',
+    '{"unknown":["value"]}',
+    '{"text":["first"],"text":["second"]}',
+    '{"text":["a"]}',
+])
+def test_local_promote_when_rejects_invalid_or_tokenless_values_without_writes(
+        tmp_path: Path, when: str) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "when-invalid", rule="Invalid predicate")
+    before = (repo / "experience" / "LESSONS.md").read_bytes()
+    with pytest.raises(ConfigError, match="FAIL_WHEN"):
+        plan_local_promote(
+            repo, None, item, scope_override="global", force_new=True, when=when,
+            state_root=repo, config_path=config,
+        )
+    assert (repo / "experience" / "LESSONS.md").read_bytes() == before
+    assert (repo / "inbox" / f"{item}.md").is_file()
+
+
+def test_local_promote_cli_binds_when_into_plan_hash(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "when-cli", rule="CLI predicate")
+    original = '{"text":["original predicate"]}'
+    changed = '{"text":["changed predicate"]}'
+    base = ["--workspace", str(repo), "--config", str(config), "--state", str(repo),
+            "--id", item, "--scope", "global", "--force-new"]
+    assert project_promote_main([*base, "--when", original]) == 0
+    plan_hash = next(line.split(" ", 1)[1] for line in capsys.readouterr().out.splitlines()
+                     if line.startswith("PLAN_HASH "))
+    before = (repo / "experience" / "LESSONS.md").read_bytes()
+    assert project_promote_main([*base, "--when", changed, "--apply", "--plan-hash", plan_hash]) == 1
+    assert "FAIL_INPUT_CHANGED" in capsys.readouterr().err
+    assert (repo / "experience" / "LESSONS.md").read_bytes() == before
+
+
 def test_local_promote_same_repository_override_and_cross_repository_rejection(tmp_path: Path) -> None:
     repo, config, control = setup_unified_local(tmp_path)
     item = project_candidate(repo, control, "same-root", rule="Project rule promoted globally")
@@ -1167,6 +1323,7 @@ def test_local_promote_rerun_converges_after_canonical_write_fault(
     converged = plan_local_promote(repo, None, item, scope_override="global", force_new=True,
                                    state_root=repo, config_path=config)
     assert converged.payload["action"] == "converge"
+    assert not any(line.startswith("POSTIMAGE_") for line in converged.lines)
     assert apply_local_promote(repo, None, converged, converged.plan_hash, config_path=config).lesson_id == "L-2"
     text = (repo / "experience" / "LESSONS.md").read_text(encoding="utf-8")
     assert text.count(f"from: {item}.") == 1

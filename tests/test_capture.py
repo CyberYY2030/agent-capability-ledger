@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import io
 import json
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -13,7 +15,8 @@ from agent_core import capture, privacy
 from agent_core.cli import main as cli_main
 from agent_core.config import ConfigError
 from agent_core.freshness import load_candidate
-from agent_core.promote import candidate_id, create_candidate, plan_project_promote
+from agent_core.match import main as match_main
+from agent_core.promote import candidate_id, create_candidate, operation_lock, plan_project_promote
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -537,3 +540,293 @@ def test_repeated_uuid_never_overwrites_and_partial_file_is_cleaned(
             scope_hint="global", evidence="synthetic:partial",
         )
     assert len(list((state / "inbox").glob("*.md"))) == 1
+
+
+CAPTURE_FIELDS = {
+    "rule": "当文本检索需要精确定位时，先使用 rg",
+    "trigger": "text search needs exact locations",
+    "cost": "repeated slow searches",
+    "sink": "checks/search.md",
+}
+
+
+def capture_block(fields: dict[str, str] | None = None, *, pretty: bool = False) -> str:
+    payload = fields or CAPTURE_FIELDS
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=not pretty, separators=None if pretty else (",", ":"))
+    return f"Answer complete.\nagent-core-capture\n{rendered}\n"
+
+
+def completion_payload(message: str, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "hook_event_name": "Stop", "stop_hook_active": False,
+        "last_assistant_message": message, "cwd": "ignored-private-workspace",
+        "session_id": "ignored-private-session", "transcript_path": "ignored.jsonl",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize("message,accepted", [
+    ("plain response", False),
+    (capture_block(), True),
+    (capture_block() + capture_block(), None),
+    ("prefix agent-core-capture\n" + json.dumps(CAPTURE_FIELDS), False),
+    ("```text\nagent-core-capture\n" + json.dumps(CAPTURE_FIELDS) + "\n```", False),
+])
+def test_completion_capture_parser_block_count_anchor_and_fence(message: str, accepted: bool | None) -> None:
+    if accepted is None:
+        with pytest.raises(ConfigError, match="block count"):
+            capture.parse_completion_capture(message)
+    else:
+        assert (capture.parse_completion_capture(message) is not None) is accepted
+
+
+@pytest.mark.parametrize("raw", [
+    '{"rule":"x","rule":"y","trigger":"t","cost":"c","sink":"s"}',
+    '{"rule":"x","trigger":"t","cost":"c"}',
+    '{"rule":"x","trigger":"t","cost":"c","sink":"s","extra":"x"}',
+    '{"rule":{"nested":true},"trigger":"t","cost":"c","sink":"s"}',
+    '{"rule":"","trigger":"t","cost":"c","sink":"s"}',
+    '{"rule":"x","trigger":"t","cost":"c","sink":"s"} trailing',
+    '{broken',
+    '["not-object"]',
+])
+def test_completion_capture_parser_rejects_strict_json_failures(raw: str) -> None:
+    with pytest.raises(ConfigError, match="automatic capture"):
+        capture.parse_completion_capture(f"agent-core-capture\n{raw}")
+
+
+@pytest.mark.parametrize("case", ["trailing", "size", "non-utf8"])
+def test_completion_capture_parser_rejects_trailing_size_and_non_utf8(case: str) -> None:
+    if case == "trailing":
+        message = "agent-core-capture\n" + json.dumps(CAPTURE_FIELDS) + "\ntrailing"
+    elif case == "size":
+        message = "x" * (capture.CAPTURE_MESSAGE_LIMIT + 1)
+    else:
+        message = "agent-core-capture\n" + json.dumps(dict(CAPTURE_FIELDS, rule="\ud800"))
+    with pytest.raises(ConfigError, match="automatic capture"):
+        capture.parse_completion_capture(message)
+
+
+def test_completion_capture_digest_is_canonical_and_output_hash_is_exact() -> None:
+    reordered = {"sink": CAPTURE_FIELDS["sink"], "cost": CAPTURE_FIELDS["cost"],
+                 "trigger": CAPTURE_FIELDS["trigger"], "rule": CAPTURE_FIELDS["rule"]}
+    first = capture.parse_completion_capture(capture_block())
+    second = capture.parse_completion_capture(capture_block(reordered, pretty=True))
+    assert first is not None and second is not None
+    assert capture._request_sha256(first) == capture._request_sha256(second)
+    changed = dict(first, sink="checks/other.md")
+    assert capture._request_sha256(first) != capture._request_sha256(changed)
+    message = capture_block() + "\n"
+    assert hashlib.sha256(message.encode("utf-8")).hexdigest() != hashlib.sha256(
+        capture_block().encode("utf-8")
+    ).hexdigest()
+
+
+def test_completion_capture_creates_once_deduplicates_consumed_and_recaptures_after_deletion(
+    tmp_path: Path,
+) -> None:
+    state = state_repo(tmp_path)
+    config = config_file(tmp_path, state)
+    ledger = state / "experience" / "LESSONS.md"
+    first_message = capture_block()
+    second_message = "Different prose.\n" + capture_block(CAPTURE_FIELDS, pretty=True)
+    assert capture.automatic_completion_capture(
+        completion_payload(first_message), runtime="claude-code", stage="completion",
+        ledger_path=ledger, config_path=config,
+    ) is None
+    candidate = next((state / "inbox").glob("*.md"))
+    payload = load_candidate(candidate)
+    request_digest = capture._request_sha256(CAPTURE_FIELDS)
+    assert payload["agent"] == "claude-code" and payload["scope_hint"] == "global"
+    assert payload["base_revision"] == f"{git(state, 'rev-parse', 'HEAD').stdout.strip()} unverified"
+    assert payload["evidence"] == (
+        f"claude-code-stop request-sha256:{request_digest} "
+        f"assistant-output-sha256:{hashlib.sha256(first_message.encode('utf-8')).hexdigest()}"
+    )
+    assert all(private not in candidate.read_text(encoding="utf-8") for private in (
+        "ignored-private-workspace", "ignored-private-session", "ignored.jsonl", str(tmp_path),
+    ))
+    assert capture.automatic_completion_capture(
+        completion_payload(second_message), runtime="claude-code", stage="completion",
+        ledger_path=ledger, config_path=config,
+    ) is None
+    assert len(list((state / "inbox").glob("*.md"))) == 1
+    changed_fields = dict(CAPTURE_FIELDS, sink="checks/changed.md")
+    assert capture.automatic_completion_capture(
+        completion_payload(capture_block(changed_fields)), runtime="claude-code", stage="completion",
+        ledger_path=ledger, config_path=config,
+    ) is None
+    assert len(list((state / "inbox").glob("*.md"))) == 2
+    changed_candidate = next(
+        path for path in (state / "inbox").glob("*.md") if path != candidate
+    )
+    changed_candidate.unlink()
+    consumed = state / "inbox" / "consumed"
+    consumed.mkdir()
+    moved = consumed / candidate.name
+    candidate.replace(moved)
+    assert capture.automatic_completion_capture(
+        completion_payload(second_message), runtime="claude-code", stage="completion",
+        ledger_path=ledger, config_path=config,
+    ) is None
+    assert not list((state / "inbox").glob("*.md"))
+    moved.unlink()
+    assert capture.automatic_completion_capture(
+        completion_payload(second_message), runtime="claude-code", stage="completion",
+        ledger_path=ledger, config_path=config,
+    ) is None
+    assert len(list((state / "inbox").glob("*.md"))) == 1
+
+
+@pytest.mark.parametrize(("case", "gate"), [
+    ("event", "payload-event"),
+    ("active-missing", "payload-active-missing"),
+    ("active", "payload-active"),
+    ("missing", "payload-output"),
+    ("parse", "parse"),
+    ("identity", "identity"),
+    ("budget", "scan"),
+    ("lock", "lock"),
+    ("privacy", "capture"),
+    ("writer", "capture"),
+])
+def test_completion_capture_rejections_are_fail_open_and_zero_write(
+    case: str, gate: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = state_repo(tmp_path)
+    config = config_file(tmp_path, state)
+    ledger = state / "experience" / "LESSONS.md"
+    canonical_ledger = ledger
+    before = ledger.read_bytes()
+    fields = dict(CAPTURE_FIELDS)
+    payload = completion_payload(capture_block(fields))
+    secret = "secret-token session-123 C:/Users/__AGENT_CORE_SYNTHETIC__/fixture.txt"
+    if case == "event":
+        payload["hook_event_name"] = secret
+    elif case == "active-missing":
+        del payload["stop_hook_active"]
+    elif case == "privacy":
+        fields["sink"] = secret
+        payload = completion_payload(capture_block(fields))
+    elif case == "active":
+        payload["stop_hook_active"] = secret
+    elif case == "missing":
+        payload["last_assistant_message"] = ""
+    elif case == "parse":
+        payload["last_assistant_message"] = f"agent-core-capture\n{{broken {secret}"
+    elif case == "identity":
+        ledger = tmp_path / secret / "LESSONS.md"
+    elif case == "budget":
+        (state / "inbox").mkdir()
+        (state / "inbox" / "existing.md").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(capture, "CAPTURE_SCAN_FILE_LIMIT", 0)
+    elif case == "writer":
+        monkeypatch.setattr(
+            capture, "create_candidate",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError(secret)),
+        )
+    inbox_before = {
+        path.name: path.read_bytes() for path in (state / "inbox").glob("*.md")
+    }
+    if case == "lock":
+        with operation_lock(config.parent / "txn"):
+            warning = capture.automatic_completion_capture(
+                payload, runtime="claude-code", stage="completion", ledger_path=ledger, config_path=config,
+            )
+    else:
+        warning = capture.automatic_completion_capture(
+            payload, runtime="claude-code", stage="completion", ledger_path=ledger, config_path=config,
+        )
+    assert warning == f"{capture.CAPTURE_WARNING} gate={gate}"
+    assert secret not in warning
+    assert len(warning.encode("ascii")) <= 80
+    assert canonical_ledger.read_bytes() == before
+    assert {
+        path.name: path.read_bytes() for path in (state / "inbox").glob("*.md")
+    } == inbox_before
+
+
+def test_completion_capture_warning_gate_set_is_fixed() -> None:
+    assert capture.AUTOMATIC_CAPTURE_GATES == frozenset({
+        "payload-event", "payload-active-missing", "payload-active", "payload-output",
+        "parse", "identity", "lock", "scan", "capture",
+    })
+
+
+def test_completion_capture_samples_head_inside_lock_before_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = state_repo(tmp_path)
+    config = config_file(tmp_path, state)
+    ledger = state / "experience" / "LESSONS.md"
+    locked = False
+    head_sampled = False
+
+    class BoundLock:
+        def __enter__(self):
+            nonlocal locked
+            locked = True
+
+        def __exit__(self, *_args):
+            nonlocal locked
+            locked = False
+
+    def local_head(_state: Path) -> str:
+        nonlocal head_sampled
+        assert locked
+        head_sampled = True
+        return "a" * 40
+
+    def duplicate(_state: Path, _token: str) -> bool:
+        assert locked and head_sampled
+        return True
+
+    monkeypatch.setattr(capture, "operation_lock", lambda _root: BoundLock())
+    monkeypatch.setattr(capture, "_local_head", local_head)
+    monkeypatch.setattr(capture, "_duplicate_request", duplicate)
+
+    assert capture.automatic_completion_capture(
+        completion_payload(capture_block()), runtime="claude-code", stage="completion",
+        ledger_path=ledger, config_path=config,
+    ) is None
+    assert head_sampled and not locked
+
+
+def test_completion_capture_uses_only_local_git_and_never_shells_model_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = state_repo(tmp_path)
+    config = config_file(tmp_path, state)
+    ledger = state / "experience" / "LESSONS.md"
+    marker = tmp_path / "must-not-exist"
+    fields = dict(CAPTURE_FIELDS, sink=f"$(touch {marker.name})")
+    original = subprocess.run
+    seen: list[list[str]] = []
+
+    def local_only(command, *args, **kwargs):
+        seen.append(list(command))
+        assert "fetch" not in command and "push" not in command and "ls-remote" not in command
+        return original(command, *args, **kwargs)
+
+    monkeypatch.setattr(capture.subprocess, "run", local_only)
+    assert capture.automatic_completion_capture(
+        completion_payload(capture_block(fields)), runtime="claude-code", stage="completion",
+        ledger_path=ledger, config_path=config,
+    ) is None
+    assert len(seen) == 1 and seen[0][-2:] == ["rev-parse", "HEAD"]
+    assert not marker.exists()
+
+
+def test_codex_completion_remains_retrieval_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = state_repo(tmp_path)
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(completion_payload(capture_block())), encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert match_main([
+        "hook", "--runtime", "codex", "--stage", "completion",
+        "--ledger", str(state / "experience" / "LESSONS.md"), "--event-json", str(event),
+    ]) == 0
+    assert not (state / "inbox").exists()

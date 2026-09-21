@@ -199,30 +199,22 @@ class BindingTests(unittest.TestCase):
                     receipt_before,
                 )
 
-    def test_attach_replaces_stale_remote_baseline_with_observed_revision(self) -> None:
+    def test_attach_rejects_a_rewound_remote_baseline_without_replacing_it(self) -> None:
         canonical, config, _remote = self._canonical("attach-baseline")
-        remote_state = config.parent / "remote-state.json"
+        remote_state = config.parent / "txn" / "remote-state.json"
         remote_state.write_text(
             json.dumps({"last_known_good": "f" * 40}, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        observed = git(canonical, "rev-parse", "origin/main").stdout.strip()
-
-        apply_attach(canonical / "state", config, confirm_private_remote=True)
-
-        self.assertEqual(
-            json.loads(remote_state.read_text(encoding="utf-8")),
-            {"last_known_good": observed},
-        )
-        self.assertEqual(
-            require_fresh(canonical / "state", "sync", config.parent, fetch=False).remote,
-            observed,
-        )
+        before = remote_state.read_bytes()
+        with self.assertRaisesRegex(ConfigError, "FAIL_REMOTE_REWIND"):
+            apply_attach(canonical / "state", config, confirm_private_remote=True)
+        self.assertEqual(remote_state.read_bytes(), before)
 
     def test_attach_write_and_verify_failures_restore_three_file_transaction(self) -> None:
         canonical, config, _remote = self._canonical("attach-rollback")
         receipt = binding_receipt_path(config)
-        remote_state = config.parent / "remote-state.json"
+        remote_state = config.parent / "txn" / "remote-state.json"
         config.write_bytes(config.read_bytes() + b"\n")
         receipt.write_bytes(receipt.read_bytes() + b"\n")
         remote_state.unlink()
@@ -274,7 +266,7 @@ class BindingTests(unittest.TestCase):
 
     def test_attach_remote_state_directory_is_rejected_before_atomic_write(self) -> None:
         canonical, config, _remote = self._canonical("attach-remote-state-directory")
-        remote_state = config.parent / "remote-state.json"
+        remote_state = config.parent / "txn" / "remote-state.json"
         remote_state.unlink()
         remote_state.mkdir()
         identity = (remote_state.stat().st_dev, remote_state.stat().st_ino)
@@ -288,7 +280,7 @@ class BindingTests(unittest.TestCase):
 
     def test_attach_remote_state_hardlink_is_rejected_before_atomic_write(self) -> None:
         canonical, config, _remote = self._canonical("attach-remote-state-hardlink")
-        remote_state = config.parent / "remote-state.json"
+        remote_state = config.parent / "txn" / "remote-state.json"
         link = self.root / "remote-state-link.json"
         try:
             os.link(remote_state, link)
@@ -438,6 +430,58 @@ class BindingTests(unittest.TestCase):
             config_link.unlink(missing_ok=True)
             receipt_link.unlink(missing_ok=True)
         self.assertEqual(validate_state_binding(canonical / "state", config).layout, "canonical")
+
+    def test_binding_git_failures_name_operation_and_stage_without_secrets(self) -> None:
+        repo = self.root / "private-repository"
+        secret = "https://example.invalid/private-repository"
+
+        def wrapped(cause: BaseException) -> ConfigError:
+            try:
+                raise ConfigError("FAIL_GIT", secret) from cause
+            except ConfigError as exc:
+                return exc
+
+        text_cases = (
+            (wrapped(OSError(secret)), "stage=spawn"),
+            (wrapped(subprocess.TimeoutExpired(["git", secret], 15)), "stage=timeout"),
+        )
+        for failure, expected_stage in text_cases:
+            with self.subTest(wrapper="text", stage=expected_stage), \
+                    mock.patch.object(state_module, "_git", side_effect=failure):
+                with self.assertRaises(ConfigError) as raised:
+                    state_module._binding_git(repo, "ls-remote", secret)
+                message = str(raised.exception)
+                self.assertIn(f"op=ls-remote {expected_stage}", message)
+                self.assertNotIn(secret, message)
+                self.assertNotIn(str(repo), message)
+
+        text_exit = subprocess.CompletedProcess(["git", secret], 128, "", secret)
+        with mock.patch.object(state_module, "_git", return_value=text_exit):
+            with self.assertRaises(ConfigError) as raised:
+                state_module._binding_git(repo, "status", secret)
+        self.assertIn("op=status stage=exit rc=128", str(raised.exception))
+        self.assertNotIn(secret, str(raised.exception))
+
+        byte_cases = (
+            (OSError(secret), "stage=spawn"),
+            (subprocess.TimeoutExpired(["git", secret], 15), "stage=timeout"),
+        )
+        for failure, expected_stage in byte_cases:
+            with self.subTest(wrapper="bytes", stage=expected_stage), \
+                    mock.patch.object(subprocess, "run", side_effect=failure):
+                with self.assertRaises(ConfigError) as raised:
+                    state_module._binding_git_bytes(repo, "show", secret)
+                message = str(raised.exception)
+                self.assertIn(f"op=show {expected_stage}", message)
+                self.assertNotIn(secret, message)
+                self.assertNotIn(str(repo), message)
+
+        byte_exit = subprocess.CompletedProcess(["git", secret], 7, b"", secret.encode())
+        with mock.patch.object(subprocess, "run", return_value=byte_exit):
+            with self.assertRaises(ConfigError) as raised:
+                state_module._binding_git_bytes(repo, "rev-parse", secret)
+        self.assertIn("op=rev-parse stage=exit rc=7", str(raised.exception))
+        self.assertNotIn(secret, str(raised.exception))
 
     @unittest.skipUnless(os.name == "nt", "Windows junction coverage")
     def test_windows_junction_state_root_is_rejected(self) -> None:

@@ -31,6 +31,9 @@
     {"id":"p28","kind":"positive","stage":"dispatch","task":"audit","expected_hit":["L-103","L-115"],"legacy_probe":{"text":"payload runtime schema event","expected_hit":"L-118"}},
     {"id":"p29","kind":"positive","stage":"pretool","paths":["audit/result.json"],"expected_hit":["L-115"],"legacy_probe":{"text":"budget omitted character marker","expected_hit":"L-119"}},
     {"id":"p30","kind":"positive","stage":"pretool","cmds":["python -m pytest"],"expected_hit":["L-110"],"legacy_probe":{"text":"ledger source scoped routing","expected_hit":"L-120"}},
+    {"id":"p31","kind":"positive","stage":"prompt","text":"harborwatch","expected_hit":["SYN-BAG"],"legacy_probe":{"text":"harborwatch amber lantern","expected_hit":"SYN-BAG"}},
+    {"id":"p32","kind":"positive","stage":"prompt","text":"quartzsignal","expected_hit":["SYN-ID"],"legacy_probe":{"text":"quartzsignal nebula matrix","expected_hit":"SYN-ID"}},
+    {"id":"p33","kind":"positive","stage":"prompt","text":"星图","expected_hit":["SYN-CJK"],"legacy_probe":{"text":"星图潮汐车站","expected_hit":"SYN-CJK"}},
     {"id":"n01","kind":"negative","stage":"prompt","paths":["agent_core/match.py"],"text":"ordinary request","expected_hit":[]},
     {"id":"n02","kind":"negative","stage":"prompt","cmds":["git commit"],"text":"ordinary request","expected_hit":[]},
     {"id":"n03","kind":"negative","stage":"pretool","text":"shared constant","paths":["assets/logo.svg"],"expected_hit":[]},
@@ -60,6 +63,9 @@
     {"id":"n27","kind":"negative","stage":"prompt","text":"routing","expected_hit":[]},
     {"id":"n28","kind":"negative","stage":"completion","text":"successfully delivered feature","expected_hit":[]},
     {"id":"n29","kind":"negative","stage":"dispatch","task":"unknown","paths":["src/main.py"],"expected_hit":[]},
-    {"id":"n30","kind":"negative","stage":"pretool","paths":["src/main.py"],"cmds":["python app.py"],"expected_hit":[]}
+    {"id":"n30","kind":"negative","stage":"pretool","paths":["src/main.py"],"cmds":["python app.py"],"expected_hit":[]},
+    {"id":"n31","kind":"negative","stage":"prompt","text":"amber","expected_hit":[]},
+    {"id":"n32","kind":"negative","stage":"prompt","text":"nebula garden","expected_hit":[]},
+    {"id":"n33","kind":"negative","stage":"prompt","text":"纸鸢车站","expected_hit":[]}
   ]
 }

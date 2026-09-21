@@ -240,4 +240,7 @@ def test_sync_apply_without_fetchable_origin_is_remote_required(tmp_path: Path) 
     state = initialized_state(tmp_path)
     config = host_config(tmp_path, str(state))
     with pytest.raises(ConfigError, match="REMOTE_REQUIRED"):
-        execute_sync(ROOT, config, state, apply=True, require_versioned=True)
+        execute_sync(
+            ROOT, config, state, apply=True, require_versioned=True,
+            plan_hash="0" * 64,
+        )

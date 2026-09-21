@@ -32,7 +32,7 @@
       "expect_regex": "(?m)^PASS artifact_sha256=.+ receipt=.+$",
       "capture": {},
       "example_output": ["PASS artifact_sha256=<ARTIFACT_SHA256> receipt=<HOST_DATA>/install-receipt.json"],
-      "omit": [{"line": "APPLIED install version=0.1.0.dev2 objects=21 hook_bindings=2", "reason": "keep the quickstart focused on the verified receipt"}]
+      "omit": [{"line": "APPLIED install version=0.1.0.dev11 objects=21 hook_bindings=2", "reason": "keep the quickstart focused on the verified receipt"}]
     },
     {
       "id": "capture",
@@ -90,18 +90,49 @@
       "omit": []
     },
     {
-      "id": "sync",
+      "id": "sync_plan",
       "section": "lifecycle",
-      "argv": ["{{python}}", "-m", "agent_core.cli", "sync", "--config", "{{config}}", "--state", "{{state}}", "--apply"],
+      "argv": ["{{python}}", "-m", "agent_core.cli", "sync", "--config", "{{config}}", "--state", "{{state}}", "--dry-run"],
+      "cwd_ref": "engine",
+      "expect_exit": 0,
+      "expect_regex": "(?m)^PLAN_HASH [0-9a-f]{64}$",
+      "capture": {"sync_plan_hash": "(?m)^PLAN_HASH ([0-9a-f]{64})$"},
+      "example_output": ["PLAN_HASH <SYNC_PLAN_HASH>"],
+      "omit": [
+        {"line": "PLAN target=claude-code runtime=claude-code", "reason": "the lifecycle text already names both synthetic runtime targets"},
+        {"line": "PLAN target=codex runtime=codex", "reason": "the lifecycle text already names both synthetic runtime targets"},
+        {"line": "PLAN_OP WRITE target=claude-code path=CLAUDE.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=claude-code path=LESSONS.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=claude-code path=CASE_LAW.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=claude-code path=hooks/user_prompt.sh", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=claude-code path=hooks/user_prompt.ps1", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=AGENTS.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=LESSONS.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=CASE_LAW.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=hooks/user_prompt.sh", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=hooks/user_prompt.ps1", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=claude-code path=skills/adversarial-audit/SKILL.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=skills/adversarial-audit/SKILL.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=claude-code path=skills/dispatching-task-cards/SKILL.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=skills/dispatching-task-cards/SKILL.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=claude-code path=skills/first-divergence-debugging/SKILL.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "PLAN_OP WRITE target=codex path=skills/first-divergence-debugging/SKILL.md", "reason": "the example keeps the reviewed token concise"},
+        {"line": "DRY_RUN writes=0 targets=2 planned_writes=16", "reason": "the exact fixture count is not a portable user contract"}
+      ]
+    },
+    {
+      "id": "sync_apply",
+      "section": "lifecycle",
+      "argv": ["{{python}}", "-m", "agent_core.cli", "sync", "--config", "{{config}}", "--state", "{{state}}", "--apply", "--plan-hash", "{{sync_plan_hash}}"],
       "cwd_ref": "engine",
       "expect_exit": 0,
       "expect_regex": "(?m)^PASS ",
       "capture": {},
-      "example_output": ["PASS backup_created=True"],
+      "example_output": ["PASS backup_created=False"],
       "omit": [
         {"line": "PLAN target=claude-code runtime=claude-code", "reason": "the lifecycle text already names both synthetic runtime targets"},
         {"line": "PLAN target=codex runtime=codex", "reason": "the lifecycle text already names both synthetic runtime targets"},
-        {"line": "BACKUP files=16", "reason": "the example emphasizes the verified backup result rather than fixture counts"},
+        {"line": "BACKUP files=0", "reason": "absent targets have no pre-image to back up"},
         {"line": "APPLIED writes=16 targets=2", "reason": "the example emphasizes the verified backup result rather than fixture counts"}
       ]
     },

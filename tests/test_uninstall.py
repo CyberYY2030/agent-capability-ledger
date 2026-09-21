@@ -5,12 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from agent_core import __version__
 from agent_core.config import ConfigError
 from agent_core.installer import apply_install, apply_uninstall, plan_uninstall
 from tests.test_install import ROOT, installed_fixture
 
 
-def test_uninstall_restores_preinstall_bytes_and_removes_new_owned_objects(
+def test_uninstall_retains_materialized_runtime_and_removes_install_owned_objects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
@@ -18,16 +19,22 @@ def test_uninstall_restores_preinstall_bytes_and_removes_new_owned_objects(
     runtime = Path(payload["targets"][0]["root"])
     runtime.mkdir(parents=True)
     rules = runtime / payload["targets"][0]["rules_target"]
-    before = b"preserve-me\n"
-    rules.write_bytes(before)
     unrelated = runtime / "notes.txt"
     unrelated.write_bytes(b"not managed\n")
     apply_install(ROOT, config, state, ROOT, manifest, force=True)
+    installed_rules = rules.read_bytes()
+    materialization_receipt = config.parent / "materialization-receipt.json"
+    materialization_receipt_before = materialization_receipt.read_bytes()
     receipt_path = config.parent / "install-receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert plan_uninstall(config)[-1] == "DRY_RUN writes=0"
-    assert apply_uninstall(config)[-1] == "PASS uninstall"
-    assert rules.read_bytes() == before
+    planned = plan_uninstall(config)
+    assert any(line == f"RETAIN path={rules}" for line in planned)
+    assert planned[-1] == "DRY_RUN writes=0"
+    applied = apply_uninstall(config)
+    assert any(line == f"RETAIN path={rules}" for line in applied)
+    assert applied[-1] == "PASS uninstall"
+    assert rules.read_bytes() == installed_rules
+    assert materialization_receipt.read_bytes() == materialization_receipt_before
     assert unrelated.read_bytes() == b"not managed\n"
     assert not receipt_path.exists()
     assert not (install_root / "engine" / receipt["engine_version"]).exists()
@@ -51,6 +58,26 @@ def test_uninstall_conflict_preserves_user_change_and_every_other_object(
     assert receipt_path.read_bytes() == receipt_before
 
 
+def test_uninstall_unknown_runtime_drift_is_retained_and_never_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, config, manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    apply_install(ROOT, config, state, ROOT, manifest, force=False)
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    rules = Path(payload["targets"][0]["root"]) / payload["targets"][0]["rules_target"]
+    drift = b"unknown-writer-after-install\n"
+    rules.write_bytes(drift)
+    materialization_receipt = config.parent / "materialization-receipt.json"
+    receipt_before = materialization_receipt.read_bytes()
+
+    result = apply_uninstall(config)
+
+    assert result[-1] == "PASS uninstall"
+    assert rules.read_bytes() == drift
+    assert materialization_receipt.read_bytes() == receipt_before
+    assert not (install_root / "engine-pin.json").exists()
+
+
 def test_uninstall_validates_snapshot_before_changing_any_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -59,12 +86,15 @@ def test_uninstall_validates_snapshot_before_changing_any_target(
     runtime = Path(payload["targets"][0]["root"])
     runtime.mkdir(parents=True)
     rules = runtime / payload["targets"][0]["rules_target"]
-    rules.write_bytes(b"before\n")
     apply_install(ROOT, config, state, ROOT, manifest, force=True)
     receipt = json.loads((config.parent / "install-receipt.json").read_text(encoding="utf-8"))
-    record = next(item for item in receipt["objects"] if item["path"] == str(rules))
-    snapshot_file = Path(receipt["snapshot_path"]) / record["snapshot_rel"]
-    snapshot_file.write_bytes(b"tampered\n")
+    snapshot_manifest_path = Path(receipt["snapshot_path"]) / "snapshot.json"
+    snapshot_manifest = json.loads(snapshot_manifest_path.read_text(encoding="utf-8"))
+    snapshot_record = next(
+        item for item in snapshot_manifest["objects"] if item["path"] == str(rules)
+    )
+    snapshot_record["installed_sha256"] = "f" * 64
+    snapshot_manifest_path.write_text(json.dumps(snapshot_manifest), encoding="utf-8")
     wrapper = install_root / "bin" / "agent-core.cmd"
     wrapper_before = wrapper.read_bytes()
     rules_installed = rules.read_bytes()
@@ -87,7 +117,7 @@ def test_uninstall_rejects_receipt_root_outside_declared_domains(
     snapshot_manifest = json.loads(snapshot_manifest_path.read_text(encoding="utf-8"))
     snapshot_manifest["objects"][0]["root"] = str(tmp_path)
     snapshot_manifest_path.write_text(json.dumps(snapshot_manifest), encoding="utf-8")
-    engine = install_root / "engine" / "0.1.0.dev2"
+    engine = install_root / "engine" / __version__
     with pytest.raises(ConfigError, match="FAIL_INSTALL_RECEIPT"):
         apply_uninstall(config)
     assert engine.is_dir()

@@ -20,6 +20,9 @@
     {"id":"L-117","scope":"profile","status":"checklist","rule":"Freeze corpus checksums before tuning.","sink":"checks/frozen-corpus.md","trigger":"frozen corpus checksum proof","when":null},
     {"id":"L-118","scope":"global","status":"enforced","rule":"Record runtime payload fields from evidence.","sink":"checks/runtime-payload.md","trigger":"runtime event payload schema","when":null},
     {"id":"L-119","scope":"project","status":"pending","rule":"Budget retrieval output by characters.","sink":"checks/character-budget.md","trigger":"character budget omitted marker","when":null},
-    {"id":"L-120","scope":"profile","status":"checklist","rule":"Resolve only declared lesson stores.","sink":"checks/scoped-routing.md","trigger":"scoped ledger source routing","when":null}
+    {"id":"L-120","scope":"profile","status":"checklist","rule":"Resolve only declared lesson stores.","sink":"checks/scoped-routing.md","trigger":"scoped ledger source routing","when":null},
+    {"id":"SYN-BAG","scope":"project","status":"pending","rule":"Keep unrelated observatory supplies in separate bins.","sink":"checks/synthetic-bag.md","trigger":"harborwatch amber lantern","when":"{\"text\":[\"amber lantern cobalt orchard velvet compass kettle glacier\",\"harborwatch\"]}"},
+    {"id":"SYN-ID","scope":"profile","status":"checklist","rule":"Inspect fictional machine labels before launch.","sink":"checks/synthetic-identifiers.md","trigger":"quartzsignal nebula matrix","when":"{\"text\":[\"nebula_matrix_crane\",\"forge --ember\",\"altitude=0\",\"quartzsignal\"]}"},
+    {"id":"SYN-CJK","scope":"global","status":"enforced","rule":"Separate imaginary station names from shared fragments.","sink":"checks/synthetic-cjk.md","trigger":"星图潮汐车站","when":"{\"text\":[\"潮汐车站\",\"星图\"]}"}
   ]
 }

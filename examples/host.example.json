@@ -6,7 +6,7 @@
   "prompt_injection": {
     "lines": [
       "Read matched lessons before acting.",
-      "At completion, report any evidence-backed lesson candidate."
+      "Only Claude Code: for a user correction or evidence-verified method that warrants one reusable, costly lesson with an observable trigger and checkable sink, run \"<INSTALL_ROOT>/bin/agent-core\" lessons capture with all required fields to create at most one inbox candidate; otherwise skip; never write canonical lessons or promote automatically; other runtimes skip."
     ]
   },
   "targets": [

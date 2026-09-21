@@ -10,6 +10,7 @@ import pytest
 
 import agent_core.installer as installer
 import agent_core.upgrade as upgrade
+from agent_core import __version__
 from agent_core.config import ConfigError
 from agent_core.installer import apply_install, build_release_manifest
 from agent_core.promote import operation_lock
@@ -17,7 +18,7 @@ from agent_core.state import apply_attach, apply_init, binding_receipt_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "0.1.0.dev2"
+CURRENT_VERSION = __version__
 TARGET_VERSION = "0.2.0"
 TEST_EMAIL = "upgrade" + chr(64) + "invalid"
 
@@ -165,11 +166,12 @@ def test_upgrade_passes_explicit_lock_ownership_to_install_once(
     state, config, target, manifest, _install_root, _control = _fixture(tmp_path, monkeypatch)
     plan = upgrade.plan_upgrade(ROOT, state, config, target, manifest, TARGET_VERSION)
     control = config.parent / "txn"
-    calls: list[bool] = []
+    calls: list[object] = []
     real_apply = upgrade.apply_install
 
     def inspect_apply(*args, **kwargs):
-        calls.append(kwargs.get("already_locked", False))
+        assert "already_locked" not in kwargs
+        calls.append(kwargs.get("lock_token"))
         return real_apply(*args, **kwargs)
 
     monkeypatch.setattr(upgrade, "apply_install", inspect_apply)
@@ -177,7 +179,8 @@ def test_upgrade_passes_explicit_lock_ownership_to_install_once(
         ROOT, state, config, target, manifest, TARGET_VERSION, control, plan.plan_hash,
     )
     assert result[0] == f"APPLIED engine-upgrade to={TARGET_VERSION}"
-    assert calls == [True]
+    assert len(calls) == 1
+    assert calls[0] is not None
 
 
 def test_upgrade_rejects_stale_plan_after_valid_artifact_change(
