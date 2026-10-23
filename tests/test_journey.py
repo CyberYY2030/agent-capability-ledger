@@ -47,7 +47,6 @@ def _machine_env(home: Path) -> dict[str, str]:
         "TMP": str(temporary),
         "TEMP": str(temporary),
         "GIT_CONFIG_NOSYSTEM": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUTF8": "1",
     }
 

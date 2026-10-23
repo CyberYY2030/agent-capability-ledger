@@ -14,6 +14,8 @@ from pathlib import Path
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]
+# --join runs from the private checkout; bytecode there would fail install's clean-snapshot check.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(ENGINE_ROOT))
 
 from agent_core import __version__  # noqa: E402

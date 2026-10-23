@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "nM9rCezdJzoRnrQ8iTYpEqgkG4o-oWuu3YRV8spf-jg",
+  "artifact_sha256": "UvfFQokKkQRb9fL5GeZzSRjVnisFFdp9mwatHCBDgM0",
   "files": [
     {
       "path": "LICENSE",
@@ -11,7 +11,7 @@
     },
     {
       "path": "agent_core/__init__.py",
-      "sha256": "y3snwf1Ab5OI_ueQg-RdsGFWkDnQkD6UXTuZQ_cGow8"
+      "sha256": "0hDsjczMfPVV1V_EGGeApv4PerzqUnpw0gNfwW0Ek3Q"
     },
     {
       "path": "agent_core/candidates.py",
@@ -187,7 +187,7 @@
     },
     {
       "path": "examples/prepare_private.py",
-      "sha256": "c9rrKRTnH69uiwuvveYP-FaKZJ_9eTucEltWAUla3xc"
+      "sha256": "ggIIJolj1zGJQ5wv7cAz5lmJOx0kPysn03bpCU6MkD0"
     },
     {
       "path": "examples/rules.global.example.md",
@@ -195,11 +195,11 @@
     },
     {
       "path": "install.ps1",
-      "sha256": "N6yw86EAxB1Wk_o23-1DEpPNon-JtvnZ6oLq6jw101w"
+      "sha256": "QZXM9Js2mSgnEPrbPH20H37Vc-_LkFFJ-JRKaORrTB0"
     },
     {
       "path": "install.sh",
-      "sha256": "NGLJ99rynB2tlktQgp4Nv-fQpfSodbgggpNC_B36D7s"
+      "sha256": "IVcnHb5RnyZ5eTKFMmBbpuPfVSqa9YpHTotA3rn4syQ"
     },
     {
       "path": "manifest.yaml",
@@ -211,7 +211,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "mVveTxe8OXmyUOp-yUwfWGXkqHy2tEmqTPVjifNWlbE"
+      "sha256": "0bGzjb-6YD-2wqB4n5bIAY0soryocdhxKUW-y-wpL1o"
     },
     {
       "path": "runtimes/claude-code/head.md",
@@ -299,5 +299,5 @@
     }
   ],
   "schema": "release-manifest/1",
-  "version": "0.2.0"
+  "version": "0.2.1"
 }

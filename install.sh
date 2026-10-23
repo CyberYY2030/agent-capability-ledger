@@ -2,6 +2,7 @@
 
 engine_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)" || exit 2
 export PYTHONPATH="$engine_root${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
 if [ -n "$AGENT_CORE_PYTHON" ]; then exec "$AGENT_CORE_PYTHON" -m agent_core.cli install --source "$engine_root" "$@"; fi
 floor=$(sed -n 's/^requires-python[[:space:]]*=[[:space:]]*">=\([0-9][0-9]*\)\.\([0-9][0-9]*\)"[[:space:]]*$/\1 \2/p' "$engine_root/pyproject.toml")
 floor_major=${floor%% *}
