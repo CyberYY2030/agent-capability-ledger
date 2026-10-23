@@ -15,13 +15,13 @@ from agent_core import state as state_module
 from agent_core.config import ConfigError
 from agent_core.freshness import require_fresh
 from agent_core.installer import build_release_manifest, plan_install
+from agent_core.provenance import RECORD
 from agent_core.state import (
     apply_attach,
-    apply_init,
     binding_receipt_path,
-    plan_attach,
     validate_state_binding,
 )
+from tests.state_fixture import build_full_state, create_state_repo
 
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -78,8 +78,11 @@ class BindingTests(unittest.TestCase):
         source = self.root / f"{name}-source"
         source.mkdir()
         self._init(source)
-        shutil.copytree(ENGINE, source / "engine", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        shutil.copytree(ENGINE.parent / "state", source / "state", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(
+            ENGINE, source / "engine",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", ".git"),
+        )
+        build_full_state(ENGINE, source / "state")
         payload = build_release_manifest(source / "engine")
         (source / "engine" / "release-manifest.json").write_text(
             json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8",
@@ -94,10 +97,10 @@ class BindingTests(unittest.TestCase):
             "engine_tree_oid": tree,
             "release_artifact_sha256": payload["artifact_sha256"],
         }
-        (source / "engine.provenance.json").write_text(
+        (source / RECORD).write_text(
             json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8",
         )
-        git(source, "add", "engine.provenance.json")
+        git(source, "add", RECORD)
         git(source, "commit", "-q", "-m", "canonical fixture")
         clone, remote = self._push_clone(source, name)
         config = host_config(self.root / f"{name}-host")
@@ -106,7 +109,7 @@ class BindingTests(unittest.TestCase):
 
     def _standalone(self) -> tuple[Path, Path]:
         source = self.root / "standalone-source"
-        apply_init(ENGINE, source, git_name="Synthetic Binding", git_email=EMAIL)
+        create_state_repo(ENGINE, source, git_name="Synthetic Binding", git_email=EMAIL)
         clone, _remote = self._push_clone(source, "standalone")
         config = host_config(self.root / "standalone-host")
         apply_attach(clone, config, confirm_private_remote=True)
@@ -148,23 +151,6 @@ class BindingTests(unittest.TestCase):
             expected_remote_revision=observed.remote_revision,
         )
         self.assertEqual(local, observed)
-
-    def test_plan_attach_returns_current_revision_without_writes(self) -> None:
-        canonical, config, _remote = self._canonical()
-        canonical_before = (config.read_bytes(), binding_receipt_path(config).read_bytes())
-        canonical_sha = git(canonical, "rev-parse", "origin/main").stdout.strip()
-        canonical_plan = plan_attach(canonical / "state", config, confirm_private_remote=True)
-        self.assertIn(f"EXPECTED_REMOTE_SHA {canonical_sha}", canonical_plan)
-        self.assertEqual(canonical_plan[-1], "DRY_RUN writes=0")
-        self.assertEqual((config.read_bytes(), binding_receipt_path(config).read_bytes()), canonical_before)
-
-        standalone, standalone_config = self._standalone()
-        standalone_before = (standalone_config.read_bytes(), binding_receipt_path(standalone_config).read_bytes())
-        standalone_sha = git(standalone, "rev-parse", "origin/main").stdout.strip()
-        standalone_plan = plan_attach(standalone, standalone_config, confirm_private_remote=True)
-        self.assertIn(f"EXPECTED_REMOTE_SHA {standalone_sha}", standalone_plan)
-        self.assertEqual(standalone_plan[-1], "DRY_RUN writes=0")
-        self.assertEqual((standalone_config.read_bytes(), binding_receipt_path(standalone_config).read_bytes()), standalone_before)
 
     def test_attach_fetch_config_and_lock_drift_fail_remote_race_without_writes(self) -> None:
         canonical, config, _remote = self._canonical("attach-race")
@@ -381,6 +367,34 @@ class BindingTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "advertised revision is not accepted lineage"):
             validate_state_binding(canonical / "state", config, require_clean_snapshot=False)
 
+    def test_unclean_snapshot_names_each_blocker_and_converges(self) -> None:
+        canonical, config, _remote = self._canonical("unclean")
+        inbox = canonical / "state" / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        candidate = inbox / "synthetic-candidate.md"
+        candidate.write_text("synthetic\n", encoding="utf-8")
+        with self.assertRaises(ConfigError) as caught:
+            validate_state_binding(canonical / "state", config)
+        detail = caught.exception.detail
+        self.assertTrue(detail.startswith("state is not a clean origin/main snapshot: "), detail)
+        self.assertIn('1 uncommitted or untracked path (first: "state/inbox/synthetic-candidate.md")', detail)
+        self.assertIn("promote or reject inbox candidates", detail)
+        self.assertNotIn("HEAD", detail)
+        candidate.rename(self.root / "held-candidate.md")
+        validate_state_binding(canonical / "state", config)
+
+        git(
+            canonical, "-c", "user.name=Writer", "-c", f"user.email={EMAIL}",
+            "commit", "-q", "--allow-empty", "-m", "local only",
+        )
+        with self.assertRaises(ConfigError) as caught:
+            validate_state_binding(canonical / "state", config)
+        detail = caught.exception.detail
+        self.assertIn("HEAD differs from origin/main", detail)
+        self.assertNotIn("uncommitted", detail)
+        git(canonical, "push", "-q", "origin", "main")
+        validate_state_binding(canonical / "state", config)
+
     def test_advertised_engine_and_root_provenance_changes_are_rejected(self) -> None:
         canonical, config, remote = self._canonical("provenance")
         engine_writer = self.root / "engine-writer"
@@ -401,9 +415,9 @@ class BindingTests(unittest.TestCase):
         subprocess.run(["git", "clone", "-q", str(remote), str(record_writer)], check=True)
         git(record_writer, "config", "user.name", "Writer")
         git(record_writer, "config", "user.email", EMAIL)
-        record = record_writer / "engine.provenance.json"
+        record = record_writer / RECORD
         record.write_bytes(record.read_bytes() + b"\n")
-        git(record_writer, "add", "engine.provenance.json")
+        git(record_writer, "add", RECORD)
         git(record_writer, "commit", "-q", "-m", "root provenance drift")
         git(record_writer, "push", "-q", "origin", "main")
         git(canonical, "fetch", "origin")

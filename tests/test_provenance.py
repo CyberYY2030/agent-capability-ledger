@@ -16,7 +16,7 @@ if str(ENGINE_ROOT) not in sys.path:
 
 from agent_core.config import ConfigError
 from agent_core.installer import build_release_manifest
-from agent_core.provenance import EngineLayout, _record, classify_engine_layout, validate_engine_provenance
+from agent_core.provenance import RECORD, EngineLayout, _record, classify_engine_layout, validate_engine_provenance
 
 
 def git(root: Path, *args: str) -> str:
@@ -63,8 +63,8 @@ class ProvenanceTests(unittest.TestCase):
         staged_root = git(self.repo, "write-tree")
         engine_tree = tree or git(self.repo, "rev-parse", f"{staged_root}:engine")
         raw = record_bytes(sequence, previous, engine_tree, aggregate or manifest["artifact_sha256"])
-        (self.repo / "engine.provenance.json").write_bytes(raw)
-        git(self.repo, "add", "--", "engine.provenance.json")
+        (self.repo / RECORD).write_bytes(raw)
+        git(self.repo, "add", "--", RECORD)
         git(self.repo, "commit", "-q", "-m", f"provenance {sequence}")
         return raw
 
@@ -87,18 +87,18 @@ class ProvenanceTests(unittest.TestCase):
         git(self.repo, "commit", "-q", "-m", "track state")
         clone = Path(self.temp.name) / "clone"
         subprocess.run(
-            ["git", "-c", "core.autocrlf=true", "clone", "-q", str(self.repo), str(clone)],
+            ["git", "clone", "-q", "--config", "core.autocrlf=true", str(self.repo), str(clone)],
             check=True, capture_output=True,
         )
         engine = clone / "engine"
-        checkout = clone / "engine.provenance.json"
+        checkout = clone / RECORD
         checkout_raw = checkout.read_bytes()
         self.assertIn(b"\r\n", checkout_raw)
         self.assertEqual(git(clone, "status", "--short"), "")
         head_blob = subprocess.run(
             [
                 "git", "-c", f"safe.directory={clone.resolve().as_posix()}",
-                "-C", str(clone), "show", "HEAD:engine.provenance.json",
+                "-C", str(clone), "show", f"HEAD:{RECORD}",
             ],
             check=True, capture_output=True,
         ).stdout
@@ -145,11 +145,11 @@ class ProvenanceTests(unittest.TestCase):
                 _record(json.dumps(value).encode("utf-8"))
 
     def test_missing_untracked_dirty_and_manifest_tree_red(self) -> None:
-        (self.repo / "engine.provenance.json").unlink()
+        (self.repo / RECORD).unlink()
         with self.assertRaisesRegex(ConfigError, "FAIL_ENGINE_PROVENANCE"):
             validate_engine_provenance(self.engine)
-        git(self.repo, "checkout", "--", "engine.provenance.json")
-        git(self.repo, "rm", "--cached", "--", "engine.provenance.json")
+        git(self.repo, "checkout", "--", RECORD)
+        git(self.repo, "rm", "--cached", "--", RECORD)
         with self.assertRaisesRegex(ConfigError, "FAIL_ENGINE_PROVENANCE"):
             validate_engine_provenance(self.engine)
         git(self.repo, "reset", "--hard", "HEAD")
@@ -157,9 +157,9 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "FAIL_ENGINE_PROVENANCE"):
             validate_engine_provenance(self.engine)
         (self.engine / "agent_core" / "new.py").unlink()
-        payload = json.loads((self.repo / "engine.provenance.json").read_text(encoding="utf-8"))
+        payload = json.loads((self.repo / RECORD).read_text(encoding="utf-8"))
         payload["release_artifact_sha256"] = "A" * 43
-        (self.repo / "engine.provenance.json").write_text(json.dumps(payload), encoding="utf-8")
+        (self.repo / RECORD).write_text(json.dumps(payload), encoding="utf-8")
         with self.assertRaisesRegex(ConfigError, "FAIL_ENGINE_PROVENANCE"):
             validate_engine_provenance(self.engine)
 

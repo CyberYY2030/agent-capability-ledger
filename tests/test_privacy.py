@@ -8,7 +8,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,9 +47,7 @@ LEGACY_BOUNDARY_SEEDS = {
 }
 
 README_EXCERPT = (
-    "A public export checkout is a one-way whitelist export of `engine/`. It is a "
-    "publication artifact, never a runtime dependency, and never receives private state, "
-    "host bindings, credentials, sessions, caches, or machine-specific paths."
+    "这个公开仓库只有程序本身：它是作者私有仓库里 `engine/` 目录的导出，不含私有状态、本机配置、凭据、会话、缓存或本机路径，运行时也不依赖它。"
 )
 
 NORMAL_CONTENT_SAMPLES = (
@@ -68,6 +65,13 @@ def run_main(*args: str) -> tuple[int, str]:
     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         code = privacy.main(list(args))
     return code, output.getvalue()
+
+
+def capture_path_rule(text: str) -> str | None:
+    return next(
+        (rule.rule_id for rule in privacy.CAPTURE_ABSOLUTE_PATH_RULES if rule.regex.search(text)),
+        None,
+    )
 
 
 class PrivacyTreeTests(unittest.TestCase):
@@ -404,301 +408,6 @@ class PrivacyGitTests(unittest.TestCase):
         self.assertIn("publication_identity_mismatch", output)
 
 
-class PreCommitHookTests(unittest.TestCase):
-    def git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(repo), *args],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-    def init_repo(self, root: Path, name: str = "repo") -> Path:
-        repo = root / name
-        repo.mkdir(parents=True)
-        self.git(repo, "init", "-q", "-b", "main")
-        self.git(repo, "config", "user.name", "Fixture Author")
-        self.git(repo, "config", "user.email", "fixture" + chr(64) + "example.invalid")
-        hooks = repo / ".githooks"
-        hooks.mkdir()
-        shutil.copy2(ROOT / ".githooks" / "pre-commit", hooks / "pre-commit")
-        shutil.copy2(ROOT / ".githooks" / "setup.py", hooks / "setup.py")
-        (repo / "clean.txt").write_text("synthetic clean content\n", encoding="utf-8")
-        return repo
-
-    def synthetic_external_privacy(self, root: Path) -> tuple[Path, Path]:
-        external = root / "external"
-        external.mkdir(exist_ok=True)
-        rules = external / "rules.json"
-        allowlist = external / "allowlist.json"
-        rules.write_text('{"schema":"privacy-rules/1","rules":[]}\n', encoding="utf-8")
-        allowlist.write_text('{"schema":"privacy-allowlist/1","exemptions":[]}\n', encoding="utf-8")
-        return rules, allowlist
-
-    def configure_private_privacy(self, repo: Path) -> tuple[Path, Path]:
-        rules, allowlist = self.synthetic_external_privacy(repo.parent)
-        result = self.run_setup(
-            repo, "install", "--rules", str(rules), "--allowlist", str(allowlist)
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return rules, allowlist
-
-    def local_config(self, repo: Path, key: str) -> str | None:
-        result = subprocess.run(
-            ["git", "-C", str(repo), "config", "--local", "--get", key],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        self.assertEqual(result.returncode, 1, result.stderr)
-        return None
-
-    def hook_environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
-        environment["PYTHONPATH"] = str(ROOT)
-        environment["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z"
-        environment["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
-        return environment
-
-    def run_hook(self, repo: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(repo), "hook", "run", "pre-commit"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.hook_environment(),
-        )
-
-    def commit(self, repo: Path) -> subprocess.CompletedProcess[str]:
-        self.git(repo, "add", "--all")
-        return subprocess.run(
-            ["git", "-C", str(repo), "commit", "-m", "fixture"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.hook_environment(),
-        )
-
-    def run_setup(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(repo / ".githooks" / "setup.py"), *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            cwd=repo,
-            env=self.hook_environment(),
-        )
-
-    def test_fresh_clone_requires_setup_before_commit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = self.init_repo(root, "source")
-            self.git(source, "add", "--all")
-            self.git(source, "commit", "-qm", "source")
-            rules, allowlist = self.synthetic_external_privacy(root)
-
-            clone = root / "ordinary-clone"
-            subprocess.run(
-                ["git", "clone", "-q", str(source), str(clone)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            self.git(clone, "config", "user.name", "Fixture Author")
-            self.git(clone, "config", "user.email", "fixture" + chr(64) + "example.invalid")
-            missing = self.run_setup(clone, "check")
-            self.assertEqual(missing.returncode, 2, missing.stderr)
-            self.assertIn("core.hooksPath", missing.stderr)
-
-            installed = self.run_setup(
-                clone, "install", "--rules", str(rules), "--allowlist", str(allowlist)
-            )
-            self.assertEqual(installed.returncode, 0, installed.stderr)
-            checked = self.run_setup(clone, "check")
-            self.assertEqual(checked.returncode, 0, checked.stderr)
-            self.assertIn("PASS privacy gate active", checked.stdout)
-            self.assertNotIn(str(rules), checked.stdout + checked.stderr)
-            self.assertNotIn(str(allowlist), checked.stdout + checked.stderr)
-            repeated = self.run_setup(
-                clone, "install", "--rules", str(rules), "--allowlist", str(allowlist)
-            )
-            self.assertEqual(repeated.returncode, 0, repeated.stderr)
-
-            before = self.git(clone, "rev-list", "--count", "HEAD").stdout.strip()
-            (clone / "marker.txt").write_text("DESKTOP-" + "SETUP123\n", encoding="utf-8")
-            rejected = self.commit(clone)
-            after = self.git(clone, "rev-list", "--count", "HEAD").stdout.strip()
-        self.assertEqual(rejected.returncode, 1, rejected.stderr)
-        self.assertIn("machine_name", rejected.stdout + rejected.stderr)
-        self.assertEqual(after, before)
-
-    def test_guarded_clone_is_active_without_setup_install(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = self.init_repo(root, "source")
-            self.git(source, "add", "--all")
-            self.git(source, "commit", "-qm", "source")
-            rules, allowlist = self.synthetic_external_privacy(root)
-
-            clone = root / "guarded-clone"
-            subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "-q",
-                    "-c",
-                    "core.hooksPath=.githooks",
-                    "-c",
-                    f"privacy.rules={rules.as_posix()}",
-                    "-c",
-                    f"privacy.allowlist={allowlist.as_posix()}",
-                    "-c",
-                    f"privacy.python={Path(sys.executable).resolve().as_posix()}",
-                    str(source),
-                    str(clone),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            self.git(clone, "config", "user.name", "Fixture Author")
-            self.git(clone, "config", "user.email", "fixture" + chr(64) + "example.invalid")
-            checked = self.run_setup(clone, "check")
-            self.assertEqual(checked.returncode, 0, checked.stderr)
-            self.assertIn("PASS privacy gate active", checked.stdout)
-
-            before = self.git(clone, "rev-list", "--count", "HEAD").stdout.strip()
-            (clone / "marker.txt").write_text("DESKTOP-" + "GUARD123\n", encoding="utf-8")
-            rejected = self.commit(clone)
-            after = self.git(clone, "rev-list", "--count", "HEAD").stdout.strip()
-        self.assertEqual(rejected.returncode, 1, rejected.stderr)
-        self.assertIn("machine_name", rejected.stdout + rejected.stderr)
-        self.assertEqual(after, before)
-
-    def test_setup_rejects_repo_internal_privacy_files_before_activation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self.init_repo(Path(tmp))
-            rules = repo / "rules.json"
-            allowlist = repo / "allowlist.json"
-            rules.write_text('{"schema":"privacy-rules/1","rules":[]}\n', encoding="utf-8")
-            allowlist.write_text('{"schema":"privacy-allowlist/1","exemptions":[]}\n', encoding="utf-8")
-            result = self.run_setup(
-                repo, "install", "--rules", str(rules), "--allowlist", str(allowlist)
-            )
-            hooks_path = self.local_config(repo, "core.hooksPath")
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("privacy.rules", result.stderr)
-        self.assertIsNone(hooks_path)
-
-    def test_setup_rejects_subdirectory_of_a_parent_repository(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            parent = self.init_repo(root, "parent")
-            child = parent / "ordinary-child"
-            hooks = child / ".githooks"
-            hooks.mkdir(parents=True)
-            shutil.copy2(ROOT / ".githooks" / "pre-commit", hooks / "pre-commit")
-            shutil.copy2(ROOT / ".githooks" / "setup.py", hooks / "setup.py")
-            rules, allowlist = self.synthetic_external_privacy(root)
-            installed = self.run_setup(
-                child, "install", "--rules", str(rules), "--allowlist", str(allowlist)
-            )
-            checked = self.run_setup(child, "check")
-            parent_hooks_path = self.local_config(parent, "core.hooksPath")
-        self.assertEqual(installed.returncode, 2, installed.stderr)
-        self.assertEqual(checked.returncode, 2, checked.stderr)
-        self.assertIsNone(parent_hooks_path)
-
-    def test_hook_ignores_ambient_privacy_configuration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = self.init_repo(root)
-            rules, allowlist = self.synthetic_external_privacy(root)
-            self.git(repo, "config", "--local", "core.hooksPath", ".githooks")
-            self.git(repo, "config", "--local", "privacy.python", Path(sys.executable).resolve().as_posix())
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repo),
-                    "-c",
-                    f"privacy.rules={rules.as_posix()}",
-                    "-c",
-                    f"privacy.allowlist={allowlist.as_posix()}",
-                    "hook",
-                    "run",
-                    "pre-commit",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=self.hook_environment(),
-            )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("privacy.rules", result.stderr)
-        self.assertIn("privacy.allowlist", result.stderr)
-
-    def test_pre_commit_rejects_missing_private_rules(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self.init_repo(Path(tmp))
-            _rules, _allowlist = self.configure_private_privacy(repo)
-            self.git(repo, "config", "--local", "--unset", "privacy.rules")
-            hook_result = self.run_hook(repo)
-            commit_result = self.commit(repo)
-        self.assertEqual(hook_result.returncode, 2, hook_result.stderr)
-        self.assertIn("privacy.rules", hook_result.stderr)
-        self.assertNotEqual(commit_result.returncode, 0, commit_result.stderr)
-        self.assertIn("privacy.rules", commit_result.stderr)
-
-    def test_pre_commit_rejects_missing_private_allowlist(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self.init_repo(Path(tmp))
-            _rules, _allowlist = self.configure_private_privacy(repo)
-            self.git(repo, "config", "--local", "--unset", "privacy.allowlist")
-            hook_result = self.run_hook(repo)
-            commit_result = self.commit(repo)
-        self.assertEqual(hook_result.returncode, 2, hook_result.stderr)
-        self.assertIn("privacy.allowlist", hook_result.stderr)
-        self.assertNotEqual(commit_result.returncode, 0, commit_result.stderr)
-        self.assertIn("privacy.allowlist", commit_result.stderr)
-
-    def test_pre_commit_reports_both_missing_private_configuration_keys(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self.init_repo(Path(tmp))
-            self.configure_private_privacy(repo)
-            self.git(repo, "config", "--local", "--unset", "privacy.rules")
-            self.git(repo, "config", "--local", "--unset", "privacy.allowlist")
-            hook_result = self.run_hook(repo)
-            commit_result = self.commit(repo)
-        self.assertEqual(hook_result.returncode, 2, hook_result.stderr)
-        self.assertIn("privacy.rules", hook_result.stderr)
-        self.assertIn("privacy.allowlist", hook_result.stderr)
-        self.assertNotEqual(commit_result.returncode, 0, commit_result.stderr)
-
-    def test_pre_commit_rejects_missing_or_non_regular_private_configuration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for key, value in (("privacy.rules", "missing-rules.json"), ("privacy.allowlist", ".")):
-                with self.subTest(key=key, value=value):
-                    repo = self.init_repo(root / key.replace(".", "-"))
-                    self.configure_private_privacy(repo)
-                    self.git(repo, "config", "--local", key, value)
-                    hook_result = self.run_hook(repo)
-                    commit_result = self.commit(repo)
-                    self.assertEqual(hook_result.returncode, 2, hook_result.stderr)
-                    self.assertIn(key, hook_result.stderr)
-                    self.assertNotEqual(commit_result.returncode, 0, commit_result.stderr)
-
-    def test_pre_commit_allows_clean_tree_with_private_configuration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self.init_repo(Path(tmp))
-            self.configure_private_privacy(repo)
-            result = self.commit(repo)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-
 class RuleContractTests(unittest.TestCase):
     def test_default_and_capture_rules_accept_normal_content(self) -> None:
         readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
@@ -734,7 +443,7 @@ class RuleContractTests(unittest.TestCase):
 
     def test_capture_reuses_scanner_identity_rule_objects(self) -> None:
         value = "/" + "Users/example/private/notes.md"
-        rule_id = privacy.absolute_path_rule(value)
+        rule_id = capture_path_rule(value)
         defaults = {rule.rule_id: rule for rule in privacy._default_rules()}
         self.assertEqual(rule_id, "absolute_unix_path")
         self.assertIsNotNone(defaults[rule_id].regex.search(value))
@@ -833,9 +542,9 @@ class RuleContractTests(unittest.TestCase):
         scanner_rules = privacy._default_rules()
         for value in ("/" + "x", "/" + "opt/x/y.md", "/" + "dev/null"):
             with self.subTest(value=value):
-                self.assertEqual(privacy.absolute_path_rule(value), "absolute_posix_path")
+                self.assertEqual(capture_path_rule(value), "absolute_posix_path")
                 self.assertEqual(
-                    privacy.absolute_path_rule(f"证据见{value}，不要外传"),
+                    capture_path_rule(f"证据见{value}，不要外传"),
                     "absolute_posix_path",
                 )
                 self.assertFalse(any(rule.regex.search(value) for rule in scanner_rules))

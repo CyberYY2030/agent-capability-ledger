@@ -17,7 +17,8 @@ from .config import ConfigError, default_config_path, load_config
 from .freshness import load_candidate
 from .match import MatchError, parse_when
 from .project import resolve_project_context
-from .promote import _similarities, create_candidate, operation_lock
+from .candidates import _similarities, create_candidate
+from .lock import operation_lock
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]

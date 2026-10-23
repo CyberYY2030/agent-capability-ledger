@@ -110,13 +110,6 @@ def load_records(workspace: Path) -> list[LessonRecord]:
     return records
 
 
-def find_lesson(workspace: Path, lesson_id: str) -> LessonRecord:
-    matches = [record for record in load_records(workspace) if record.lesson_id == lesson_id]
-    if len(matches) != 1:
-        raise ConfigError("FAIL_LESSON", f"expected one active {lesson_id}, found {len(matches)}")
-    return matches[0]
-
-
 def _argv_block(value: Any, source: str) -> dict[str, list[str]]:
     if not isinstance(value, dict) or set(value) != {"argv"}:
         raise ConfigError("FAIL_VERIFIER_SCHEMA", f"{source} must contain only argv")

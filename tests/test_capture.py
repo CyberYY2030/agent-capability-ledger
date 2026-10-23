@@ -16,7 +16,9 @@ from agent_core.cli import main as cli_main
 from agent_core.config import ConfigError
 from agent_core.freshness import load_candidate
 from agent_core.match import main as match_main
-from agent_core.promote import candidate_id, create_candidate, operation_lock, plan_project_promote
+from agent_core.candidates import candidate_id, create_candidate
+from agent_core.lock import operation_lock
+from agent_core.local_promote import plan_local_promote
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -124,7 +126,7 @@ def test_project_auto_captures_in_dirty_workspace_without_state_freshness(
     canonical = workspace / ".agents" / "LESSONS.md"
     canonical_hash = hashlib.sha256(canonical.read_bytes()).hexdigest()
     (workspace / "dirty.txt").write_text("dirty\n", encoding="utf-8")
-    monkeypatch.setattr("agent_core.promote.require_fresh", lambda *_args, **_kwargs: pytest.fail("project capture used require_fresh"))
+    monkeypatch.setattr("agent_core.candidates.require_fresh", lambda *_args, **_kwargs: pytest.fail("project capture used require_fresh"))
     original_run = subprocess.run
 
     def no_fetch(command, *args, **kwargs):
@@ -380,7 +382,7 @@ def test_capture_and_promote_share_project_schema_rejection(
     assert capture.main(argv(config, workspace, rule="Second candidate")) == 1
     capture_error = capsys.readouterr().err.strip()
     with pytest.raises(ConfigError) as caught:
-        plan_project_promote(workspace, tmp_path / "control", candidate)
+        plan_local_promote(workspace, tmp_path / "control", candidate, force_new=True)
     assert capture_error == str(caught.value)
     assert capture_error == "REJECTED scope project_identity_unavailable invalid_schema"
 
@@ -422,6 +424,10 @@ def test_global_and_profile_keep_state_writer_and_global_warns(
         "<!-- lessons-scope: profile -->\n<!-- lessons-profile: example-domain -->\n"
         "## 活跃\n\n## 归档\n", encoding="utf-8",
     )
+    git(state, "add", "experience/profiles/example-domain/LESSONS.md")
+    git(state, "-c", "user.name=Test", "-c", f"user.email=test{chr(64)}invalid",
+        "commit", "-q", "-m", "add profile ledger")
+    git(state, "push", "-q", "origin", "main")
     config = config_file(tmp_path, state)
     assert capture.main(argv(config, workspace, scope="global", rule="当 sample-project 发布时，先检查项目作用域")) == 0
     assert "SCOPE_WARNING project scope may be narrower" in capsys.readouterr().out
@@ -515,8 +521,8 @@ def test_repeated_uuid_never_overwrites_and_partial_file_is_cleaned(
             return fixed_time
 
     original_uuid4 = uuid.uuid4
-    monkeypatch.setattr("agent_core.promote.dt.datetime", FrozenDateTime)
-    monkeypatch.setattr("agent_core.promote.uuid.uuid4", lambda: fixed)
+    monkeypatch.setattr("agent_core.candidates.dt.datetime", FrozenDateTime)
+    monkeypatch.setattr("agent_core.candidates.uuid.uuid4", lambda: fixed)
     first = create_candidate(
         state, control, host="desk", agent="codex", rule="First",
         trigger="first", cost="cost", sink="checks/first.md",
@@ -531,8 +537,8 @@ def test_repeated_uuid_never_overwrites_and_partial_file_is_cleaned(
         )
     assert first.read_bytes() == before and len(list((state / "inbox").glob("*.md"))) == 1
 
-    monkeypatch.setattr("agent_core.promote.load_candidate", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("schema fail")))
-    monkeypatch.setattr("agent_core.promote.uuid.uuid4", original_uuid4)
+    monkeypatch.setattr("agent_core.candidates.load_candidate", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("schema fail")))
+    monkeypatch.setattr("agent_core.candidates.uuid.uuid4", original_uuid4)
     with pytest.raises(ValueError, match="schema fail"):
         create_candidate(
             state, control, host="desk", agent="codex", rule="Partial",

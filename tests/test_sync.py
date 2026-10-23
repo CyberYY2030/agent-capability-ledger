@@ -13,11 +13,11 @@ from agent_core import sync as sync_module
 from agent_core.cli import main as cli_main
 from agent_core.config import ConfigError, load_config
 from agent_core.doctor import run as run_doctor
-from agent_core.promote import operation_lock
+from agent_core.lock import operation_lock
 from agent_core.sync import _plan_hash, _plan_payload, collect_operations, execute
+from tests.engine_fixture import create_engine_repo
 
 
-ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ac1"
 CONFIG = Path(__file__).resolve().parent / "fixtures" / "config"
 
@@ -37,14 +37,19 @@ def concrete_environment(tmp_path: Path) -> tuple[Path, Path, list[Path]]:
     return state, config, targets
 
 
-def test_default_sync_is_dry_run() -> None:
-    output = execute(ROOT, None, None, apply=False)
+def test_default_sync_is_dry_run(
+    standalone_engine: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.delenv("AGENT_CORE_HOST_CONFIG", raising=False)
+    output = execute(standalone_engine, None, None, apply=False)
     assert output[-1].startswith("DRY_RUN writes=0")
     assert not any(line.startswith(("BACKUP ", "APPLIED ")) for line in output)
 
 
-def test_shipped_example_dry_run_is_explicitly_unbound() -> None:
-    output = execute(ROOT, ROOT / "examples" / "host.example.json", None, apply=False)
+def test_shipped_example_dry_run_is_explicitly_unbound(standalone_engine: Path) -> None:
+    output = execute(standalone_engine, standalone_engine / "examples" / "host.example.json", None, apply=False)
     assert output == [
         "PLAN target=claude-code runtime=claude-code",
         "PLAN target=codex runtime=codex",
@@ -53,8 +58,8 @@ def test_shipped_example_dry_run_is_explicitly_unbound() -> None:
     assert not any(line.startswith(("PLAN_HASH ", "PLAN_OP ")) for line in output)
 
 
-def test_three_runtime_plan_lists_all_targets() -> None:
-    output = execute(ROOT, CONFIG / "three-runtime.json", None, apply=False)
+def test_three_runtime_plan_lists_all_targets(standalone_engine: Path) -> None:
+    output = execute(standalone_engine, CONFIG / "three-runtime.json", None, apply=False)
     assert len([line for line in output if line.startswith("PLAN ")]) == 3
     assert output[-1] == (
         "DRY_RUN writes=0 targets=3 planned_writes=unknown reason=state_unbound"
@@ -76,19 +81,21 @@ def _target_bytes(targets: list[Path]) -> dict[str, bytes]:
 
 
 def reviewed_apply(
+    engine_root: Path,
     config: Path,
     state: Path,
     *,
     require_versioned: bool = False,
 ) -> list[str]:
-    token = _plan_hash_from(execute(ROOT, config, state, apply=False))
+    token = _plan_hash_from(execute(engine_root, config, state, apply=False))
     return execute(
-        ROOT, config, state, apply=True, require_versioned=require_versioned,
+        engine_root, config, state, apply=True, require_versioned=require_versioned,
         plan_hash=token,
     )
 
 
 def test_git_index_mode_and_generated_hooks_feed_executable_plan_intent(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     indexed = tmp_path / "indexed"
@@ -113,7 +120,7 @@ def test_git_index_mode_and_generated_hooks_feed_executable_plan_intent(
         if root.resolve() == state.resolve() else set(),
     )
     payload = load_config(config)
-    operations = collect_operations(ROOT, payload, state)
+    operations = collect_operations(standalone_engine, payload, state)
     script_operation = next(
         item for item in operations if item.destination.name == "run.sh"
     )
@@ -135,6 +142,7 @@ def test_git_index_mode_and_generated_hooks_feed_executable_plan_intent(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable mode contract")
 def test_sync_mode_only_upgrade_is_visible_transactional_and_preserves_bytes(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, targets = concrete_environment(tmp_path)
@@ -146,7 +154,7 @@ def test_sync_mode_only_upgrade_is_visible_transactional_and_preserves_bytes(
         lambda root: {str(state_script.resolve()).casefold()}
         if root.resolve() == state.resolve() else set(),
     )
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     for root in targets:
         hook = root / "hooks" / "user_prompt.sh"
         assert os.access(hook, os.X_OK)
@@ -161,7 +169,7 @@ def test_sync_mode_only_upgrade_is_visible_transactional_and_preserves_bytes(
     receipt_path.write_text(json.dumps(legacy), encoding="utf-8")
     receipt_before = receipt_path.read_bytes()
 
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
     mode_lines = [line for line in planned if line.startswith("PLAN_OP MODE ")]
     assert mode_lines == [
         "PLAN_OP MODE  target=claude-code path=skills/user-check/scripts/run.sh status=mode-drift",
@@ -174,26 +182,27 @@ def test_sync_mode_only_upgrade_is_visible_transactional_and_preserves_bytes(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ConfigError("FAIL_TEST", "receipt fault")),
     )
     with pytest.raises(ConfigError, match="FAIL_TEST"):
-        execute(ROOT, config, state, apply=True, plan_hash=_plan_hash_from(planned))
+        execute(standalone_engine, config, state, apply=True, plan_hash=_plan_hash_from(planned))
     assert destination.read_bytes() == before
     assert not os.access(destination, os.X_OK)
     assert receipt_path.read_bytes() == receipt_before
 
     monkeypatch.setattr(sync_module, "publish_materialization_receipt", original_publish)
-    planned = execute(ROOT, config, state, apply=False)
-    execute(ROOT, config, state, apply=True, plan_hash=_plan_hash_from(planned))
+    planned = execute(standalone_engine, config, state, apply=False)
+    execute(standalone_engine, config, state, apply=True, plan_hash=_plan_hash_from(planned))
     assert destination.read_bytes() == before
     assert os.access(destination, os.X_OK)
-    assert execute(ROOT, config, state, apply=False)[-1] == (
+    assert execute(standalone_engine, config, state, apply=False)[-1] == (
         "DRY_RUN writes=0 targets=2 planned_writes=0 ready=true"
     )
 
 
 def test_bound_dry_run_reports_all_operations_as_noop(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, _targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     monkeypatch.setattr(
         "agent_core.sync.require_fresh",
         lambda *_args, **_kwargs: pytest.fail("dry-run called require_fresh"),
@@ -203,7 +212,7 @@ def test_bound_dry_run_reports_all_operations_as_noop(
         lambda *_args, **_kwargs: pytest.fail("dry-run called record_remote_head"),
     )
 
-    output = execute(ROOT, config, state, apply=False)
+    output = execute(standalone_engine, config, state, apply=False)
     operations = [line for line in output if line.startswith("PLAN_OP ")]
     assert operations
     assert all(line.startswith("PLAN_OP NOOP  ") for line in operations)
@@ -211,12 +220,14 @@ def test_bound_dry_run_reports_all_operations_as_noop(
     assert len([line for line in output if line.startswith("PLAN_HASH ")]) == 1
 
 
-def test_bound_dry_run_reports_one_perturbed_file_as_foreign(tmp_path: Path) -> None:
+def test_bound_dry_run_reports_one_perturbed_file_as_foreign(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     (targets[0] / "LESSONS.md").write_text("perturbed", encoding="utf-8")
 
-    output = execute(ROOT, config, state, apply=False)
+    output = execute(standalone_engine, config, state, apply=False)
     blocked = [line for line in output if line.startswith("PLAN_OP BLOCK ")]
     assert blocked == [
         "PLAN_OP BLOCK target=claude-code path=LESSONS.md status=foreign",
@@ -225,21 +236,23 @@ def test_bound_dry_run_reports_one_perturbed_file_as_foreign(tmp_path: Path) -> 
     assert output[-1] == "DRY_RUN writes=0 targets=2 planned_writes=0 ready=false"
 
 
-def test_bound_dry_run_plan_hash_is_stable(tmp_path: Path) -> None:
+def test_bound_dry_run_plan_hash_is_stable(standalone_engine: Path, tmp_path: Path) -> None:
     state, config, _targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
 
-    first = execute(ROOT, config, state, apply=False)
-    second = execute(ROOT, config, state, apply=False)
+    first = execute(standalone_engine, config, state, apply=False)
+    second = execute(standalone_engine, config, state, apply=False)
     assert _plan_hash_from(first) == _plan_hash_from(second)
 
 
-def test_plan_distinguishes_targets_sharing_a_relative_path(tmp_path: Path) -> None:
+def test_plan_distinguishes_targets_sharing_a_relative_path(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     (targets[0] / "LESSONS.md").write_text("perturbed", encoding="utf-8")
 
-    output = execute(ROOT, config, state, apply=False)
+    output = execute(standalone_engine, config, state, apply=False)
     lesson_lines = [line for line in output if "path=LESSONS.md " in line]
     assert lesson_lines == [
         "PLAN_OP BLOCK target=claude-code path=LESSONS.md status=foreign",
@@ -247,7 +260,7 @@ def test_plan_distinguishes_targets_sharing_a_relative_path(tmp_path: Path) -> N
     ]
     payload = load_config(config)
     plan = _plan_payload(
-        collect_operations(ROOT, payload, state), payload, config_path=config,
+        collect_operations(standalone_engine, payload, state), payload, config_path=config,
         state_root=state, control_root=config.parent / "txn",
     )
     lessons = [item for item in plan["operations"] if item["relative_path"] == "LESSONS.md"]
@@ -263,78 +276,89 @@ def test_plan_distinguishes_targets_sharing_a_relative_path(tmp_path: Path) -> N
     ]
 
 
-def test_plan_hash_rejects_before_state_drift_without_writes(tmp_path: Path) -> None:
+def test_plan_hash_rejects_before_state_drift_without_writes(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
-    planned = _plan_hash_from(execute(ROOT, config, state, apply=False))
+    reviewed_apply(standalone_engine, config, state)
+    planned = _plan_hash_from(execute(standalone_engine, config, state, apply=False))
     (targets[0] / "LESSONS.md").write_text("changed after preview", encoding="utf-8")
     before = _target_bytes(targets)
 
     with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
-        execute(ROOT, config, state, apply=True, plan_hash=planned)
+        execute(standalone_engine, config, state, apply=True, plan_hash=planned)
     assert _target_bytes(targets) == before
 
 
-def test_plan_hash_rejects_raw_config_drift_before_backup_or_runtime_write(tmp_path: Path) -> None:
+def test_plan_hash_rejects_raw_config_drift_before_backup_or_runtime_write(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    planned = _plan_hash_from(execute(ROOT, config, state, apply=False))
+    planned = _plan_hash_from(execute(standalone_engine, config, state, apply=False))
     config.write_bytes(config.read_bytes() + b"\n")
 
     with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
-        execute(ROOT, config, state, apply=True, plan_hash=planned)
+        execute(standalone_engine, config, state, apply=True, plan_hash=planned)
     assert _target_bytes(targets) == {}
     assert not (tmp_path / "backups").exists()
 
 
-def test_plan_hash_rejects_target_root_drift_before_backup_or_runtime_write(tmp_path: Path) -> None:
+def test_plan_hash_rejects_target_root_drift_before_backup_or_runtime_write(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    planned = _plan_hash_from(execute(ROOT, config, state, apply=False))
+    planned = _plan_hash_from(execute(standalone_engine, config, state, apply=False))
     payload = json.loads(config.read_text(encoding="utf-8"))
     payload["targets"][0]["root"] = str(tmp_path / "different-runtime")
     config.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
-        execute(ROOT, config, state, apply=True, plan_hash=planned)
+        execute(standalone_engine, config, state, apply=True, plan_hash=planned)
     assert _target_bytes(targets) == {}
     assert not (tmp_path / "different-runtime").exists()
     assert not (tmp_path / "backups").exists()
 
 
-def test_install_held_lock_blocks_sync_before_backup_or_runtime_write(tmp_path: Path) -> None:
+def test_install_held_lock_blocks_sync_before_backup_or_runtime_write(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    planned = _plan_hash_from(execute(ROOT, config, state, apply=False))
+    planned = _plan_hash_from(execute(standalone_engine, config, state, apply=False))
     with operation_lock(config.parent / "txn"):
         with pytest.raises(ConfigError, match="FAIL_LOCKED"):
-            execute(ROOT, config, state, apply=True, plan_hash=planned)
+            execute(standalone_engine, config, state, apply=True, plan_hash=planned)
     assert _target_bytes(targets) == {}
     assert not (tmp_path / "backups").exists()
 
 
-def test_stale_plan_hash_writes_nothing(tmp_path: Path) -> None:
+def test_stale_plan_hash_writes_nothing(standalone_engine: Path, tmp_path: Path) -> None:
     state, config, targets = concrete_environment(tmp_path)
     before = _target_bytes(targets)
 
     with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
-        execute(ROOT, config, state, apply=True, plan_hash="0" * 64)
+        execute(standalone_engine, config, state, apply=True, plan_hash="0" * 64)
     assert _target_bytes(targets) == before
     assert not (tmp_path / "backups").exists()
 
 
-def test_sync_apply_without_a_reviewed_hash_writes_nothing(tmp_path: Path) -> None:
+def test_sync_apply_without_a_reviewed_hash_writes_nothing(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
     with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
-        execute(ROOT, config, state, apply=True)
+        execute(standalone_engine, config, state, apply=True)
     assert _target_bytes(targets) == {}
     assert not (tmp_path / "backups").exists()
 
 
 def test_sync_plan_contract_binds_config_repository_targets_and_absolute_operations(
+    standalone_engine: Path,
     tmp_path: Path,
 ) -> None:
     state, config, _targets = concrete_environment(tmp_path)
     payload = load_config(config)
     plan = _plan_payload(
-        collect_operations(ROOT, payload, state), payload, config_path=config,
+        collect_operations(standalone_engine, payload, state), payload, config_path=config,
         state_root=state, control_root=config.parent / "txn",
     )
     assert Path(plan["config"]["path"]).is_absolute()
@@ -357,7 +381,7 @@ def test_plan_hash_without_apply_is_refused(tmp_path: Path, capsys: pytest.Captu
     assert _target_bytes(targets) == {}
 
 
-def test_invalid_ledger_writes_nothing(tmp_path: Path) -> None:
+def test_invalid_ledger_writes_nothing(standalone_engine: Path, tmp_path: Path) -> None:
     state, config, targets = concrete_environment(tmp_path)
     sentinel_paths = []
     for index, root in enumerate(targets):
@@ -368,17 +392,19 @@ def test_invalid_ledger_writes_nothing(tmp_path: Path) -> None:
     ledger_path = state / "experience" / "LESSONS.md"
     ledger_path.write_text(ledger_path.read_text(encoding="utf-8").replace("lessons-scope: global", "lessons-scope: project"), encoding="utf-8")
     with pytest.raises(ConfigError, match="FAIL_LEDGER"):
-        execute(ROOT, config, state, apply=False)
+        execute(standalone_engine, config, state, apply=False)
     assert [path.read_text(encoding="utf-8") for path in sentinel_paths] == ["before-0", "before-1"]
     assert not (tmp_path / "backups").exists()
 
 
-def test_apply_backs_up_writes_and_verifies_content(tmp_path: Path) -> None:
+def test_apply_backs_up_writes_and_verifies_content(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     lessons = state / "experience" / "LESSONS.md"
     lessons.write_bytes(lessons.read_bytes() + b"\n")
-    output = reviewed_apply(config, state)
+    output = reviewed_apply(standalone_engine, config, state)
     assert any(line.startswith("BACKUP ") for line in output)
     assert output[-1] == "PASS backup_created=True"
     source = (state / "experience" / "LESSONS.md").read_bytes()
@@ -389,9 +415,9 @@ def test_apply_backs_up_writes_and_verifies_content(tmp_path: Path) -> None:
     assert list((tmp_path / "backups").rglob("LESSONS.md"))
 
 
-def test_identical_second_apply_writes_nothing(tmp_path: Path) -> None:
+def test_identical_second_apply_writes_nothing(standalone_engine: Path, tmp_path: Path) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    first = reviewed_apply(config, state)
+    first = reviewed_apply(standalone_engine, config, state)
     assert first[-1] == "PASS backup_created=False"
 
     def materialized_records() -> dict[str, tuple[bytes, int, int, int]]:
@@ -408,18 +434,19 @@ def test_identical_second_apply_writes_nothing(tmp_path: Path) -> None:
 
     before = materialized_records()
     assert before
-    output = reviewed_apply(config, state)
+    output = reviewed_apply(standalone_engine, config, state)
     assert f"APPLIED writes=0 targets={len(targets)}" in output
     assert output[-1] == "PASS backup_created=False"
     assert materialized_records() == before
 
 
 def test_sync_publishes_materialization_receipt_and_uses_it_for_noop(
+    standalone_engine: Path,
     tmp_path: Path,
 ) -> None:
     state, config, targets = concrete_environment(tmp_path)
 
-    first = reviewed_apply(config, state)
+    first = reviewed_apply(standalone_engine, config, state)
 
     receipt_path = config.parent / "materialization-receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -444,7 +471,7 @@ def test_sync_publishes_materialization_receipt_and_uses_it_for_noop(
     assert {row["status"] for row in receipt["rows"]} == {"active"}
     assert first[-1] == "PASS backup_created=False"
 
-    second = execute(ROOT, config, state, apply=False)
+    second = execute(standalone_engine, config, state, apply=False)
     operation_lines = [line for line in second if line.startswith("PLAN_OP ")]
     assert operation_lines
     assert all("status=receipt-owned-identical" in line for line in operation_lines)
@@ -452,61 +479,72 @@ def test_sync_publishes_materialization_receipt_and_uses_it_for_noop(
 
 
 def test_sync_exact_unowned_bytes_are_visibly_adopted_without_runtime_backup(
+    standalone_engine: Path,
     tmp_path: Path,
 ) -> None:
     state, config, targets = concrete_environment(tmp_path)
     payload = load_config(config)
-    operations = collect_operations(ROOT, payload, state)
+    operations = collect_operations(standalone_engine, payload, state)
+    before: dict[Path, tuple[int, int, int]] = {}
     for operation in operations:
         operation.destination.parent.mkdir(parents=True, exist_ok=True)
         operation.destination.write_bytes(operation.content)
+        operation.destination.chmod(0o755 if operation.executable else 0o644)
+        stat = operation.destination.stat()
+        before[operation.destination] = (stat.st_dev, stat.st_ino, stat.st_mtime_ns)
 
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
     operation_lines = [line for line in planned if line.startswith("PLAN_OP ")]
     assert operation_lines
     assert all("status=adopt-identical" in line for line in operation_lines)
     token = _plan_hash_from(planned)
-    applied = execute(ROOT, config, state, apply=True, plan_hash=token)
+    applied = execute(standalone_engine, config, state, apply=True, plan_hash=token)
 
     assert applied[-1] == "PASS backup_created=False"
     assert not (tmp_path / "backups").exists()
     assert (config.parent / "materialization-receipt.json").is_file()
     assert _target_bytes(targets)
+    after = {
+        path: (path.stat().st_dev, path.stat().st_ino, path.stat().st_mtime_ns)
+        for path in before
+    }
+    assert after == before
 
 
 def test_sync_path_set_shrink_retains_reactivates_and_blocks_retained_drift(
+    standalone_engine: Path,
     tmp_path: Path,
 ) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     state_manifest = state / "manifest.yaml"
     payload = json.loads(state_manifest.read_text(encoding="utf-8"))
     original_capabilities = payload["capabilities"]
     payload["capabilities"] = []
     state_manifest.write_text(json.dumps(payload), encoding="utf-8")
 
-    shrink = execute(ROOT, config, state, apply=False)
+    shrink = execute(standalone_engine, config, state, apply=False)
     retained_lines = [line for line in shrink if line.startswith("RETAIN ")]
     assert len(retained_lines) == 2
     assert all("status=retained" in line and "user-check" in line for line in retained_lines)
-    shrink_result = execute(ROOT, config, state, apply=True, plan_hash=_plan_hash_from(shrink))
+    shrink_result = execute(standalone_engine, config, state, apply=True, plan_hash=_plan_hash_from(shrink))
     assert shrink_result[-1] == "PASS backup_created=False"
 
     payload["capabilities"] = original_capabilities
     state_manifest.write_text(json.dumps(payload), encoding="utf-8")
-    reactivated = execute(ROOT, config, state, apply=False)
+    reactivated = execute(standalone_engine, config, state, apply=False)
     user_check = [line for line in reactivated if "skills/user-check/" in line]
     assert user_check and all("status=receipt-owned-identical" in line for line in user_check)
     reviewed = _plan_hash_from(reactivated)
-    execute(ROOT, config, state, apply=True, plan_hash=reviewed)
+    execute(standalone_engine, config, state, apply=True, plan_hash=reviewed)
 
     payload["capabilities"] = []
     state_manifest.write_text(json.dumps(payload), encoding="utf-8")
-    shrink_again = execute(ROOT, config, state, apply=False)
-    execute(ROOT, config, state, apply=True, plan_hash=_plan_hash_from(shrink_again))
+    shrink_again = execute(standalone_engine, config, state, apply=False)
+    execute(standalone_engine, config, state, apply=True, plan_hash=_plan_hash_from(shrink_again))
     retained_path = targets[0] / "skills" / "user-check" / "SKILL.md"
     retained_path.write_bytes(b"unknown-writer\n")
-    blocked = execute(ROOT, config, state, apply=False)
+    blocked = execute(standalone_engine, config, state, apply=False)
     assert not any(line.startswith("PLAN_HASH ") for line in blocked)
     assert any(
         line.startswith("RETAIN ") and "status=retained-drift" in line
@@ -515,14 +553,16 @@ def test_sync_path_set_shrink_retains_reactivates_and_blocks_retained_drift(
     assert blocked[-1].endswith("ready=false")
 
 
-def test_sync_corrupt_receipt_is_indeterminate_and_never_ignored(tmp_path: Path) -> None:
+def test_sync_corrupt_receipt_is_indeterminate_and_never_ignored(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     before = _target_bytes(targets)
     receipt = config.parent / "materialization-receipt.json"
     receipt.write_text("{}", encoding="utf-8")
 
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
 
     assert not any(line.startswith("PLAN_HASH ") for line in planned)
     assert all(
@@ -536,10 +576,11 @@ def test_sync_corrupt_receipt_is_indeterminate_and_never_ignored(tmp_path: Path)
 
 @pytest.mark.parametrize("redirect", ("config", "root", "path"))
 def test_sync_redirected_receipt_identity_is_indeterminate(
+    standalone_engine: Path,
     tmp_path: Path, redirect: str,
 ) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     receipt_path = config.parent / "materialization-receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     if redirect == "config":
@@ -553,7 +594,7 @@ def test_sync_redirected_receipt_identity_is_indeterminate(
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     before = _target_bytes(targets)
 
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
 
     assert not any(line.startswith("PLAN_HASH ") for line in planned)
     assert all(
@@ -564,33 +605,36 @@ def test_sync_redirected_receipt_identity_is_indeterminate(
     assert _target_bytes(targets) == before
 
 
-def test_sync_receipt_preimage_drift_rejects_before_runtime_write(tmp_path: Path) -> None:
+def test_sync_receipt_preimage_drift_rejects_before_runtime_write(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
-    planned = execute(ROOT, config, state, apply=False)
+    reviewed_apply(standalone_engine, config, state)
+    planned = execute(standalone_engine, config, state, apply=False)
     token = _plan_hash_from(planned)
     receipt = config.parent / "materialization-receipt.json"
     receipt.write_bytes(receipt.read_bytes() + b"\n")
     before = _target_bytes(targets)
 
     with pytest.raises(ConfigError, match="FAIL_PLAN_HASH"):
-        execute(ROOT, config, state, apply=True, plan_hash=token)
+        execute(standalone_engine, config, state, apply=True, plan_hash=token)
     assert _target_bytes(targets) == before
     assert not (config.parent / "txn" / "materialization-pending.json").exists()
 
 
 def test_sync_unknown_writer_matching_new_desired_is_foreign_and_zero_write(
+    standalone_engine: Path,
     tmp_path: Path,
 ) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     receipt = config.parent / "materialization-receipt.json"
     receipt_before = receipt.read_bytes()
     global_rules = state / "rules" / "global.md"
     global_rules.write_bytes(global_rules.read_bytes() + b"\nunknown-writer-generation-b\n")
     payload = load_config(config)
     changed = next(
-        item for item in collect_operations(ROOT, payload, state)
+        item for item in collect_operations(standalone_engine, payload, state)
         if item.target_id == payload["targets"][0]["id"] and item.source_label == "rules"
     )
     changed.destination.write_bytes(changed.content)
@@ -599,7 +643,7 @@ def test_sync_unknown_writer_matching_new_desired_is_foreign_and_zero_write(
         for root in targets for path in root.rglob("*") if path.is_file()
     }
 
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
 
     changed_line = next(
         line for line in planned
@@ -616,10 +660,11 @@ def test_sync_unknown_writer_matching_new_desired_is_foreign_and_zero_write(
 
 @pytest.mark.parametrize("fault", ("runtime", "receipt", "cleanup"))
 def test_sync_transaction_faults_restore_runtime_receipt_and_marker(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
 ) -> None:
     state, config, targets = concrete_environment(tmp_path)
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
     token = _plan_hash_from(planned)
     original_materialize = sync_module.materialize_bytes
     original_clear = sync_module._clear_materialization_transaction
@@ -648,7 +693,7 @@ def test_sync_transaction_faults_restore_runtime_receipt_and_marker(
         monkeypatch.setattr(sync_module, "_clear_materialization_transaction", fail_cleanup_once)
 
     with pytest.raises(ConfigError):
-        execute(ROOT, config, state, apply=True, plan_hash=token)
+        execute(standalone_engine, config, state, apply=True, plan_hash=token)
 
     assert _target_bytes(targets) == {}
     assert not (config.parent / "materialization-receipt.json").exists()
@@ -656,13 +701,14 @@ def test_sync_transaction_faults_restore_runtime_receipt_and_marker(
 
 
 def test_sync_partial_snapshot_cleanup_keeps_marker_and_blocks_followup(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, _targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     rules = state / "rules" / "global.md"
     rules.write_bytes(rules.read_bytes() + b"\npartial-cleanup-generation\n")
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
     original_rmtree = sync_module.shutil.rmtree
     injected = False
 
@@ -678,23 +724,24 @@ def test_sync_partial_snapshot_cleanup_keeps_marker_and_blocks_followup(
 
     monkeypatch.setattr(sync_module.shutil, "rmtree", partial_cleanup)
     with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_ROLLBACK"):
-        execute(ROOT, config, state, apply=True, plan_hash=_plan_hash_from(planned))
+        execute(standalone_engine, config, state, apply=True, plan_hash=_plan_hash_from(planned))
 
     assert injected is True
     pending = config.parent / "txn" / "materialization-pending.json"
     assert pending.is_file()
     with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECOVERY"):
-        execute(ROOT, config, state, apply=False)
+        execute(standalone_engine, config, state, apply=False)
 
 
 def test_sync_pending_unlink_failure_keeps_marker_and_blocks_followup(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, _targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     rules = state / "rules" / "global.md"
     rules.write_bytes(rules.read_bytes() + b"\npending-unlink-generation\n")
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
     pending = config.parent / "txn" / "materialization-pending.json"
     original_unlink = Path.unlink
 
@@ -705,18 +752,19 @@ def test_sync_pending_unlink_failure_keeps_marker_and_blocks_followup(
 
     monkeypatch.setattr(Path, "unlink", fail_pending_unlink)
     with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_ROLLBACK"):
-        execute(ROOT, config, state, apply=True, plan_hash=_plan_hash_from(planned))
+        execute(standalone_engine, config, state, apply=True, plan_hash=_plan_hash_from(planned))
 
     assert pending.is_file()
     with pytest.raises(ConfigError, match="FAIL_MATERIALIZATION_RECOVERY"):
-        execute(ROOT, config, state, apply=False)
+        execute(standalone_engine, config, state, apply=False)
 
 
 def test_sync_receipt_race_preserves_racer_snapshot_and_marker(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, config, _targets = concrete_environment(tmp_path)
-    planned = execute(ROOT, config, state, apply=False)
+    planned = execute(standalone_engine, config, state, apply=False)
     token = _plan_hash_from(planned)
     racer = b'{"racer":true}\n'
 
@@ -726,7 +774,7 @@ def test_sync_receipt_race_preserves_racer_snapshot_and_marker(
 
     monkeypatch.setattr(sync_module, "publish_materialization_receipt", race)
     with pytest.raises(ConfigError, match="FAIL_MATERIALIZER_RACE") as caught:
-        execute(ROOT, config, state, apply=True, plan_hash=token)
+        execute(standalone_engine, config, state, apply=True, plan_hash=token)
 
     assert (config.parent / "materialization-receipt.json").read_bytes() == racer
     pending = config.parent / "txn" / "materialization-pending.json"
@@ -734,24 +782,26 @@ def test_sync_receipt_race_preserves_racer_snapshot_and_marker(
     assert "snapshot retained" in str(caught.value)
 
 
-def test_sync_refuses_install_pending_before_plan_or_runtime_write(tmp_path: Path) -> None:
+def test_sync_refuses_install_pending_before_plan_or_runtime_write(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state, config, targets = concrete_environment(tmp_path)
     pending = config.parent / "install-pending.json"
     pending.write_text("{}", encoding="utf-8")
 
     with pytest.raises(ConfigError, match="FAIL_INSTALL_RECOVERY"):
-        execute(ROOT, config, state, apply=False)
+        execute(standalone_engine, config, state, apply=False)
 
     assert _target_bytes(targets) == {}
     assert pending.read_text(encoding="utf-8") == "{}"
 
 
-def test_prompt_injection_is_config_driven(tmp_path: Path) -> None:
+def test_prompt_injection_is_config_driven(standalone_engine: Path, tmp_path: Path) -> None:
     state, config, targets = concrete_environment(tmp_path)
     payload = json.loads(config.read_text(encoding="utf-8"))
     payload["prompt_injection"]["lines"] = ["Synthetic configured line."]
     config.write_text(json.dumps(payload), encoding="utf-8")
-    reviewed_apply(config, state)
+    reviewed_apply(standalone_engine, config, state)
     for root in targets:
         hook = (root / "hooks" / "user_prompt.sh").read_text(encoding="utf-8")
         assert "Synthetic configured line." in hook
@@ -761,11 +811,27 @@ def test_prompt_injection_is_config_driven(tmp_path: Path) -> None:
 
 
 def test_doctor_proves_required_skill_consumers(tmp_path: Path) -> None:
+    engine = create_engine_repo(tmp_path / "engine")
     state, config, targets = concrete_environment(tmp_path)
-    reviewed_apply(config, state)
-    lines = run_doctor(ROOT, config, state, state / "manifest.yaml")
+    remote = tmp_path / "state.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("add", "."),
+        ("-c", "user.name=Synthetic Consumer", "-c", "user.email=consumer@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-q", "-m", "state fixture"),
+        ("remote", "add", "origin", str(remote)),
+        ("push", "-q", "-u", "origin", "main"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(state), *args], check=True,
+            capture_output=True, text=True, encoding="utf-8",
+        )
+    planned = execute(engine, config, state, apply=False)
+    execute(engine, config, state, apply=True, plan_hash=_plan_hash_from(planned))
+    lines = run_doctor(engine, config, state, state / "manifest.yaml", workspace=tmp_path)
     assert any("capability=skill:dispatching-task-cards" in line for line in lines)
     missing = targets[0] / "skills" / "dispatching-task-cards" / "SKILL.md"
     missing.unlink()
     with pytest.raises(ConfigError, match="FAIL_CONSUMER_MISSING"):
-        run_doctor(ROOT, config, state, state / "manifest.yaml")
+        run_doctor(engine, config, state, state / "manifest.yaml", workspace=tmp_path)

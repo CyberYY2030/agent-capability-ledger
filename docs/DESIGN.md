@@ -1,39 +1,49 @@
-# Design decisions
+# 设计取舍
 
-This document records the selected boundaries, the rejected alternatives, and the costs that remain visible to an operator.
+## 1. 按可移植性分层
 
-## 1. Placement follows portability
+公开的 engine、私有状态和本机 host 配置分开放置。规则、技能和经验进入私有 Git 仓库；runtime 目录与本机路径由各机器的 host 配置指定。
 
-- Decision: place public mechanism, private state content, and host-only paths in separate layers.
-- Rejected alternative: synchronize complete dotfiles directories.
-- Cost: configuration must declare which layer owns each path, and host-specific paths are populated separately.
+这样避免把整套本机配置目录同步到另一台机器。代价是每台机器都要单独准备 host 配置，并声明各路径的归属。
 
-## 2. Retrieval is deterministic lexical matching
+## 2. 使用确定性关键词检索
 
-- Decision: normalize Unicode, use CJK bigrams and predicates, and order results from lexical matches.
-- Rejected alternative: vector retrieval.
-- Cost: queries depend on declared words and predicates; semantic similarity is not used to select a result.
+检索使用 Unicode 规范化、中文二元组和显式谓词，按范围、状态和 ID 稳定排序。它不使用向量检索，也不以语义相似度选经验。
 
-## 3. The tool does not edit the ledger automatically
+`paths` 使用路径通配符，`cmds` 使用命令子串，`tasks` 使用任务类型，`text` 使用分词后的交集。显式 `when.text` 只需一个词重合；没有 `when` 的旧条目需要触发文字中至少两个词重合。各谓词之间按“任一命中”处理，不能把命令子串或中文二字片段当成完整语义约束。
 
-- Decision: capture creates an immutable candidate and a person decides whether promotion writes canonical content.
-- Rejected alternative: automatic persistence to the ledger.
-- Cost: promotion requires review and an explicit transaction before canonical content changes.
+提示词阶段使用 `tasks` 和 `text`；派发阶段使用 `tasks` 和 `paths`；工具调用前使用 `paths` 和 `cmds`；完成阶段使用 `text`。提示词里的路径和命令不会被推断成结构化字段。`lessons match --explain` 可显示命中和被忽略的谓词。
 
-## 4. Capture writes to inbox before canonical content
+代价是漏掉复数和同义词，也会因常见词误召回。同一个匹配器在真实台账上有单词误召回，合成数据上的结果不能代表实际召回质量。
 
-- Decision: capture only appends immutable candidate bytes; reviewed promotion moves a candidate to
-  `consumed/`, and reviewed rejection moves it to `rejected/`.
-- Rejected alternative: direct writes to canonical content.
-- Evidence: in incident B, two agent sessions implemented the same integration work from the same baseline; only one result could become canonical after manual comparison.
-- Cost: candidate review and promotion add a separate step before canonical content changes.
+## 3. 台账修改由人审核
 
-## 5. The retrieval budget is measured in characters
+采集只创建候选，入库需要人工审核计划和最终内容。它不把 Agent 产生的规则直接持久化到台账。
 
-- Decision: limit retrieval output by character count.
-- Rejected alternative: limit output by model tokens.
-- Cost: the limit is not expressed in a model-specific token unit.
+代价是每条经验多一次审核。计划哈希绑定候选、目标和原内容；审核后发生变化，需要重新预览。入库只做本地写入和暂存，提交、推送和 runtime 同步由用户另行执行。
 
-## Trust boundaries
+## 4. 候选先进入 inbox
 
-V0.1 does not import third-party lessons or skills automatically. State consumes only content that its owner explicitly places and marks as trusted; unknown sources are rejected from injection and installation. Text normalization does not create trust for instructional content. Any future import capability requires a separate threat model, source or signature design, preview, and approval work.
+采集追加不可变候选，入库后移入 `consumed/`，拒绝后移入 `rejected/`。多会话可能对同一个问题提出不同做法，先保留候选便于人工比较后再决定哪条进入台账。
+
+代价是要处理候选积压。目标台账的精确重复会阻塞，其他范围的精确重复和 `SIMILAR` 相似提示供人判断。
+
+## 5. 按字符数限制注入预算
+
+检索输出按字符数限制长度，默认预算为 1200 个字符；`--budget-chars` 可以调整。超出预算时保留能放入的前缀，并输出截断提示。
+
+这样无需依赖某个模型的分词器。代价是字符预算不等于模型 token 预算，命中也不保证最终进入注入文本。
+
+## 信任边界
+
+工具不会自动导入第三方经验或技能。私有状态由用户维护；状态清单中的能力需要显式标记为可信，否则安装和 sync 会拒绝。Unicode 规范化只用于匹配，不会让指令内容变可信。
+
+第三方内容应先经过用户审核再进入私有状态。若以后增加导入能力，需要另行设计来源验证、预览和授权。
+
+## hook 契约
+
+Claude Code 与 Codex 的提示词阶段都输出文本；工具调用前有非空提醒时输出 JSON，文本位于 `hookSpecificOutput.additionalContext`。输出不包含权限决定，也不改写工具输入。
+
+Stop 的标准输出为空；Claude Code 仍可按采集条件执行完成阶段采集，警告写入标准错误。hook 出错时输出警告并放行。hook 每次运行都写一条心跳记录，只说明它运行过、是否有输出；心跳不能证明采集成功，也不能证明模型采纳了提醒。
+
+工具调用前的上下文会在后续模型请求中到达，不能阻止已经选定的工具调用。提醒不是权限拦截；实际投递取决于 host 和版本。

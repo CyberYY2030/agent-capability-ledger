@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import agent_core.materializer as materializer_module
-import agent_core.promote as promote_module
+import agent_core.lock as lock_module
 from agent_core.config import ConfigError
 from agent_core.materializer import (
     MaterializationTarget,
@@ -15,7 +15,7 @@ from agent_core.materializer import (
     require_lock_token,
     review_materialization,
 )
-from agent_core.promote import operation_lock
+from agent_core.lock import operation_lock
 
 
 def _materialize(
@@ -66,7 +66,7 @@ def test_lock_token_has_no_module_issuer_or_mutable_authority(
     control_a = tmp_path / "host-a" / "txn"
     control_b = tmp_path / "host-b" / "txn"
 
-    for module in (materializer_module, promote_module):
+    for module in (materializer_module, lock_module):
         assert not hasattr(module, "_issue_lock_token")
         assert not hasattr(module, "_expire_lock_token")
         assert not hasattr(module, "_make_lock_authority")

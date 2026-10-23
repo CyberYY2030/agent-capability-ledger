@@ -43,10 +43,11 @@ class MaterializationReview:
     retained: tuple[dict[str, Any], ...]
     ready: bool
     receipt_error: str | None = None
+    causes: tuple[tuple[str, str, str], ...] = ()
 
 
 def require_lock_token(token: object, control_root: Path) -> None:
-    from .promote import _validate_lock_token
+    from .lock import _validate_lock_token
 
     _validate_lock_token(token, control_root)
 
@@ -528,6 +529,18 @@ def review_materialization(
                 previous_rows = {}
                 break
 
+    causes: list[tuple[str, str, str]] = []
+    if receipt_error is not None:
+        causes.append((
+            "indeterminate", "materialization-receipt",
+            f"{receipt_error}; move aside {receipt_path} (keep a copy), then rerun the plan",
+        ))
+    if not receipt_exists and legacy_error is not None:
+        causes.append((
+            "indeterminate", "install-receipt",
+            f"{legacy_error}; move aside {config_path.parent / 'install-receipt.json'} "
+            "(keep a copy), then rerun the plan",
+        ))
     planned: list[dict[str, Any]] = []
     active_rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -561,6 +574,11 @@ def review_materialization(
             or not _same_path(Path(row["root"]), root)
         ):
             status = "indeterminate"
+            causes.append((
+                "indeterminate", "materialization-receipt",
+                f"receipt row identity differs for {path}; move aside {receipt_path} "
+                "(keep a copy), then rerun the plan",
+            ))
         elif row is not None and current_sha256 == row["installed_sha256"] == desired_sha256:
             status = (
                 "mode-drift"
@@ -595,7 +613,18 @@ def review_materialization(
             )
         else:
             status = "foreign"
-        action = "WRITE" if status in {"absent", "managed-update", "bootstrap-managed-update"} else (
+        if status == "foreign" and current_exists:
+            causes.append((
+                "foreign", "target",
+                f"preserve or move aside {path}, then rerun the plan",
+            ))
+        elif status == "foreign":
+            causes.append((
+                "foreign", "materialization-receipt",
+                f"receipt-owned {path} is missing; move aside {receipt_path} "
+                "(keep a copy), then rerun the plan",
+            ))
+        action ="WRITE" if status in {"absent", "managed-update", "bootstrap-managed-update"} else (
             "MODE" if status == "mode-drift" else
             "NOOP" if status in {"receipt-owned-identical", "bootstrap-identical", "adopt-identical"}
             else "BLOCK"
@@ -671,6 +700,7 @@ def review_materialization(
     return MaterializationReview(
         receipt_path, receipt_exists, receipt_sha256, receipt_bytes, receipt_changed,
         tuple(planned), tuple(retained), ready, receipt_error or legacy_error,
+        tuple(causes),
     )
 
 

@@ -51,11 +51,11 @@ def _state_from_args(args: list[str], config: dict) -> tuple[Path, list[str]]:
 
 
 def _inject_state(args: list[str], state_root: Path) -> list[str]:
-    if not args or args[0] in {"--version", "state", "uninstall"}:
+    if not args or args[0] in {"--version"}:
         return args
     if "--state" in args:
         return args
-    if args[:2] in (["candidate", "publish"], ["lessons", "capture"]):
+    if args[:2] == ["lessons", "capture"]:
         return [*args[:2], "--state", str(state_root), *args[2:]]
     if args[:2] in (["lessons", "match"], ["lessons", "hook"]):
         if "--ledger" in args:
@@ -64,10 +64,8 @@ def _inject_state(args: list[str], state_root: Path) -> list[str]:
             *args[:2], "--ledger", str(state_root / "experience" / "LESSONS.md"),
             *args[2:],
         ]
-    if args[:2] == ["engine", "upgrade"]:
-        return [*args[:2], "--state", str(state_root), *args[2:]]
     if args[0] in {
-        "check", "sync", "doctor", "fingerprint", "promote", "rollback", "recover", "install",
+        "sync", "doctor", "install",
     }:
         return [args[0], "--state", str(state_root), *args[1:]]
     return args
@@ -106,21 +104,11 @@ def run(argv: Optional[Sequence[str]] = None, *, launcher_path: Optional[Path] =
         forwarded = _inject_state(forwarded, state_root)
         lock = _load_object(state_root / "agent-core.lock.json", "FAIL_STATE_LOCK")
         version = lock.get("engine_version")
-        upgrade_escape = forwarded[:2] == ["engine", "upgrade"]
-        if upgrade_escape and "--state" in forwarded:
-            state_index = forwarded.index("--state")
-            if state_index + 1 >= len(forwarded) or (
-                Path(forwarded[state_index + 1]).expanduser().resolve() != state_root
-            ):
-                raise ValueError("FAIL_STATE_BINDING upgrade state differs from launcher state")
-        if not isinstance(version, str) or (
-            version != pin.get("version") and not upgrade_escape
-        ):
+        if not isinstance(version, str) or version != pin.get("version"):
             raise ValueError(
                 f"FAIL_ENGINE_PIN state={version!r} installed={pin.get('version')!r}"
             )
-        runtime_version = pin.get("version") if upgrade_escape else version
-        engine_root = install_root / "engine" / str(runtime_version)
+        engine_root = install_root / "engine" / str(version)
         if not (engine_root / "agent_core" / "cli.py").is_file():
             raise ValueError(f"FAIL_ENGINE_MISSING {engine_root}")
     except ValueError as exc:

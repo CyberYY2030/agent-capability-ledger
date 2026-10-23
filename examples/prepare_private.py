@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a fresh private agent-core workspace without installing it."""
+"""Prepare or join a private agent-core workspace without installing it."""
 
 from __future__ import annotations
 
@@ -65,6 +65,30 @@ def _manifest() -> tuple[object, list[tuple[Path, Path]]]:
     return artifact, copies
 
 
+def _join_workspace(path: Path) -> Path:
+    requested = path.absolute()
+    if not requested.is_dir():
+        raise ConfigError("FAIL_PREPARE_PATH", "workspace must be an existing ordinary directory")
+    current = requested
+    while current != current.parent:
+        junction = getattr(current, "is_junction", None)
+        if current.is_symlink() or (callable(junction) and junction()):
+            raise ConfigError("FAIL_PREPARE_ALIAS", "workspace contains an alias")
+        current = current.parent
+    workspace = requested.resolve()
+    if Path(_git(workspace, "rev-parse", "--show-toplevel")).resolve() != workspace:
+        raise ConfigError("FAIL_PREPARE_GIT", "workspace must be the Git work tree top level")
+    engine = workspace / "engine"
+    try:
+        verify_release_manifest(engine, engine / "release-manifest.json")
+    except ConfigError as exc:
+        raise ConfigError("FAIL_PREPARE_CLONE", f"invalid engine/release-manifest.json: {exc}") from exc
+    lock = workspace / "state" / "agent-core.lock.json"
+    if lock.is_symlink() or not lock.is_file():
+        raise ConfigError("FAIL_PREPARE_CLONE", "state/agent-core.lock.json must be a regular file")
+    return workspace
+
+
 def _config(workspace: Path, config_path: Path, runtime: str, runtime_root: Path, host: str) -> bytes:
     payload = json.loads((ENGINE_ROOT / "examples" / "host.example.json").read_text(encoding="utf-8"))
     payload["host_label"] = host
@@ -88,9 +112,9 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _reject_overlap(workspace: Path, config: Path, runtime: Path) -> None:
+def _reject_overlap(workspace: Path, config: Path, runtime: Path, *, join: bool = False) -> None:
     source = ENGINE_ROOT.resolve()
-    if _inside(workspace, source) or _inside(source, workspace):
+    if not join and (_inside(workspace, source) or _inside(source, workspace)):
         raise ConfigError("FAIL_PREPARE_OVERLAP", "workspace overlaps the public engine")
     if _inside(config, source) or _inside(config, workspace):
         raise ConfigError("FAIL_PREPARE_OVERLAP", "config must stay outside engine and workspace")
@@ -103,24 +127,39 @@ def _reject_overlap(workspace: Path, config: Path, runtime: Path) -> None:
 def prepare(args: argparse.Namespace) -> list[str]:
     if HOST_LABEL_RE.fullmatch(args.host_label) is None:
         raise ConfigError("FAIL_PREPARE_INPUT", "host label must be privacy-safe kebab-case")
-    if not args.git_name.strip() or not args.git_email.strip():
+    if not args.join and (not (args.git_name or "").strip() or not (args.git_email or "").strip()):
         raise ConfigError("FAIL_PREPARE_INPUT", "Git identity values must be non-empty")
-    workspace = _fresh_target(args.workspace, "workspace")
+    workspace = _join_workspace(args.workspace) if args.join else _fresh_target(args.workspace, "workspace")
     config_path = _fresh_target(args.config, "config")
     runtime_root = args.runtime_root.absolute()
     if not runtime_root.is_dir() or runtime_root.is_symlink():
         raise ConfigError("FAIL_PREPARE_RUNTIME", "runtime root must be an existing ordinary directory")
     runtime_root = runtime_root.resolve()
-    _reject_overlap(workspace, config_path, runtime_root)
-    artifact, copies = _manifest()
+    _reject_overlap(workspace, config_path, runtime_root, join=args.join)
+    if not args.join:
+        artifact, copies = _manifest()
     config_bytes = _config(workspace, config_path, args.runtime, runtime_root, args.host_label)
     lines = [
-        f"PLAN operation=prepare-private workspace={workspace}",
+        f"PLAN operation={'join-private' if args.join else 'prepare-private'} workspace={workspace}",
         f"PLAN config={config_path}",
         f"PLAN runtime={args.runtime} runtime_root={runtime_root}",
     ]
     if not args.apply:
         return lines + ["DRY_RUN writes=0 ready=true"]
+
+    if args.join:
+        handle, name = tempfile.mkstemp(prefix=config_path.name + ".", suffix=".prepare", dir=config_path.parent)
+        config_staging = Path(name)
+        try:
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(config_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            load_config(config_staging)
+            _move_no_replace(config_staging, config_path)
+        finally:
+            config_staging.unlink(missing_ok=True)
+        return [f"APPLIED config={config_path}", "PASS joined=true installed=false"]
 
     staging = Path(tempfile.mkdtemp(prefix=".agent-core-private-", dir=workspace.parent))
     config_staging: Path | None = None
@@ -192,8 +231,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--config", type=Path, required=True)
     result.add_argument("--runtime", choices=("claude-code", "codex"), required=True)
     result.add_argument("--runtime-root", type=Path, required=True)
-    result.add_argument("--git-name", required=True)
-    result.add_argument("--git-email", required=True)
+    result.add_argument("--git-name")
+    result.add_argument("--git-email")
+    result.add_argument("--join", action="store_true")
     result.add_argument("--host-label", default="local")
     result.add_argument("--apply", action="store_true")
     return result

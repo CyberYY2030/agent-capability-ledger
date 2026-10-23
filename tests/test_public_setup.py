@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent_core.installer import build_release_manifest
-from agent_core.provenance import validate_engine_provenance
+from agent_core.provenance import RECORD, validate_engine_provenance
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,9 +109,16 @@ def test_apply_creates_clean_private_repo_and_external_config(
     assert git(workspace, "log", "--format=%s", "-1") == "state: initialize private agent-core workspace"
     assert (workspace / "engine" / "release-manifest.json").is_file()
     assert (workspace / "state" / "experience" / "LESSONS.md").is_file()
-    assert (workspace / "engine.provenance.json").is_file()
+    assert (workspace / RECORD).is_file()
     assert not (workspace / "engine" / "AGENTS.md").exists()
-    assert not (workspace / "engine" / ".githooks").exists()
+    engine = workspace / "engine"
+    manifest = json.loads((public_source(tmp_path) / "release-manifest.json").read_text(encoding="utf-8"))
+    expected_files = {Path(item["path"]) for item in manifest["files"]} | {Path("release-manifest.json")}
+    expected_directories = {
+        parent for path in expected_files for parent in path.parents if parent != Path(".")
+    }
+    assert {path.relative_to(engine) for path in engine.rglob("*") if path.is_file()} == expected_files
+    assert {path.relative_to(engine) for path in engine.rglob("*") if path.is_dir()} == expected_directories
     assert not (workspace / "audit").exists()
     assert validate_engine_provenance(workspace / "engine").sequence == 1
     payload = json.loads(config.read_text(encoding="utf-8"))
@@ -257,20 +264,20 @@ def test_prepared_repo_completes_supported_local_install_journey(tmp_path: Path)
     installed = tmp_path / "data" / "agent-core" / "bin" / "agent-core"
     doctor = subprocess.run(
         [str(installed), "doctor", "--config", str(config), "--state", str(workspace / "state")],
-        env=environment, check=False, capture_output=True, text=True, encoding="utf-8",
+        cwd=tmp_path, env=environment, check=False, capture_output=True, text=True, encoding="utf-8",
     )
     assert doctor.returncode == 0, doctor.stderr
     lesson = subprocess.run(
         [str(installed), "lessons", "match", "--ledger",
          str(workspace / "state" / "experience" / "profiles" / "example-domain" / "LESSONS.md"),
          "--workspace", "seed", "--stage", "prompt", "--text", "public fixture"],
-        env=environment, check=False, capture_output=True, text=True, encoding="utf-8",
+        cwd=tmp_path, env=environment, check=False, capture_output=True, text=True, encoding="utf-8",
     )
     assert lesson.returncode == 0, lesson.stderr
     assert "EXAMPLE-1" in lesson.stdout
     sync = subprocess.run(
         [str(installed), "sync", "--config", str(config), "--state", str(workspace / "state")],
-        env=environment, check=False, capture_output=True, text=True, encoding="utf-8",
+        cwd=tmp_path, env=environment, check=False, capture_output=True, text=True, encoding="utf-8",
     )
     assert sync.returncode == 0, sync.stderr
     assert "DRY_RUN writes=0" in sync.stdout

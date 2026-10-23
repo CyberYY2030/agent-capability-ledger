@@ -109,14 +109,6 @@ def _sensitive_identity_rules() -> tuple[Rule, ...]:
 SENSITIVE_IDENTITY_RULES = _sensitive_identity_rules()
 
 
-def absolute_path_rule(text: str) -> str | None:
-    """Return the stricter capture path rule id, independent of host OS."""
-    return next(
-        (rule.rule_id for rule in CAPTURE_ABSOLUTE_PATH_RULES if rule.regex.search(text)),
-        None,
-    )
-
-
 def _builtin_default_rules() -> list[Rule]:
     specs = [
         (

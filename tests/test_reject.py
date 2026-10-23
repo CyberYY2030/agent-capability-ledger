@@ -9,7 +9,9 @@ import pytest
 
 from agent_core.config import ConfigError
 from agent_core.cli import main as cli_main
-from agent_core.promote import apply_local_reject, create_candidate, operation_lock, plan_local_reject
+from agent_core.local_promote import apply_local_reject, plan_local_reject
+from agent_core.candidates import create_candidate
+from agent_core.lock import operation_lock
 from agent_core.reject import main as reject_main
 
 
@@ -208,8 +210,24 @@ def test_reject_source_must_be_an_ordinary_single_link_file(tmp_path: Path, kind
             source.symlink_to(target)
         except OSError as exc:
             pytest.skip(f"symlink unavailable: {exc}")
-    with pytest.raises(ConfigError, match="FAIL_CANDIDATE_STATE"):
+    entries_before = set(source.parent.iterdir())
+    index_before = git(repo, "ls-files", "--stage", "-z").stdout
+    expected_code = "FAIL_TRANSACTION_SCOPE" if kind == "symlink" else "FAIL_CANDIDATE_STATE"
+    with pytest.raises(ConfigError, match=expected_code) as caught:
         plan_local_reject(repo, None, item, state_root=state, config_path=config)
+    assert caught.value.code == expected_code
+    if kind == "symlink":
+        assert caught.value.detail == source.relative_to(state).as_posix()
+        assert source.is_symlink() and source.readlink() == target
+        assert target.read_bytes() == raw
+    elif kind == "directory":
+        assert source.is_dir() and not list(source.iterdir())
+    else:
+        assert source.read_bytes() == raw
+        assert os.path.samefile(source, tmp_path / "second-link.md")
+        assert (tmp_path / "second-link.md").read_bytes() == raw
+    assert set(source.parent.iterdir()) == entries_before
+    assert git(repo, "ls-files", "--stage", "-z").stdout == index_before
 
 
 def test_reject_revalidates_head_candidate_config_and_index_before_move(tmp_path: Path) -> None:
@@ -265,7 +283,7 @@ def test_reject_destination_race_never_overwrites(tmp_path: Path, monkeypatch: p
     def race(_source: Path, target: Path) -> None:
         target.write_bytes(b"racer")
 
-    monkeypatch.setattr("agent_core.promote._before_local_reject_move", race)
+    monkeypatch.setattr("agent_core.local_promote._before_local_reject_move", race)
     with pytest.raises(ConfigError, match="FAIL_CANDIDATE_STATE"):
         apply_local_reject(repo, None, plan, plan.plan_hash, config_path=config)
     assert source.read_bytes() == raw and destination.read_bytes() == b"racer"
@@ -282,7 +300,7 @@ def test_reject_parent_replacement_fails_before_move(tmp_path: Path, monkeypatch
         os.rename(parent, parent.with_name("rejected-detached"))
         parent.mkdir()
 
-    monkeypatch.setattr("agent_core.promote._before_local_reject_move", replace_parent)
+    monkeypatch.setattr("agent_core.local_promote._before_local_reject_move", replace_parent)
     with pytest.raises(ConfigError, match="rejected parent changed"):
         apply_local_reject(repo, None, plan, plan.plan_hash, config_path=config)
     assert source.read_bytes() == raw
@@ -293,15 +311,15 @@ def test_reject_git_add_failure_restores_source(tmp_path: Path, monkeypatch: pyt
     item, source = make_candidate(repo, state, "add-failure")
     raw = source.read_bytes()
     plan = plan_local_reject(repo, None, item, state_root=state, config_path=config)
-    from agent_core import promote as promote_module
-    original_git = promote_module._git
+    from agent_core import local_promote as local_promote_module
+    original_git = local_promote_module._git
 
     def fail_add(path: Path, *args: str, **kwargs):
         if args and args[0] == "add":
             raise ConfigError("FAIL_GIT", "injected add failure")
         return original_git(path, *args, **kwargs)
 
-    monkeypatch.setattr(promote_module, "_git", fail_add)
+    monkeypatch.setattr(local_promote_module, "_git", fail_add)
     with pytest.raises(ConfigError, match="injected add failure"):
         apply_local_reject(repo, None, plan, plan.plan_hash, config_path=config)
     assert source.read_bytes() == raw
@@ -313,8 +331,8 @@ def test_reject_recovery_race_preserves_both_objects(tmp_path: Path, monkeypatch
     item, source = make_candidate(repo, state, "recovery-race")
     raw = source.read_bytes()
     plan = plan_local_reject(repo, None, item, state_root=state, config_path=config)
-    from agent_core import promote as promote_module
-    original_git = promote_module._git
+    from agent_core import local_promote as local_promote_module
+    original_git = local_promote_module._git
 
     def fail_add(path: Path, *args: str, **kwargs):
         if args and args[0] == "add":
@@ -322,7 +340,7 @@ def test_reject_recovery_race_preserves_both_objects(tmp_path: Path, monkeypatch
             raise ConfigError("FAIL_GIT", "injected add failure")
         return original_git(path, *args, **kwargs)
 
-    monkeypatch.setattr(promote_module, "_git", fail_add)
+    monkeypatch.setattr(local_promote_module, "_git", fail_add)
     with pytest.raises(ConfigError, match="FAIL_REJECT_RECOVERY"):
         apply_local_reject(repo, None, plan, plan.plan_hash, config_path=config)
     destination = state / "inbox" / "rejected" / source.name

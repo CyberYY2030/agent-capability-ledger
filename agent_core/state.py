@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import hashlib
 import json
@@ -10,11 +9,10 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from . import __version__, ledger
 from .config import ConfigError, load_config, load_manifest
@@ -84,37 +82,6 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         raise ConfigError("FAIL_GIT", str(exc)) from exc
 
 
-def _required_git(repo: Path, *args: str) -> str:
-    result = _git(repo, *args)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "git command failed"
-        raise ConfigError("FAIL_GIT", detail)
-    return result.stdout.strip()
-
-
-def _assert_bootstrap_target(engine_root: Path, target: Path) -> Path:
-    if target.is_symlink():
-        raise ConfigError("FAIL_PATH", "state target must not be a symbolic link")
-    resolved = target.resolve()
-    engine = engine_root.resolve()
-    if resolved == resolved.parent:
-        raise ConfigError("FAIL_PATH", "state target must not be a filesystem root")
-    try:
-        resolved.relative_to(engine)
-    except ValueError:
-        pass
-    else:
-        raise ConfigError("FAIL_PATH", "private state must stay outside the public engine")
-    if not resolved.parent.is_dir():
-        raise ConfigError("FAIL_PATH", f"state parent does not exist: {resolved.parent}")
-    if resolved.exists():
-        if not resolved.is_dir():
-            raise ConfigError("FAIL_PATH", "state target must be a directory")
-        if any(resolved.iterdir()):
-            raise ConfigError("FAIL_STATE_NOT_EMPTY", str(resolved))
-    return resolved
-
-
 def _copy_state_seed(engine_root: Path, staging: Path) -> None:
     experience = staging / "experience"
     experience.mkdir()
@@ -137,86 +104,6 @@ def _copy_state_seed(engine_root: Path, staging: Path) -> None:
             "+00:00", "Z"
         ),
     }))
-
-
-def _configure_identity(repo: Path, name: str | None, email: str | None) -> None:
-    if (name is None) != (email is None):
-        raise ConfigError("FAIL_ARGUMENT", "--git-name and --git-email must be supplied together")
-    if name is not None and email is not None:
-        if not name.strip() or not email.strip():
-            raise ConfigError("FAIL_GIT_IDENTITY", "Git identity values must be non-empty")
-        _required_git(repo, "config", "user.name", name)
-        _required_git(repo, "config", "user.email", email)
-    effective_name = _required_git(repo, "config", "--get", "user.name") if _git(
-        repo, "config", "--get", "user.name"
-    ).returncode == 0 else ""
-    effective_email = _required_git(repo, "config", "--get", "user.email") if _git(
-        repo, "config", "--get", "user.email"
-    ).returncode == 0 else ""
-    if not effective_name or not effective_email:
-        raise ConfigError(
-            "FAIL_GIT_IDENTITY",
-            "supply --git-name and --git-email; they are written only to the new state repo",
-        )
-
-
-def _commit_state(repo: Path) -> str:
-    _required_git(repo, "add", ".")
-    _required_git(repo, "commit", "-q", "-m", "state: initialize agent-core state")
-    sha = _required_git(repo, "rev-parse", "HEAD")
-    if not SHA_RE.fullmatch(sha):
-        raise ConfigError("FAIL_GIT", "initial commit did not produce a valid revision")
-    return sha
-
-
-def plan_init(engine_root: Path, target: Path) -> list[str]:
-    resolved = _assert_bootstrap_target(engine_root, target)
-    return [
-        f"PLAN operation=state-init path={resolved}",
-        "PLAN creates=experience,rules,manifest.yaml,agent-core.lock.json,.git",
-        "DRY_RUN writes=0",
-    ]
-
-
-def apply_init(
-    engine_root: Path,
-    target: Path,
-    *,
-    git_name: str | None = None,
-    git_email: str | None = None,
-) -> list[str]:
-    resolved = _assert_bootstrap_target(engine_root, target)
-    staging = Path(tempfile.mkdtemp(prefix=".state-bootstrap-", dir=resolved.parent))
-    target_was_present = resolved.exists()
-    try:
-        _copy_state_seed(engine_root, staging)
-        initialized = subprocess.run(
-            ["git", "init", "-q", "-b", "main", str(staging)],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-        if initialized.returncode != 0:
-            raise ConfigError("FAIL_GIT", initialized.stderr.strip() or "git init failed")
-        _configure_identity(staging, git_name, git_email)
-        sha = _commit_state(staging)
-        if target_was_present:
-            resolved.rmdir()
-        try:
-            os.replace(staging, resolved)
-        except Exception:
-            if target_was_present and not resolved.exists():
-                resolved.mkdir()
-            raise
-        return [f"APPLIED operation=state-init path={resolved}", f"PASS revision={sha}"]
-    except ConfigError:
-        raise
-    except OSError as exc:
-        raise ConfigError("FAIL_STATE_INIT", str(exc)) from exc
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
 
 
 def _load_lock(state_root: Path) -> tuple[dict[str, str], bytes]:
@@ -414,14 +301,46 @@ def _local_remote_identity(context: RepositoryContext) -> str:
     return _sha256(fetch_url.encode("utf-8"))
 
 
+def _status_paths(status: str) -> list[str]:
+    """Return paths from `git status --porcelain=v1 -z`, skipping each rename source."""
+    fields = status.split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        paths.append(entry[3:])
+        if entry[0] in "RC":
+            index += 1
+    return paths
+
+
 def _require_clean_snapshot(context: RepositoryContext, advertised: str) -> None:
     repo = context.repo_root
     head = _valid_oid(_binding_git(repo, "rev-parse", "--verify", "HEAD"))
     tracked = _valid_oid(_binding_git(repo, "rev-parse", "--verify", "origin/main"))
     status = _binding_git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     unmerged = _binding_git(repo, "ls-files", "-u")
-    if head != advertised or tracked != advertised or status or unmerged:
-        _binding_fail("state is not a clean origin/main snapshot")
+    reasons: list[str] = []
+    if unmerged:
+        reasons.append("unmerged paths exist; finish or abort the merge")
+    paths = _status_paths(status)
+    if paths:
+        noun = "path" if len(paths) == 1 else "paths"
+        reasons.append(
+            f"{len(paths)} uncommitted or untracked {noun} (first: {json.dumps(paths[0], ensure_ascii=False)}); "
+            "commit the changes, promote or reject inbox candidates, or move the files outside the repository"
+        )
+    elif status:
+        reasons.append("the working tree is not clean; inspect git status")
+    if head != advertised:
+        reasons.append("HEAD differs from origin/main; pull, or push reviewed local commits, so that they match")
+    if tracked != advertised:
+        reasons.append("local origin/main differs from the remote main; run git fetch origin")
+    if reasons:
+        _binding_fail("state is not a clean origin/main snapshot: " + "; ".join(reasons) + "; then rerun")
 
 
 def _lineage(context: RepositoryContext, advertised: str) -> str:
@@ -645,24 +564,6 @@ def binding_receipt_path(config_path: Path) -> Path:
     return config_path.with_name(config_path.name + ".state-binding.json")
 
 
-def plan_attach(
-    state_root: Path,
-    config_path: Path,
-    *,
-    confirm_private_remote: bool,
-) -> list[str]:
-    context, _config, _config_content, _lock, _remote, remote_sha, _root, _provenance = _validate_attach(
-        state_root, config_path, confirm_private_remote=confirm_private_remote,
-    )
-    config_path = _host_path_outside_repository(config_path, context.repo_root, "host config")
-    return [
-        f"PLAN operation=state-attach path={context.state_root}",
-        f"PLAN config={config_path.resolve()}",
-        f"EXPECTED_REMOTE_SHA {remote_sha}",
-        "DRY_RUN writes=0",
-    ]
-
-
 def _atomic_write(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
@@ -688,7 +589,7 @@ def apply_attach(
     _reviewed_config_bytes: bytes | None = None,
 ) -> list[str]:
     from .materializer import require_lock_token
-    from .promote import operation_lock
+    from .lock import operation_lock
 
     control_root = config_path.resolve().parent / "txn"
     if _defer_remote_state and lock_token is None:
@@ -820,48 +721,3 @@ def _apply_attach_locked(
         f"APPLIED operation=state-attach config={config_path.resolve()}",
         f"PASS revision={remote_sha} receipt={receipt_path.resolve()}",
     ]
-
-
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agent-core state")
-    commands = parser.add_subparsers(dest="command", required=True)
-    init = commands.add_parser("init")
-    init.add_argument("--path", type=Path, required=True)
-    init.add_argument("--apply", action="store_true")
-    init.add_argument("--git-name")
-    init.add_argument("--git-email")
-    attach = commands.add_parser("attach")
-    attach.add_argument("--path", type=Path, required=True)
-    attach.add_argument("--config", type=Path, required=True)
-    attach.add_argument("--confirm-private-remote", action="store_true")
-    attach.add_argument("--apply", action="store_true")
-    return parser
-
-
-def main(argv: Sequence[str] | None = None, engine_root: Path | None = None) -> int:
-    args = _parser().parse_args(list(sys.argv[1:] if argv is None else argv))
-    root = (engine_root or Path(__file__).resolve().parents[1]).resolve()
-    try:
-        if args.command == "init":
-            if not args.apply and (args.git_name is not None or args.git_email is not None):
-                raise ConfigError("FAIL_ARGUMENT", "Git identity flags require --apply")
-            lines = apply_init(
-                root, args.path, git_name=args.git_name, git_email=args.git_email,
-            ) if args.apply else plan_init(root, args.path)
-        else:
-            lines = apply_attach(
-                args.path, args.config,
-                confirm_private_remote=args.confirm_private_remote,
-            ) if args.apply else plan_attach(
-                args.path, args.config,
-                confirm_private_remote=args.confirm_private_remote,
-            )
-        print(*lines, sep="\n")
-        return 0
-    except ConfigError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

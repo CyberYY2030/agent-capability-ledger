@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .config import ConfigError, default_config_path, load_config
-from .promote import apply_local_promote, plan_local_promote
+from .local_promote import apply_local_promote, plan_local_promote
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]

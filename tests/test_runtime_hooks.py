@@ -13,7 +13,7 @@ import pytest
 
 from agent_core.config import ConfigError, posix_user_data_root_shell
 from agent_core.doctor import hook_retrieval_status
-from agent_core.installer import apply_install, apply_uninstall, build_release_manifest, plan_install
+from agent_core.installer import apply_install, build_release_manifest, plan_install
 from agent_core.match import _hook_source_signature, main as match_main
 from agent_core.runtime_config import render_fragment, runtime_hook_path
 from agent_core.sync import _hook_content, _powershell_hook_content
@@ -183,13 +183,14 @@ def heartbeat_fixture(tmp_path: Path) -> tuple[Path, Path, dict]:
 
 
 def install_runtime_hooks(
+    engine_root: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Path, Path, Path, dict]:
-    state, config, _manifest, install_root = installed_fixture(tmp_path, monkeypatch)
+    state, config, _manifest, install_root = installed_fixture(engine_root, tmp_path, monkeypatch)
     add_retrieval_lesson(state)
     manifest = tmp_path / "hook-release-manifest.json"
-    manifest.write_text(json.dumps(build_release_manifest(ROOT)), encoding="utf-8")
-    apply_install(ROOT, config, state, ROOT, manifest, force=False)
+    manifest.write_text(json.dumps(build_release_manifest(engine_root)), encoding="utf-8")
+    apply_install(engine_root, config, state, engine_root, manifest, force=False)
     return state, config, install_root, json.loads(config.read_text(encoding="utf-8"))
 
 
@@ -299,11 +300,12 @@ def test_doctor_rejects_v2_hook_heartbeat_without_session_id(tmp_path: Path) -> 
 
 @pytest.mark.parametrize("runtime", ["claude-code", "codex"])
 def test_installed_prompt_and_pretool_hooks_retrieve_and_prove_mtime_gate(
+    standalone_engine: Path,
     runtime: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state, _config, _install_root, payload = install_runtime_hooks(tmp_path, monkeypatch)
+    state, _config, _install_root, payload = install_runtime_hooks(standalone_engine, tmp_path, monkeypatch)
     target = next(item for item in payload["targets"] if item["runtime"] == runtime)
     hook = runtime_hook_path(Path(target["root"]) / target["hook_target"])
     config_name = "settings.json" if runtime == "claude-code" else "hooks.json"
@@ -408,9 +410,10 @@ def test_installed_prompt_and_pretool_hooks_retrieve_and_prove_mtime_gate(
 
 
 def test_claude_code_stop_heartbeat_records_session_id(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state, _config, _install_root, payload = install_runtime_hooks(tmp_path, monkeypatch)
+    state, _config, _install_root, payload = install_runtime_hooks(standalone_engine, tmp_path, monkeypatch)
     target = next(item for item in payload["targets"] if item["runtime"] == "claude-code")
     hook = runtime_hook_path(Path(target["root"]) / target["hook_target"])
     runtime_config = json.loads((Path(target["root"]) / "settings.json").read_text(encoding="utf-8"))
@@ -452,10 +455,11 @@ def test_lessons_hook_heartbeat_records_null_for_truncated_payload(
     assert payload["session_id"] is None
 
 
-def test_runtime_config_merge_and_uninstall_preserve_unowned_bytes(
+def test_runtime_config_merge_preserves_unowned_bytes(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
+    state, config, manifest, _install_root = installed_fixture(standalone_engine, tmp_path, monkeypatch)
     payload = json.loads(config.read_text(encoding="utf-8"))
     target = payload["targets"][0]
     runtime_root = Path(target["root"])
@@ -466,85 +470,49 @@ def test_runtime_config_merge_and_uninstall_preserve_unowned_bytes(
         b'  "hooks" : {"Foreign":[{"command":"keep"}]}\r\n}\r\n'
     )
     settings.write_bytes(before)
-    apply_install(ROOT, config, state, ROOT, manifest, force=False)
+    apply_install(standalone_engine, config, state, standalone_engine, manifest, force=False)
     installed = settings.read_bytes()
     assert b'"theme" : {"palette":[1, 2]}' in installed
     assert b'"Foreign":[{"command":"keep"}]' in installed
-    assert apply_uninstall(config)[-1] == "PASS uninstall"
-    assert settings.read_bytes() == before
-
-
-def test_uninstall_preserves_post_install_unowned_runtime_config_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
-    payload = json.loads(config.read_text(encoding="utf-8"))
-    target = payload["targets"][0]
-    settings = Path(target["root"]) / "settings.json"
-    apply_install(ROOT, config, state, ROOT, manifest, force=False)
-    current = json.loads(settings.read_text(encoding="utf-8"))
-    current["user_after"] = "keep-this-value"
-    current["hooks"]["PreToolUse"].append({"hooks": [{"type": "command", "command": "user hook"}]})
-    settings.write_text(json.dumps(current, separators=(",", ":")), encoding="utf-8")
-    apply_uninstall(config)
-    remaining = json.loads(settings.read_text(encoding="utf-8"))
-    assert remaining["user_after"] == "keep-this-value"
-    assert remaining["hooks"]["PreToolUse"] == [
-        {"hooks": [{"type": "command", "command": "user hook"}]},
-    ]
-
-
-def test_uninstall_rejects_modified_owned_runtime_hook_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
-    payload = json.loads(config.read_text(encoding="utf-8"))
-    target = payload["targets"][0]
-    settings = Path(target["root"]) / "settings.json"
-    apply_install(ROOT, config, state, ROOT, manifest, force=False)
-    runtime_config = json.loads(settings.read_text(encoding="utf-8"))
-    runtime_config["hooks"]["PreToolUse"][-1]["hooks"][0]["command"] = "user replacement"
-    settings.write_text(json.dumps(runtime_config), encoding="utf-8")
-    with pytest.raises(ConfigError, match="UNINSTALL_CONFLICT"):
-        apply_uninstall(config)
-    assert "user replacement" in settings.read_text(encoding="utf-8")
 
 
 def test_equivalent_unowned_runtime_hooks_are_foreign_without_a_force_bypass(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state, config, manifest, _install_root = installed_fixture(tmp_path, monkeypatch)
+    state, config, manifest, _install_root = installed_fixture(standalone_engine, tmp_path, monkeypatch)
     payload = json.loads(config.read_text(encoding="utf-8"))
     target = payload["targets"][0]
     runtime_root = Path(target["root"])
     runtime_root.mkdir(parents=True)
     settings = runtime_root / "settings.json"
     desired = render_fragment(
-        ROOT / "runtimes" / "claude-code" / "hook.fragment.json",
+        standalone_engine / "runtimes" / "claude-code" / "hook.fragment.json",
         runtime_root / target["hook_target"],
     )
     ambiguous = json.loads(json.dumps(desired))
     ambiguous["PreToolUse"].append(ambiguous["PreToolUse"][0])
     before = json.dumps({"hooks": ambiguous}, separators=(",", ":")).encode("utf-8")
     settings.write_bytes(before)
-    plan = plan_install(ROOT, config, state, ROOT, manifest)
+    plan = plan_install(standalone_engine, config, state, standalone_engine, manifest)
     assert any(
         line.startswith("TARGET runtime-config:claude-code status=foreign ") for line in plan
     )
     assert plan[-1] == "DRY_RUN writes=0 ready=false no_changes=false"
     with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
-        apply_install(ROOT, config, state, ROOT, manifest, force=False)
+        apply_install(standalone_engine, config, state, standalone_engine, manifest, force=False)
     with pytest.raises(ConfigError, match="INSTALL_CONFLICT"):
-        apply_install(ROOT, config, state, ROOT, manifest, force=True)
+        apply_install(standalone_engine, config, state, standalone_engine, manifest, force=True)
     assert settings.read_bytes() == before
     assert not (_install_root / "engine-pin.json").exists()
     assert not (config.parent / "install-receipt.json").exists()
 
 
 def test_generated_hook_is_fail_open_when_wrapper_returns_nonzero(
+    standalone_engine: Path,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _state, _config, install_root, payload = install_runtime_hooks(tmp_path, monkeypatch)
+    _state, _config, install_root, payload = install_runtime_hooks(standalone_engine, tmp_path, monkeypatch)
     target = payload["targets"][0]
     hook = runtime_hook_path(Path(target["root"]) / target["hook_target"])
     environment = os.environ.copy()
@@ -761,10 +729,11 @@ def test_windows_generated_hook_bounds_missing_wrapper_invocation_error(tmp_path
 
 @pytest.mark.skipif(os.name != "nt", reason="requires generated Windows PowerShell hook")
 def test_windows_generated_hook_malformed_event_reaches_real_python_parser(
+    standalone_engine: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state, _config, _install_root, payload = install_runtime_hooks(tmp_path, monkeypatch)
+    state, _config, _install_root, payload = install_runtime_hooks(standalone_engine, tmp_path, monkeypatch)
     target = next(item for item in payload["targets"] if item["runtime"] == "claude-code")
     hook = runtime_hook_path(Path(target["root"]) / target["hook_target"])
     inbox = state / "inbox"

@@ -51,6 +51,11 @@ def _capture_workspace(tmp_path: Path) -> tuple[Path, Path]:
     (workspace / ".agents" / "lessons.json").write_text(json.dumps({
         "schema": "lessons-routing/1", "project_id": "sample-project", "profiles": [],
     }) + "\n", encoding="utf-8")
+    (workspace / ".agents" / "LESSONS.md").write_text(
+        "# Lessons\n<!-- lessons-schema: lessons-ledger/2 -->\n"
+        "<!-- lessons-scope: project -->\n<!-- lessons-project: sample-project -->\n\n"
+        "## 活跃\n\n## 归档\n", encoding="utf-8",
+    )
     (workspace / "tracked.txt").write_text("base\n", encoding="utf-8")
     _git(workspace, "add", ".")
     _git(workspace, "commit", "-q", "-m", "seed")

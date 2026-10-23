@@ -1,155 +1,140 @@
 # agent-core
 
-`agent-core` is a personal alpha for keeping reusable agent rules, skills, and
-lessons in one private Git source, delivering them to local agent runtimes,
-and checking what was actually installed. Lessons are retrieved for a task so
-useful guidance can reach the agent without loading the whole ledger.
+让 Claude Code 和 Codex 记住踩过的坑，下次遇到相关任务时自动提醒它们。
 
-The public repository is a reviewable engine export. Real use requires your own
-private state and host configuration; this checkout contains neither. It is a
-single-owner prototype, not a hosted service. Candidate version: **0.1.0.dev12**.
+经验、规则和技能都放在你自己的私有 Git 仓库里。两个 Agent 共用这一份，多台机器之间用 `git pull` 同步。
 
-## Try a synthetic lesson (no installation)
+## 为什么需要它
 
-From this checkout's root, with Python 3.11 or newer:
+在聊天里纠正过 Agent 的错误，换一个会话它可能再犯。
 
-```sh
-python3 -m agent_core.cli --version
-python3 -m agent_core.cli lessons match --ledger seed/profiles/example-domain/LESSONS.md --workspace seed --stage prompt --text "public fixture" --explain
-```
+最直接的做法是把教训写进 `CLAUDE.md` 或 `AGENTS.md`。条目少时这样够用，条目多了会有三个麻烦：
 
-The retrieval output includes `EXAMPLE-1` and `Keep public fixtures synthetic.`
-The supplied ledger is **synthetic demonstration data**. The explicit ledger
-and workspace keep this read-only example separate from installed private
-sources. No install, sync, account, or host config is needed. On Windows use a
-compatible `python` interpreter in place of `python3`. This demonstrates
-retrieval mechanics, not natural-work recall, P1 samples, or business benefit.
+- 这些文件每次会话都整份加载。条目越多，占的上下文越多，要紧的那条也越容易被淹没。
+- Claude Code 和 Codex 各读各的文件，每台机器又各有一份，手工同步容易走样。
+- 直接写进文件的规则不经审核，一条错的规则会一直生效，直到有人发现。
 
-See [alpha changes and evidence limits](docs/ALPHA.md) for the changes since
-the current public main release.
+agent-core 的做法：
 
-## First installation with your own private data
+- 每条经验写明什么时候提醒：碰到哪些文件路径、哪些命令或哪些关键词。平时它不进上下文；你的消息或 Agent 要调用的工具命中条件时，hook 才把相关的几条交给 Agent。
+- 规则、技能和经验放在同一个私有 Git 仓库里，由 agent-core 装进 `~/.claude` 或 `~/.codex`。
+- Agent 只提交候选经验。候选要经你预览、确认后，才写进经验台账。
 
-Use Python 3.11 or newer and Git. You need a private Git remote you control,
-a new private workspace, a separate host-config location, and the target
-runtime directory for Claude Code or Codex. The public checkout supplies only
-engine code and synthetic seed data; it does not need access to the author's
-private repository.
+## 效果
 
-Start with the source-distributed preparation helper:
+端到端测试 `tests/test_journey.py` 用两个临时目录模拟两台机器：
 
-```sh
-python3 examples/prepare_private.py --help
-```
+1. 机器 A 记下一条经验，审核入库，推送到私有仓库。
+2. 机器 B clone 这个私有仓库并安装，再把一条用户消息交给 Codex 的 hook：「给 users 表加一个非空的 email 字段，顺便写好迁移」。
 
-Follow the [complete first-installation walkthrough](docs/QUICKSTART.md). It
-prepares a new private `engine/` and `state/` repository and host config, then
-uses the existing reviewed `install` flow. Preparation never overwrites an
-existing workspace/config, contacts a remote, or activates a runtime. You
-confirm your own private remote and publish your own initial private commit
-before binding it. No frozen `state init` or `state attach` CLI is needed.
-
-The helper is optional source setup, not a fifth installed command. Existing
-users retain `install`, `sync`, `doctor`, and `lessons`. Host approval/trust for
-hooks is still a user action; a successful shell test cannot grant that trust
-or prove a Desktop app emitted an event.
-
-## Requirements
-
-- Python 3.11 or newer.
-- A private state repository and reviewed host configuration for real use.
-
-If `python` is unavailable on `PATH`, install Python or set `AGENT_CORE_PYTHON` for the current process to a compatible interpreter before invoking the wrapper. Do not persist a machine-specific bundled interpreter path as shared configuration.
-
-For the portable Claude capture action, replace `<INSTALL_ROOT>` in the host
-example with the installed engine root, then approve exactly one matching Claude
-allow for that launcher invocation and its `lessons capture` subcommand. Do not
-copy a machine-specific interpreter path or settings file into shared config.
-
-## Source of truth
-
-The private Git repository containing `engine/` and `state/` is the only runtime source of truth. Cross-machine synchronization uses ordinary Git operations on that private repository.
-
-A public export checkout is a one-way whitelist export of `engine/`. It is a
-publication artifact, never a runtime dependency, and never receives private
-state, host bindings, credentials, sessions, caches, or machine-specific paths.
-
-## V0.1 CLI
-
-- `install` performs first private binding and receipt-owned engine updates. Runtime rows use the shared materialization receipt; engine, wrapper, pin, and hook rows retain the install receipt.
-- `sync` materializes configured private state into local runtimes and publishes `materialization-receipt/1`; Git itself carries private state between machines.
-- `doctor` verifies the configured engine, state, active and retained materialization rows, pending markers, and runtime bytes.
-- `lessons` accesses the private lessons workflows behind the single supported lessons entry point.
-
-`agent-core --version` remains available. Historical lifecycle, transaction, migration, maintenance, documentation, privacy, and uninstall entry points are frozen. Their implementation may remain in the source tree, but the public CLI rejects them before parsing or side effects:
+hook 返回下面这段文字（测试的真实输出），Codex 处理这条消息之前会先读到它：
 
 ```text
-FAIL_COMMAND_FROZEN promote
+Read matched lessons before acting.
+…
+LESSON L-9: 当要写数据库迁移时，先在本地副本上演练回滚. sink=docs/migration-checklist.md
 ```
 
-The shortest supported journey is plan, apply, verify, then retrieve a lesson:
+`L-9` 是这条经验在台账里的编号，后面是规则本身，`sink` 是这条经验声明的检查清单路径。省略的一行要求 Claude Code 在需要时记录新经验，其他 Agent 跳过。
 
-```console
-$ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote
-$ agent-core install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote --apply --plan-hash '<REVIEWED_INSTALL_PLAN_HASH>'
-$ agent-core sync --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>'
-$ agent-core sync --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --apply --plan-hash '<REVIEWED_SYNC_PLAN_HASH>'
-$ agent-core doctor --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>'
-$ agent-core lessons match --stage prompt --text '<TASK>' --explain
+## 一条经验长什么样
+
+经验存在私有仓库的台账里。台账是 Markdown 文件，一条经验占一行。上面那条经验入库后是这样，原文取自同一次测试：
+
+```text
+- **L-9 [pending·通用] 当要写数据库迁移时，先在本地副本上演练回滚.** 触发: 写数据库迁移. 代价: 迁移上线后无法回滚，只能手工修数据. from: local-20261015T150327Z-8ba00df6ce5f4d079258334c04eb01e2. sink → docs/migration-checklist.md. when: {"text":["迁移"]}
 ```
 
-The first two lines are the plan/apply phases of the single `install` command, so the user-facing surface remains four commands.
+| 部分 | 这一条里 | 作用 |
+| --- | --- | --- |
+| 编号 | `L-9` | 经验在台账里的编号 |
+| 状态 | `pending` | `pending` 还没落实到检查；`checklist` 已写进检查清单；`enforced` 有可以复验的检查。标签本身不证明检查已经执行 |
+| 范围 | `通用` | 所有项目都会检索它；另有 `领域` 和 `项目` 两级 |
+| 规则 | 加粗的那句 | 遇到这种情况时要怎么做 |
+| 触发 | 写数据库迁移 | 这条规则适用的情境 |
+| 代价 | 迁移上线后无法回滚…… | 不照做会损失什么 |
+| from | `local-…` | 它来自哪条候选 |
+| sink | `docs/migration-checklist.md` | 规则要落实到哪个检查或清单 |
+| when | `{"text":["迁移"]}` | 什么时候提醒：这里是消息里出现"迁移" |
 
-### Lessons promotion
+下面两条来自作者自己的台账。公开前删去了日期、编号和内部路径，措辞有压缩：
 
-`agent-core lessons promote --id <CANDIDATE>` reviews one local promotion and stops at the worktree/index boundary. Choose exactly one `--force-new` or scoped `--update <scope:store:lesson-id>`; `--scope global`, `--scope profile:<declared>`, and `--scope project:<current-project-id>` select the destination. An explicit same-repository override may move a project candidate into a bound global or declared profile ledger. A cross-repository request writes nothing and directs recapture in the target inbox. The reviewed plan hash binds the candidate, target, selected action, configuration, and exact staged paths. Apply uses the install transaction lock, writes the canonical ledger and consumed candidate only, and never syncs, commits, pushes, fetches, or contacts a remote.
-
-## Lessons workflow and hook contract
-
-See [Lessons workflow](docs/LESSONS_WORKFLOW.md) for explicit capture with scope, trigger predicates and evidence, whole-entry updates, and the read-only shell delivery check. Host authorization controls whether an agent may capture automatically.
-
-`lessons hook` keeps prompt output as text and emits nonempty PreToolUse context as JSON `hookSpecificOutput.additionalContext`, without permission decisions or rewritten inputs. Stop output is empty; the existing Claude completion capture still runs and warnings go to stderr. The heartbeat describes retrieval/output only, not capture success or model adoption. Claude reads tool-event context on a subsequent model request; a reminder is not a guard on the tool call already selected. Actual delivery remains host/version-specific. [Claude hooks](https://code.claude.com/docs/en/hooks#add-context-for-claude), [Codex hooks](https://learn.chatgpt.com/docs/hooks#pretooluse).
-
-`lessons eval --report` is a repository development check: its default fixtures live in `tests/fixtures/retrieval`, which the installed artifact does not ship. Use the source checkout, or pass `--fixtures` pointing to the reviewed fixture directory. Matching metrics and budgeted production rendering are evaluated separately; neither proves host delivery or real-work value.
-
-## Installation preview
-
-C1 installation planning and apply passed clean-tree acceptance in the isolated C2 environment. Preview every managed target before apply:
-
-```console
-$ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote
-PLAN operation=install version=<VERSION>
-EXPECTED_REMOTE_SHA <REVIEWED_REMOTE_SHA>
-PLAN_HASH <REVIEWED_INSTALL_PLAN_HASH>
-TARGET <LABEL> status=absent|identical|managed-update|foreign|indeterminate path=<TARGET>
-DRY_RUN writes=0 ready=true|false no_changes=true|false
+```text
+- **[pending·通用] 脚本化的 Git 文件事务只能回退 Git 已记录的内容：未跟踪的文件要移到归档位置，不能删除；交给 `git add` 的路径要先按存在性过滤。** 触发: 写或改会暂存、归档、清理仓库文件的脚本、hook 或 Agent 动作。 代价: 任一路径不存在，整条 `git add` 失败（退出码 128），一个文件也不暂存，事务停在半完成状态；如果候选此时已被删除，就找不回来。 sink → 入库时的存在性检查和归档。 when: {"text":["归档"]}
 ```
 
-Apply only a reviewed plan with `ready=true`:
+起因：实测 `git add -A -- <存在的文件> <不存在的文件>` 返回 128，暂存区为空。现在入库只暂存 Git 已跟踪的候选路径，并把候选移到 `consumed/`，不删除（`agent_core/local_promote.py`）。
 
-```console
-$ python -m agent_core.cli install --config '<HOST_CONFIG>' --state '<PRIVATE_STATE>' --source '<ENGINE>' --artifact-manifest '<MANIFEST>' --confirm-private-remote --apply --plan-hash '<REVIEWED_INSTALL_PLAN_HASH>'
+```text
+- **[checklist·通用] 会被 sync 写到多台机器的脚本，机器差异（`python3` 或 `python`、`stat -c` 或 `stat -f`、路径分隔符）要在私有仓库的源文件里运行时探测；不要在某台机器上手改落地的副本。** 触发: 写或改会被 sync 写到多台机器的 hook 或脚本，或想直接改 `~/.claude`、`~/.codex` 里的同步产物来修 bug。 代价: 手改的副本和源文件对不上，下次 sync 会停下报冲突；处理冲突后写回的仍是源文件，同一个错误再次出现。 sink → hook 源文件和跨平台脚本检查。 when: {"text":["hook"]}
 ```
 
-For a later receipt-owned update, omit `--confirm-private-remote` while the existing binding remains valid. After a valid engine or private-state change invalidates that binding, pass explicit `--state` and `--confirm-private-remote` to review and apply its transactional reacceptance with a new exact `PLAN_HASH`. `foreign` and `indeterminate` make the whole plan not ready and apply writes nothing. Runtime `managed-update` requires the shared receipt's exact root/path/current SHA; a legacy install runtime row is accepted only once while the shared receipt is absent and its SHA exactly matches current bytes. Exact unowned desired bytes are visibly adopted without a runtime rewrite. The installer has no force option. A pending install or materialization marker blocks both writers until its retained evidence is inspected and the marker is deliberately cleared. Windows flushes pre-image files and uses no-replace placement, but has no portable directory-fsync equivalent and cannot promise zero overwrite against a non-cooperating writer that retains an open handle.
+起因：一个 hook 写死了 `python`，在只有 `python3` 的 Mac 上每轮都误报。安装脚本也用同样的做法，依次试运行候选解释器（`install.sh`）。
 
-Always run and review the plan before `install --apply` or `sync --apply`. First binding and explicit reacceptance of an invalid binding require the confirmation flag; later valid bound installs do not. `sync` materializes private state after ordinary Git synchronization and requires the exact `PLAN_HASH` printed by its dry-run. Removed desired paths remain as verified `retained` rows; retained drift blocks the whole plan, and uninstall never rewinds runtime bytes through an old install snapshot. Other real-machine environments remain pending acceptance.
+## 怎么工作
 
-## Current limits
+```text
+你的私有 Git 仓库
+├── engine/   程序本身，从这个公开仓库复制过去
+└── state/    你的规则、技能和经验台账
+      │
+      │  install / sync
+      ▼
+~/.claude 或 ~/.codex
+  CLAUDE.md 或 AGENTS.md（由规则生成）、技能、hook
+      │
+      │  你发消息时、Agent 调用工具前，hook 查台账
+      ▼
+命中的经验进入 Agent 的上下文
+```
 
-- C1 clean-tree acceptance in C2 covered 222 `missing` targets, install, 222 `identical` targets, conflict zero-write behavior, the public no-force boundary, and injected-failure restoration of original bytes, prior absence, and residue cleanup.
-- C2 acceptance includes live cutover on the current machine: 215 materializations classified as 7 `missing`, 150 `identical`, and 58 `conflict`, with `hook_conflict=0`; after the reviewed migration, all four installed wrapper commands returned zero, canonical bytes matched, and foreign hook fields were preserved.
-- The reviewed dev7 closeout accepted private Git propagation, receipt/byte parity, zero-write follow-up, and native Claude and Codex Desktop prompt delivery on the tested Mac. This is a sanitized summary of bounded evidence, not a dev11 live-installation result or a claim about arbitrary machines or app versions.
-- Current Windows Desktop automatic dispatch remains unproven. A registered hook or successful shell replay does not prove that a host emitted an event. PreToolUse context reaches a subsequent model request and cannot guard a tool call already selected.
-- Natural-work retrieval quality, reduced rework, and benefits exceeding lesson-maintenance costs remain unproven. Synthetic retrieval, rendered-evaluation fixtures, and shell-format demonstrations do not establish those outcomes.
-- Installation needs a clean reviewed private source window. Some Git failure diagnostics remain coarse. The release manifest binds content, not POSIX executable mode; delivery checks must also inspect required execution bits.
-- Historical transaction, migration, and uninstall modules remain frozen and outside the four-command public path. `docs/commands.json` is retained historical developer material, not a quickstart.
-- Every public update requires the [export/privacy/review gate](docs/PUBLICATION.md). Preparing a private workspace or passing the public gate does not activate this candidate in an existing runtime.
+- 规则和技能由 `sync` 写进 `~/.claude` 或 `~/.codex`。hook 每次都直接读私有仓库里的台账，所以 `git pull` 拉到新经验后，下一条消息就能用上，不用再 sync。
+- 你提交消息时，hook 看消息内容；Agent 调用工具前，hook 看要读写的文件路径和要执行的命令。
+- 检索是关键词匹配，不调用模型，也不用向量库。同样的输入总是得到同样的结果，`lessons match --explain` 能说明为什么命中。
 
-## Development safety
+## 日常怎么用
 
-Repository governance, transaction invariants, and privacy gates still protect retained implementation. Engine changes also require synchronized release-manifest and provenance governance before any commit or publication.
+agent-core 只有四个命令：`install` 安装或更新本机的程序和配置，`sync` 把私有仓库里的规则和技能写进 `~/.claude` 或 `~/.codex`，`doctor` 检查安装状态，`lessons` 记录、入库和检查经验。
 
-## License
+在 macOS 和 Linux 上，命令装在 `~/.local/share/agent-core/bin/agent-core`（设置了 `XDG_DATA_HOME` 时在它下面），不会自动加进 `PATH`。下面简写成 `agent-core`，并省略每条命令都要带的 `--config ~/.agent-core/host.json` 等参数。
 
-The engine source is licensed under Apache-2.0. Redistributions must preserve the notices required by `NOTICE`.
+1. **记下来**：Agent 犯了错、被你纠正后，让它运行 `agent-core lessons capture`，你也可以自己运行。结果是一条候选，放进 inbox 目录等你审核，还不会生效。Claude Code 每轮回答结束时，Stop hook 在满足条件时会自动补记一条候选，以防漏记。
+2. **审核入库**：`agent-core lessons promote` 先显示要写进台账的那一行。你确认无误后，带上预览给出的 `PLAN_HASH` 再执行一次。它只改本地文件并暂存；提交和推送由你自己做。
+3. **自动提醒**：之后你的消息或 Agent 的工具调用命中这条经验时，hook 就把它交给 Agent。
+4. **其他机器**：只改了经验时，`git pull` 后下一条消息就能用上。规则或技能有变化时运行 `agent-core sync`，同样先预览、再执行；程序本身更新时重新运行安装命令。install 只接受和远端 main 一致的干净仓库，所以运行前先提交改动，并处理 inbox 里的候选：入库、拒绝，或者暂时移到仓库外。
+
+`agent-core lessons retire --report` 报告每条经验的状态和现有证据，帮你判断哪些该补检查、哪些可以归档。完整命令见[经验的格式和流程](docs/LESSONS.md)。
+
+## 设计取舍
+
+- **不覆盖不属于它的文件。** `install` 和 `sync` 先列出计划，你确认后才写。目标位置已有内容不同、又不是它装的文件时，整份计划都不执行，并告诉你怎么处理。执行中途出错，会把已经写过的文件恢复原样；进程被强行终止时不保证这一点。
+- **只需要 Git。** 不调用模型，不用数据库，也没有服务端。多台机器之间只靠你自己的私有 Git 仓库同步。`doctor` 逐个检查本机装上的文件是否和仓库生成的内容一致。
+- **检索结果可以预测。** 先做 Unicode 规范化，中文按相邻两个字切分，再按关键词、文件路径、命令和任务类型匹配。代价是会漏掉同义词，常见词也会误触发。
+- **两个 Agent 用同一套 hook。** Claude Code 和 Codex 都在两个时点提醒：你提交消息时注入文本；Agent 调用工具前有命中时，通过 JSON 字段 `hookSpecificOutput.additionalContext` 注入。
+- **经验入库要你确认。** 程序不辨认操作的是人还是 Agent，它保证执行的内容和你预览过的一致：预览之后候选或台账有变化，执行会拒绝，要重新预览。写入台账后如果中断，重新预览再执行就能完成，不会写出重复的经验。
+
+## 快速开始
+
+需要 Python 3.11 或更新版本、Git 2.28 或更新版本、已经装好的 Claude Code 或 Codex，以及一个空的私有 Git 远端。只想在本机试用，可以用本地裸仓库代替远端。
+
+clone 这个仓库后，第一台机器 6 条命令：生成私有仓库，推送，安装，检查。第二台机器 clone 同一个私有仓库后再安装一次。步骤见[快速开始](docs/QUICKSTART.md)。
+
+- 已经有自己的 `CLAUDE.md` 或 `AGENTS.md` 时，安装会停下，不覆盖它。把内容并进私有仓库的 `state/rules/global.md`，移开原文件后再安装。`settings.json` 或 `hooks.json` 里已有的其他设置和 hook 会保留。
+- 快速开始每台机器配置一个 Agent。同一台机器两个都用时，在 `~/.agent-core/host.json` 的 `targets` 里放两项，写法见 `examples/host.example.json`。
+
+## 现状和限制
+
+- 这是作者自用的个人工具，版本 0.2。作者在 Mac 上日常使用；Linux 只在 CI 里跑过单元测试；Windows 上的完整流程还没有实测，桌面端 hook 能否自动触发也没有验证。
+- 检索是关键词匹配：会漏掉复数和同义词，常见词会误触发。
+- 它能不能真正减少返工，目前没有量化证据。
+- 这个公开仓库只有程序本身：它是作者私有仓库里 `engine/` 目录的导出，不含私有状态、本机配置、凭据、会话、缓存或本机路径，运行时也不依赖它。agent-core 不会替你推送，也不会把你的规则、经验和本机配置传到别处。hook 交给 Agent 的经验和你的其他输入一样，会进入 Agent 使用的模型上下文。
+
+## 文档
+
+- [快速开始](docs/QUICKSTART.md)：在第一台和第二台机器上安装。
+- [经验的格式和流程](docs/LESSONS.md)：每个字段的说明，记录、入库和退役检查的完整命令。
+- [设计取舍](docs/DESIGN.md)：为什么这样设计，信任边界，hook 的输入和输出。
+
+## 许可证
+
+Apache-2.0。再分发时须保留 `NOTICE` 中的声明。

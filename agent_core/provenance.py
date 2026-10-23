@@ -177,11 +177,6 @@ def _dirty(repo: Path) -> None:
         _fail("working tree dirty")
 
 
-def is_canonical_engine_layout(engine_root: Path) -> bool:
-    """Return whether this is exactly the canonical sibling engine root."""
-    return classify_engine_layout(engine_root) is EngineLayout.CANONICAL
-
-
 def validate_engine_provenance(engine_root: Path) -> EngineProvenance:
     """Validate the canonical engine record and its complete first-parent chain."""
     try:

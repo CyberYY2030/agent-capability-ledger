@@ -22,7 +22,7 @@ from agent_core.materializer import (
     publish_materialization_receipt,
     review_materialization,
 )
-from agent_core.promote import operation_lock
+from agent_core.lock import operation_lock
 from agent_core.doctor import (
     assert_repository_separation,
     assert_remote_role,
@@ -30,6 +30,8 @@ from agent_core.doctor import (
     run,
 )
 from agent_core.privacy import DEFAULT_MAX_BLOB_BYTES
+from tests.engine_fixture import create_engine_repo
+from tests.state_fixture import create_state_repo
 
 
 def git(repo: Path, *args: str) -> None:
@@ -448,35 +450,34 @@ def test_remote_role_marks_non_repository_engine_unverified_or_red(tmp_path: Pat
 
 
 def test_doctor_rejects_engine_implementation_in_state(tmp_path: Path) -> None:
-    engine = tmp_path / "engine"
-    engine.mkdir()
+    engine = create_engine_repo(tmp_path / "engine")
     state = tmp_path / "state"
+    create_state_repo(engine, state, git_name="Synthetic Doctor", git_email="doctor@example.invalid")
     implementation = state / "agent_core" / "cli.py"
     implementation.parent.mkdir(parents=True)
     implementation.write_text("raise SystemExit(0)\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="FAIL_STATE_CONTAINS_ENGINE"):
-        run(engine, tmp_path / "missing-host.json", state, None)
+        run(engine, tmp_path / "missing-host.json", state, None, workspace=tmp_path)
 
 
 def test_doctor_rejects_nested_engine_implementation_in_state(tmp_path: Path) -> None:
-    engine = tmp_path / "engine"
-    engine.mkdir()
+    engine = create_engine_repo(tmp_path / "engine")
     state = tmp_path / "state"
+    create_state_repo(engine, state, git_name="Synthetic Doctor", git_email="doctor@example.invalid")
     implementation = state / "agent-core" / "agent_core" / "cli.py"
     implementation.parent.mkdir(parents=True)
     implementation.write_text("raise SystemExit(0)\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="FAIL_STATE_CONTAINS_ENGINE") as caught:
-        run(engine, tmp_path / "missing-host.json", state, None)
+        run(engine, tmp_path / "missing-host.json", state, None, workspace=tmp_path)
     assert "agent-core/agent_core/cli.py" in str(caught.value).replace("\\", "/")
 
 
 def test_doctor_rejects_machine_identity_in_engine(tmp_path: Path) -> None:
-    engine = tmp_path / "engine"
-    engine.mkdir()
+    engine = create_engine_repo(tmp_path / "engine")
     private_label = "DESKTOP-" + "PRIVATE123"
     (engine / "notes.txt").write_text(private_label + "\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="FAIL_ENGINE_KNOWN_HOST_LABEL"):
-        run(engine, tmp_path / "missing-host.json", None, None)
+        run(engine, tmp_path / "missing-host.json", None, None, workspace=tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -491,11 +492,10 @@ def test_doctor_rejects_machine_identity_in_engine(tmp_path: Path) -> None:
 def test_doctor_surfaces_structural_engine_findings(
     tmp_path: Path, name: str, content: bytes, rule_id: str,
 ) -> None:
-    engine = tmp_path / "engine"
-    engine.mkdir()
+    engine = create_engine_repo(tmp_path / "engine")
     (engine / name).write_bytes(content)
     with pytest.raises(ConfigError, match="FAIL_ENGINE_PUBLIC_SCAN") as caught:
-        run(engine, tmp_path / "missing-host.json", None, None)
+        run(engine, tmp_path / "missing-host.json", None, None, workspace=tmp_path)
     assert rule_id in str(caught.value)
 
 

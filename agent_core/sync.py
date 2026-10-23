@@ -40,7 +40,7 @@ from .materializer import (
     restore_file_preimage,
     review_materialization,
 )
-from .promote import operation_lock
+from .lock import operation_lock
 
 
 @dataclass(frozen=True)
@@ -400,13 +400,24 @@ def _repository_review(
 
 
 def _plan_payload(
+    operations: list[Operation], config: dict, *, config_path: Path,
+    state_root: Path, control_root: Path,
+) -> dict[str, object]:
+    payload, _review = _plan_payload_with_review(
+        operations, config, config_path=config_path, state_root=state_root,
+        control_root=control_root,
+    )
+    return payload
+
+
+def _plan_payload_with_review(
     operations: list[Operation],
     config: dict,
     *,
     config_path: Path,
     state_root: Path,
     control_root: Path,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], MaterializationReview]:
     try:
         raw_config = config_path.read_bytes()
     except OSError as exc:
@@ -439,7 +450,7 @@ def _plan_payload(
         },
         "operations": _operation_payload(operations, config, review),
         "retained": list(review.retained),
-    }
+    }, review
 
 
 def _plan_hash(payload: dict[str, object]) -> str:
@@ -759,7 +770,7 @@ def execute(
             return output
         operations = collect_operations(engine_root, config, state_root)
         control_root = config_path.parent / "txn"
-        payload = _plan_payload(
+        payload, review = _plan_payload_with_review(
             operations, config, config_path=config_path, state_root=state_root,
             control_root=control_root,
         )
@@ -774,6 +785,11 @@ def execute(
             f"RETAIN target={item['target_id']} path={item['path']} status={item['status']}"
             for item in payload["retained"]
         )
+        if not ready:
+            output.extend(dict.fromkeys(
+                f"NEXT {status} {evidence}: {sentence}"
+                for status, evidence, sentence in review.causes
+            ))
         planned_writes = sum(
             item["action"] in {"WRITE", "MODE"} for item in payload["operations"]
         )

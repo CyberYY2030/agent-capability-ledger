@@ -7,15 +7,12 @@ from pathlib import Path
 import pytest
 
 from agent_core.config import ConfigError
-from agent_core.promote import create_candidate, plan_promote, plan_publish
 from agent_core.state import (
     apply_attach,
-    apply_init,
     binding_receipt_path,
-    plan_attach,
-    plan_init,
 )
 from agent_core.sync import execute as execute_sync
+from tests.state_fixture import create_state_repo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +42,7 @@ def host_config(tmp_path: Path, state_root: str = "<STATE>") -> Path:
 
 def initialized_state(tmp_path: Path, name: str = "state") -> Path:
     state = tmp_path / name
-    apply_init(ROOT, state, git_name="Synthetic Owner", git_email=TEST_EMAIL)
+    create_state_repo(ROOT, state, git_name="Synthetic Owner", git_email=TEST_EMAIL)
     return state
 
 
@@ -64,109 +61,20 @@ def attached_clone(tmp_path: Path) -> tuple[Path, Path]:
     return clone, remote
 
 
-def candidate(state: Path, control: Path) -> str:
-    path = create_candidate(
-        state,
-        control,
-        host="desk",
-        agent="codex",
-        rule="Keep state writes remotely synchronized.",
-        trigger="publishing or promoting state",
-        cost="divergent private ledgers",
-        sink="checks/state.md",
-        scope_hint="global",
-        evidence="synthetic:state-bootstrap",
-    )
-    return path.stem
-
-
-def test_state_init_plan_is_zero_write(tmp_path: Path) -> None:
-    target = tmp_path / "state"
-    before = set(tmp_path.iterdir())
-    lines = plan_init(ROOT, target)
-    assert lines[-1] == "DRY_RUN writes=0"
-    assert set(tmp_path.iterdir()) == before
-    assert not target.exists()
-
-
-def test_state_init_apply_creates_seeded_clean_main_repo(tmp_path: Path) -> None:
-    target = tmp_path / "state"
-    target.mkdir()
-    # State bootstrap remains an internal primitive; the public CLI freezes
-    # historical `state` commands before parsing or writing.
-    apply_init(ROOT, target, git_name="Synthetic Owner", git_email=TEST_EMAIL)
-    assert git(target, "branch", "--show-current").stdout.strip() == "main"
-    assert git(target, "status", "--porcelain").stdout == ""
-    assert git(target, "remote").stdout == ""
-    assert git(target, "config", "--local", "user.name").stdout.strip() == "Synthetic Owner"
-    assert git(target, "config", "--local", "user.email").stdout.strip() == TEST_EMAIL
-    assert (target / "experience" / "LESSONS.md").is_file()
-    assert (target / "experience" / "CASE_LAW.md").is_file()
-    assert (target / "experience" / "profiles" / "example-domain" / "LESSONS.md").is_file()
-    assert (target / "rules" / "global.md").is_file()
-    assert json.loads((target / "manifest.yaml").read_text(encoding="utf-8")) == {
-        "schema": "capability-manifest/1", "capabilities": [],
-    }
-    lock = json.loads((target / "agent-core.lock.json").read_text(encoding="utf-8"))
-    assert set(lock) == {"engine_version", "engine_source", "schema_version", "pinned_at"}
-    assert lock["schema_version"] == "lessons-ledger/2"
-    assert lock["engine_source"] == f"local@{lock['engine_version']}"
-    assert lock["pinned_at"].endswith("Z")
-
-
-def test_state_init_missing_identity_leaves_target_absent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    isolated_global = tmp_path / "empty-gitconfig"
-    isolated_global.write_text("", encoding="utf-8")
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(isolated_global))
-    missing_identity = tmp_path / "missing-identity"
-    with pytest.raises(ConfigError, match="FAIL_GIT_IDENTITY"):
-        apply_init(ROOT, missing_identity)
-    assert not missing_identity.exists()
-
-
-def test_state_init_injected_commit_failure_preserves_existing_empty_target(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-
-    existing_empty = tmp_path / "atomic"
-    existing_empty.mkdir()
-    monkeypatch.setattr(
-        "agent_core.state._commit_state",
-        lambda _repo: (_ for _ in ()).throw(ConfigError("INJECTED_COMMIT_FAILURE", "synthetic")),
-    )
-    with pytest.raises(ConfigError, match="INJECTED_COMMIT_FAILURE"):
-        apply_init(
-            ROOT, existing_empty,
-            git_name="Synthetic Owner", git_email=TEST_EMAIL,
-        )
-    assert existing_empty.is_dir()
-    assert list(existing_empty.iterdir()) == []
-    assert not list(tmp_path.glob(".state-bootstrap-*"))
-
-
 def test_state_attach_requires_explicit_private_confirmation(tmp_path: Path) -> None:
     clone, _remote = attached_clone(tmp_path)
     config = host_config(tmp_path)
     before = config.read_bytes()
     with pytest.raises(ConfigError, match="PRIVATE_REMOTE_CONFIRMATION_REQUIRED"):
-        plan_attach(clone, config, confirm_private_remote=False)
+        apply_attach(clone, config, confirm_private_remote=False)
     assert config.read_bytes() == before
     assert not binding_receipt_path(config).exists()
 
 
-def test_state_attach_plan_is_zero_write_and_apply_binds_valid_clone(tmp_path: Path) -> None:
+def test_state_attach_apply_binds_valid_clone(tmp_path: Path) -> None:
     clone, remote = attached_clone(tmp_path)
     config = host_config(tmp_path)
-    before = config.read_bytes()
     remote_ref_before = git(clone, "rev-parse", "origin/main").stdout.strip()
-    lines = plan_attach(clone, config, confirm_private_remote=True)
-    assert lines[-1] == "DRY_RUN writes=0"
-    assert config.read_bytes() == before
-    assert not binding_receipt_path(config).exists()
-    assert git(clone, "rev-parse", "origin/main").stdout.strip() == remote_ref_before
 
     result = apply_attach(clone, config, confirm_private_remote=True)
     assert result[-1].startswith("PASS revision=")
@@ -222,25 +130,13 @@ def test_state_attach_second_write_failure_restores_overlay_and_receipt(
     assert receipt_path.read_bytes() == previous_receipt
 
 
-def test_publish_without_fetchable_origin_is_remote_required(tmp_path: Path) -> None:
-    state = initialized_state(tmp_path)
-    item = candidate(state, tmp_path / "control")
-    with pytest.raises(ConfigError, match="REMOTE_REQUIRED"):
-        plan_publish(state, tmp_path / "control", item)
-
-
-def test_promote_without_fetchable_origin_is_remote_required(tmp_path: Path) -> None:
-    state = initialized_state(tmp_path)
-    item = candidate(state, tmp_path / "control")
-    with pytest.raises(ConfigError, match="REMOTE_REQUIRED"):
-        plan_promote(state, tmp_path / "control", item)
-
-
-def test_sync_apply_without_fetchable_origin_is_remote_required(tmp_path: Path) -> None:
+def test_sync_apply_without_fetchable_origin_is_remote_required(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     state = initialized_state(tmp_path)
     config = host_config(tmp_path, str(state))
     with pytest.raises(ConfigError, match="REMOTE_REQUIRED"):
         execute_sync(
-            ROOT, config, state, apply=True, require_versioned=True,
+            standalone_engine, config, state, apply=True, require_versioned=True,
             plan_hash="0" * 64,
         )

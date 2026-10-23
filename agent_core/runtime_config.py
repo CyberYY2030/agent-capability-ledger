@@ -168,36 +168,6 @@ def _replace_span(text: str, span: Span, value: Any) -> str:
     return text[:span.start] + _compact(value) + text[span.end:]
 
 
-def _remove_element(text: str, array_span: Span, index: int) -> str:
-    elements = _array_elements(text, array_span)
-    if index < 0 or index >= len(elements):
-        raise ConfigError("FAIL_RUNTIME_CONFIG", "owned hook index is missing")
-    target = elements[index]
-    if len(elements) == 1:
-        return text[:target.start] + text[target.end:]
-    if index < len(elements) - 1:
-        end = elements[index + 1].start
-        return text[:target.start] + text[end:]
-    start = elements[index - 1].end
-    return text[:start] + text[target.end:]
-
-
-def _remove_member(text: str, object_span: Span, key: str) -> str:
-    members = _object_members(text, object_span)
-    indexes = [index for index, item in enumerate(members) if item.key == key]
-    if len(indexes) != 1:
-        raise ConfigError("UNINSTALL_CONFLICT", f"owned JSON member differs: {key}")
-    index = indexes[0]
-    target = members[index]
-    start = target.key_span.start
-    end = target.value_span.end
-    if len(members) == 1:
-        return text[:start] + text[end:]
-    if index < len(members) - 1:
-        return text[:start] + text[members[index + 1].key_span.start:]
-    return text[:members[index - 1].value_span.end] + text[end:]
-
-
 def _powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -353,48 +323,6 @@ def merge_owned_hooks(
             "installed_value": desired_group,
         })
     return text.encode("utf-8"), {"hooks_created": hooks_created, "groups": records}, changed
-
-
-def remove_owned_hooks(current: bytes, ownership: dict[str, Any]) -> bytes:
-    text = current.decode("utf-8")
-    for record in reversed(ownership.get("groups", [])):
-        root = _root_span(text)
-        hooks_member = _member(text, root, "hooks")
-        if hooks_member is None:
-            raise ConfigError("UNINSTALL_CONFLICT", "hooks object missing")
-        event_member = _member(text, hooks_member.value_span, record["event"])
-        if event_member is None:
-            raise ConfigError("UNINSTALL_CONFLICT", f"event missing: {record['event']}")
-        elements = _array_elements(text, event_member.value_span)
-        matches = [
-            index for index, span in enumerate(elements)
-            if json.loads(text[span.start:span.end]) == record["installed_value"]
-        ]
-        if len(matches) != 1:
-            raise ConfigError("UNINSTALL_CONFLICT", f"owned hook changed: {record['event']}")
-        if record.get("original_exists") and record.get("original_value") == record.get("installed_value"):
-            continue
-        if record.get("original_exists"):
-            text = _replace_span(text, elements[matches[0]], record.get("original_value"))
-        else:
-            text = _remove_element(text, event_member.value_span, matches[0])
-        if record.get("event_created"):
-            root = _root_span(text)
-            hooks_member = _member(text, root, "hooks")
-            assert hooks_member is not None
-            event_member = _member(text, hooks_member.value_span, record["event"])
-            if event_member is None:
-                raise ConfigError("UNINSTALL_CONFLICT", f"owned event missing: {record['event']}")
-            if not _array_elements(text, event_member.value_span):
-                text = _remove_member(text, hooks_member.value_span, record["event"])
-    if ownership.get("hooks_created"):
-        root = _root_span(text)
-        hooks_member = _member(text, root, "hooks")
-        if hooks_member is None:
-            raise ConfigError("UNINSTALL_CONFLICT", "owned hooks object missing")
-        if not _object_members(text, hooks_member.value_span):
-            text = _remove_member(text, root, "hooks")
-    return text.encode("utf-8")
 
 
 def runtime_config_path(runtime: str, target_root: Path) -> Path:

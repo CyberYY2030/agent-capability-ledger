@@ -43,12 +43,11 @@ from .materializer import (
 from .doctor import hook_retrieval_status
 from .runtime_config import (
     merge_owned_hooks,
-    remove_owned_hooks,
     render_fragment,
     runtime_config_path,
     runtime_hook_path,
 )
-from .promote import operation_lock
+from .lock import operation_lock
 from . import state as state_module
 from .state import BindingEvidence, binding_receipt_path, validate_state_binding
 from .sync import collect_operations
@@ -124,6 +123,8 @@ class InstallPlan:
     remote_baseline_review: RemoteBaselineReview | None = None
     binding_config_bytes: bytes | None = None
     object_executable_preimages: tuple[bool | None, ...] = ()
+    block_reason: str | None = None
+    causes: tuple[tuple[str, str, str], ...] = ()
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -851,15 +852,22 @@ def _prepare_hook_bindings(
     plan: InstallPlan, previous: dict[str, Any] | None, *, force: bool,
 ) -> tuple[
     list[dict[str, Any]], bool, list[tuple[str, Path, str]], list[str],
+    list[tuple[str, str, str]],
 ]:
     previous_bindings = _receipt_hook_bindings(previous)
     expected = {item.target_id for item in plan.hook_bindings}
-    if set(previous_bindings) - expected:
-        raise ConfigError("INSTALL_CONFLICT", "runtime hook binding set changed; uninstall first")
+    removed = sorted(set(previous_bindings) - expected)
+    if removed:
+        raise ConfigError(
+            "INSTALL_CONFLICT",
+            f"runtime hook binding set changed (no longer configured: {', '.join(removed)}); "
+            f"restore those targets in host config before replanning: {plan.config_path}",
+        )
     records: list[dict[str, Any]] = []
     changed = previous is None
     statuses: list[tuple[str, Path, str]] = []
     conflicts: list[str] = []
+    causes: list[tuple[str, str, str]] = []
     for index, binding in enumerate(plan.hook_bindings):
         junction = getattr(binding.path, "is_junction", None)
         if os.path.lexists(binding.path) and (
@@ -871,6 +879,10 @@ def _prepare_hook_bindings(
             label = f"runtime-config:{binding.target_id}"
             statuses.append((label, binding.path, "conflict"))
             conflicts.append(label)
+            causes.append((
+                "foreign", "runtime-config",
+                f"not an ordinary file; move aside {binding.path}, then rerun the plan",
+            ))
             continue
         _assert_within(binding.path, binding.root)
         current = binding.path.read_bytes() if binding.path.is_file() else None
@@ -896,6 +908,11 @@ def _prepare_hook_bindings(
             label = f"runtime-config:{binding.target_id}"
             statuses.append((label, binding.path, "conflict"))
             conflicts.append(label)
+            causes.append((
+                "foreign", "runtime-config",
+                f"{exc}; keep a copy of {binding.path}, then remove the conflicting hook group "
+                "or move the file aside, and rerun the plan",
+            ))
             continue
         changed = changed or item_changed
         adopt_identical = (
@@ -922,7 +939,7 @@ def _prepare_hook_bindings(
             "content": merged,
             "before_content": current,
         })
-    return records, changed, statuses, conflicts
+    return records, changed, statuses, conflicts, causes
 
 
 def _validate_receipt_identity(plan: InstallPlan, previous: dict[str, Any] | None, objects: dict[str, dict[str, Any]]) -> None:
@@ -932,6 +949,7 @@ def _validate_receipt_identity(plan: InstallPlan, previous: dict[str, Any] | Non
     if not isinstance(previous["engine_version"], str):
         raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt engine version is invalid")
     expected = {str(item.path).casefold(): item for item in plan.objects}
+    stale: list[str] = []
     for key, recorded in objects.items():
         current = expected.get(key)
         if current is None:
@@ -941,7 +959,8 @@ def _validate_receipt_identity(plan: InstallPlan, previous: dict[str, Any] | Non
                 or recorded["label"].startswith("runtime:")
             ):
                 continue
-            raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt has an unexpected managed path")
+            stale.append(recorded["path"])
+            continue
         if (
             recorded["label"] != current.label
             or recorded["kind"] != current.kind
@@ -949,6 +968,13 @@ def _validate_receipt_identity(plan: InstallPlan, previous: dict[str, Any] | Non
             or Path(recorded["path"]).resolve() != current.path.resolve()
         ):
             raise ConfigError("FAIL_INSTALL_RECEIPT", "receipt managed identity differs from current plan")
+    if stale:
+        raise ConfigError(
+            "FAIL_INSTALL_RECEIPT",
+            f"receipt has an unexpected managed path ({', '.join(sorted(stale))}); restore the "
+            "previous install location, or move those files and the install receipt aside "
+            f"before replanning: {plan.receipt_path}",
+        )
 
 
 def _review_runtime_materialization(plan: InstallPlan) -> MaterializationReview:
@@ -980,31 +1006,32 @@ def _classify_install(
     plan: InstallPlan, *, force: bool,
 ) -> tuple[
     dict[str, Any] | None, bool, list[dict[str, Any]],
-    list[tuple[str, Path, str]], list[str],
+    list[tuple[str, Path, str]], list[str], str | None,
+    list[tuple[str, str, str]],
 ]:
+    receipt_cause = (
+        "indeterminate", "install-receipt",
+        f"fix the cause in BLOCK_REASON, or move aside {plan.receipt_path} "
+        "(keep a copy), then rerun the plan",
+    )
+    causes: list[tuple[str, str, str]] = []
     try:
         previous = _load_receipt(plan.receipt_path)
         previous_objects = _receipt_objects(previous)
         _validate_receipt_identity(plan, previous, previous_objects)
-    except ConfigError:
+    except ConfigError as exc:
         statuses = [(item.label, item.path, "indeterminate") for item in plan.objects]
-        return None, False, [], statuses, [item.label for item in plan.objects]
-    expected_keys = {str(item.path).casefold() for item in plan.objects}
-    if previous is not None:
-        retired = set(previous_objects) - expected_keys
-        allowed_retired = {
-            key for key in retired
-            if (
-                Path(previous_objects[key]["path"]).parent == plan.install_root / "engine"
-                or previous_objects[key]["label"].startswith("runtime:")
-            )
-        }
-        if retired != allowed_retired:
-            raise ConfigError("INSTALL_CONFLICT", "managed path set changed; uninstall first")
+        return None, False, [], statuses, [item.label for item in plan.objects], str(exc), [receipt_cause]
     try:
         materialization = _review_runtime_materialization(plan)
-    except ConfigError:
+    except ConfigError as exc:
         materialization = None
+        causes.append((
+            "indeterminate", "host-config",
+            f"{exc}; check {plan.config_path}, then rerun the plan",
+        ))
+    if materialization is not None:
+        causes.extend(cause for cause in materialization.causes if cause[1] != "target")
     materialized = {
         str(item["path"]).casefold(): item
         for item in (materialization.operations if materialization is not None else ())
@@ -1021,6 +1048,11 @@ def _classify_install(
         except ConfigError:
             statuses.append((item.label, item.path, "indeterminate"))
             conflicts.append(item.label)
+            kind = "file" if item.kind == "file" else "directory"
+            causes.append((
+                "indeterminate", "target",
+                f"cannot read {item.path} as an ordinary {kind}; move it aside, then rerun the plan",
+            ))
             continue
         old = previous_objects.get(str(item.path).casefold())
         if item.label.startswith("runtime:"):
@@ -1028,6 +1060,11 @@ def _classify_install(
             status = classified["status"] if classified is not None else "indeterminate"
             if status in {"foreign", "indeterminate"}:
                 conflicts.append(item.label)
+            if status == "foreign" and current is not None:
+                causes.append((
+                    "foreign", "target",
+                    f"preserve or move aside {item.path}, then rerun the plan",
+                ))
             no_changes = no_changes and status == "receipt-owned-identical"
             statuses.append((item.label, item.path, status))
             continue
@@ -1055,6 +1092,11 @@ def _classify_install(
         else:
             status = "foreign"
             conflicts.append(item.label)
+        if status == "foreign":
+            causes.append((
+                "foreign", "target",
+                f"preserve or move aside {item.path}, then rerun the plan",
+            ))
         statuses.append((item.label, item.path, status))
         no_changes = no_changes and status == "identical"
     if previous is not None and (
@@ -1063,10 +1105,10 @@ def _classify_install(
     ):
         no_changes = False
     try:
-        hook_bindings, hooks_changed, hook_statuses, hook_conflicts = _prepare_hook_bindings(
+        hook_bindings, hooks_changed, hook_statuses, hook_conflicts, hook_causes = _prepare_hook_bindings(
             plan, previous, force=force,
         )
-    except ConfigError:
+    except ConfigError as exc:
         invalid_statuses = [
             (item.label, item.path, "indeterminate") for item in plan.objects
         ]
@@ -1076,7 +1118,8 @@ def _classify_install(
         )
         return None, False, [], invalid_statuses, [
             label for label, _path, _status in invalid_statuses
-        ]
+        ], str(exc), [receipt_cause]
+    causes.extend(hook_causes)
     for label, path, status in hook_statuses:
         if status == "conflict":
             statuses.append((label, path, "foreign"))
@@ -1090,25 +1133,16 @@ def _classify_install(
             if item.label.startswith("runtime:") and item.label not in conflicts:
                 conflicts.append(item.label)
     no_changes = no_changes and not hooks_changed
-    return previous, no_changes, hook_bindings, statuses, conflicts
-
-
-def _preflight(
-    plan: InstallPlan, *, force: bool,
-) -> tuple[dict[str, Any] | None, bool, list[dict[str, Any]]]:
-    previous, no_changes, hook_bindings, _statuses, conflicts = _classify_install(
-        plan, force=force,
-    )
-    if conflicts:
-        raise ConfigError("INSTALL_CONFLICT", "install plan ready=false")
-    return previous, no_changes, hook_bindings
+    return previous, no_changes, hook_bindings, statuses, conflicts, None, causes
 
 
 def _reviewed_install_plan(
     plan: InstallPlan,
 ) -> tuple[InstallPlan, dict[str, Any] | None, bool, list[dict[str, Any]], list[tuple[str, Path, str]], list[str]]:
     """Freeze every fact that gives install authority; callers never print payload."""
-    previous, no_changes, hook_bindings, statuses, conflicts = _classify_install(plan, force=False)
+    previous, no_changes, hook_bindings, statuses, conflicts, block_reason, causes = _classify_install(
+        plan, force=False,
+    )
     object_preimages: list[str | None] = []
     object_executable_preimages: list[bool | None] = []
     for item in plan.objects:
@@ -1129,9 +1163,15 @@ def _reviewed_install_plan(
             hook_preimages.append(None)
     try:
         receipt_exists, receipt_sha256 = _raw_file_sha256(plan.receipt_path)
-    except ConfigError:
+    except ConfigError as exc:
         receipt_exists, receipt_sha256 = True, None
         conflicts.append("install-receipt")
+        block_reason = block_reason or str(exc)
+        causes.append((
+            "indeterminate", "install-receipt",
+            f"fix the cause in BLOCK_REASON, or move aside {plan.receipt_path} "
+            "(keep a copy), then rerun the plan",
+        ))
     try:
         config_exists, config_sha256 = _raw_file_sha256(plan.config_path)
         manifest_exists, manifest_sha256 = _raw_file_sha256(plan.artifact_manifest_path or (plan.source_root / "release-manifest.json"))
@@ -1248,6 +1288,7 @@ def _reviewed_install_plan(
         materialization_review=materialization,
         remote_baseline_review=remote_baseline,
         object_executable_preimages=tuple(object_executable_preimages),
+        block_reason=block_reason, causes=tuple(causes),
     )
     return reviewed, previous, no_changes, hook_bindings, statuses, conflicts
 
@@ -1262,7 +1303,8 @@ def _assert_reviewed_plan_current(plan: InstallPlan) -> tuple[InstallPlan, dict[
     if plan.plan_hash and reviewed.plan_hash != plan.plan_hash:
         raise ConfigError("FAIL_PLAN_HASH", "install inputs changed after reviewed plan")
     if conflicts:
-        raise ConfigError("INSTALL_CONFLICT", "install plan ready=false")
+        reason = f"; {reviewed.block_reason}" if reviewed.block_reason else ""
+        raise ConfigError("INSTALL_CONFLICT", f"install plan ready=false{reason}")
     return reviewed, previous, no_changes, hook_bindings
 
 
@@ -1319,6 +1361,26 @@ def plan_install(
     binding_receipt_override: bytes | None = None,
     confirm_private_remote: bool = False,
 ) -> list[str]:
+    lines, _plan_hash = _plan_install(
+        engine_root, config_path, explicit_state, source_root, manifest_path,
+        expected_version=expected_version,
+        binding_receipt_override=binding_receipt_override,
+        confirm_private_remote=confirm_private_remote,
+    )
+    return lines
+
+
+def _plan_install(
+    engine_root: Path,
+    config_path: Path,
+    explicit_state: Path | None,
+    source_root: Path,
+    manifest_path: Path | None,
+    *,
+    expected_version: str | None = None,
+    binding_receipt_override: bytes | None = None,
+    confirm_private_remote: bool = False,
+) -> tuple[list[str], str | None]:
     pending = _read_pending(config_path)
     if pending is not None:
         raise ConfigError(
@@ -1341,6 +1403,7 @@ def plan_install(
     lines = [
         f"PLAN operation=install version={plan.artifact.version}",
         f"PLAN artifact_sha256={plan.artifact.artifact_sha256}",
+        f"PLAN source={plan.source_root}",
     ]
     if plan.binding_pending:
         lines.append("BINDING_REFRESH pending=true")
@@ -1361,6 +1424,13 @@ def plan_install(
             f"exists={'true' if item.exists else 'false'} sha256={item.sha256 or 'none'} "
             f"last_known_good={item.last_known_good or 'none'} path={item.path}"
         )
+    if plan.block_reason:
+        lines.append(f"BLOCK_REASON {plan.block_reason}")
+    if conflicts:
+        lines.extend(dict.fromkeys(
+            f"NEXT {status} {evidence}: {sentence}"
+            for status, evidence, sentence in plan.causes
+        ))
     if not conflicts:
         lines.append(f"EXPECTED_REMOTE_SHA {plan.binding.remote_revision}")
         lines.append(f"PLAN_HASH {plan.plan_hash}")
@@ -1368,7 +1438,7 @@ def plan_install(
         f"DRY_RUN writes=0 ready={'false' if conflicts else 'true'} "
         f"no_changes={'true' if no_changes else 'false'}"
     )
-    return lines
+    return lines, None if conflicts else plan.plan_hash
 
 
 def _copy_path(source: Path, destination: Path, kind: str) -> None:
@@ -2344,127 +2414,27 @@ def _apply_install_plan(
     ]
 
 
-def _uninstall_plan(
+def _resolve_source(
+    engine_root: Path,
     config_path: Path,
-) -> tuple[Path, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    config = load_config(config_path.resolve())
-    install_root = user_data_root()
-    allowed_roots = {str(install_root).casefold()}
-    allowed_roots.update(
-        str(Path(target["root"]).expanduser().resolve()).casefold()
-        for target in config["targets"]
-    )
-    receipt_path = config_path.resolve().parent / "install-receipt.json"
-    receipt = _load_receipt(receipt_path, required=True)
-    assert receipt is not None
-    all_objects = list(_receipt_objects(receipt).values())
-    retained = [item for item in all_objects if item["label"].startswith("runtime:")]
-    objects = [item for item in all_objects if not item["label"].startswith("runtime:")]
-    hook_bindings = list(_receipt_hook_bindings(receipt).values())
-    for item in all_objects:
-        path = Path(item["path"])
-        root = Path(item["root"])
-        if str(root.resolve()).casefold() not in allowed_roots:
-            raise ConfigError("FAIL_INSTALL_RECEIPT", f"unapproved managed root: {root}")
-        _assert_within(path, root)
-        actual = _path_hash(path, item["kind"])
-        if not item["label"].startswith("runtime:") and actual != item["installed_sha256"]:
-            raise ConfigError("UNINSTALL_CONFLICT", f"modified managed object: {path}")
-    expected_targets = {
-        target["id"]: (
-            target["runtime"], Path(target["root"]).expanduser().resolve(),
-        )
-        for target in config["targets"] if target["runtime"] in {"claude-code", "codex"}
-    }
-    if set(expected_targets) != {item["target_id"] for item in hook_bindings}:
-        raise ConfigError("FAIL_INSTALL_RECEIPT", "runtime hook target set differs")
-    for item in hook_bindings:
-        path = Path(item["path"])
-        root = Path(item["root"])
-        expected_runtime, expected_root = expected_targets[item["target_id"]]
-        expected_path = runtime_config_path(expected_runtime, expected_root)
-        if (
-            item["runtime"] != expected_runtime or root.resolve() != expected_root
-            or path.resolve() != expected_path.resolve()
-        ):
-            raise ConfigError("FAIL_INSTALL_RECEIPT", f"runtime hook identity differs: {item['target_id']}")
-        if str(root.resolve()).casefold() not in allowed_roots:
-            raise ConfigError("FAIL_INSTALL_RECEIPT", f"unapproved runtime root: {root}")
-        _assert_within(path, root)
-        if not path.is_file():
-            raise ConfigError("UNINSTALL_CONFLICT", f"runtime config missing: {path}")
-        remove_owned_hooks(path.read_bytes(), item["ownership"])
-    snapshot = Path(receipt["snapshot_path"])
-    rollback_root = config_path.resolve().parent / "rollback"
-    _assert_within(snapshot, rollback_root)
-    if not (snapshot / "snapshot.json").is_file():
-        raise ConfigError("FAIL_INSTALL_RECEIPT", f"missing snapshot: {snapshot}")
-    snapshot_manifest = _load_json(snapshot / "snapshot.json", "FAIL_INSTALL_RECEIPT")
-    snapshot_objects = [
-        {
-            key: value for key, value in item.items()
-            if key not in {"before_executable", "installed_executable"}
-        }
-        for item in snapshot_manifest.get("objects", [])
-        if isinstance(item, dict)
-    ]
-    if (
-        set(snapshot_manifest) not in ({"schema", "objects", "hook_bindings"}, {"schema", "objects", "hook_bindings", "host_records"})
-        or snapshot_manifest.get("schema") != SNAPSHOT_SCHEMA
-        or snapshot_objects != receipt["objects"]
-        or snapshot_manifest.get("hook_bindings") != receipt["hook_bindings"]
-    ):
-        raise ConfigError("FAIL_INSTALL_RECEIPT", "snapshot manifest differs from receipt")
-    all_objects = list(snapshot_manifest["objects"])
-    retained = [item for item in all_objects if item["label"].startswith("runtime:")]
-    objects = [item for item in all_objects if not item["label"].startswith("runtime:")]
-    for item in all_objects:
-        if not item["before_exists"]:
-            continue
-        snapshotted = snapshot / item["snapshot_rel"]
-        if _path_hash(snapshotted, item["kind"]) != item["before_sha256"]:
-            raise ConfigError("FAIL_INSTALL_RECEIPT", f"snapshot hash differs: {item['path']}")
-    for item in hook_bindings:
-        if not item["before_exists"]:
-            continue
-        snapshotted = snapshot / item["snapshot_rel"]
-        if not snapshotted.is_file() or _sha256(snapshotted.read_bytes()) != item["before_sha256"]:
-            raise ConfigError("FAIL_INSTALL_RECEIPT", f"runtime snapshot hash differs: {item['path']}")
-    return receipt_path, receipt, objects, retained, hook_bindings
-
-
-def plan_uninstall(config_path: Path) -> list[str]:
-    _receipt_path, receipt, objects, retained, hook_bindings = _uninstall_plan(config_path)
-    lines = [f"PLAN operation=uninstall version={receipt['engine_version']}"]
-    lines.extend(f"TARGET remove-or-restore path={item['path']}" for item in objects)
-    lines.extend(f"RETAIN path={item['path']}" for item in retained)
-    lines.extend(f"TARGET remove-hook-binding path={item['path']}" for item in hook_bindings)
-    lines.append("DRY_RUN writes=0")
-    return lines
-
-
-def apply_uninstall(config_path: Path) -> list[str]:
-    receipt_path, receipt, objects, retained, hook_bindings = _uninstall_plan(config_path)
-    snapshot = Path(receipt["snapshot_path"])
-    for item in hook_bindings:
-        path = Path(item["path"])
-        cleaned = remove_owned_hooks(path.read_bytes(), item["ownership"])
-        if not item["before_exists"] and json.loads(cleaned) == {}:
-            path.unlink()
-        else:
-            _atomic_write(path, cleaned)
-    _restore(snapshot, objects)
-    previous_receipt = snapshot / "previous-receipt.json"
-    if previous_receipt.is_file():
-        _atomic_write(receipt_path, previous_receipt.read_bytes())
-    else:
-        receipt_path.unlink()
-    shutil.rmtree(snapshot)
-    return [
-        *(f"RETAIN path={item['path']}" for item in retained),
-        f"APPLIED uninstall objects={len(objects)} retained={len(retained)} hook_bindings={len(hook_bindings)}",
-        "PASS uninstall",
-    ]
+    explicit_state: Path | None,
+    explicit_source: Path | None,
+) -> Path:
+    if explicit_source is not None:
+        return explicit_source.resolve()
+    state_root = explicit_state
+    if state_root is None:
+        try:
+            configured = load_config(config_path)["state_root"]
+        except ConfigError:
+            configured = None
+        if configured and not (configured.startswith("<") and configured.endswith(">")):
+            state_root = Path(configured)
+    if state_root is not None:
+        candidate = state_root.expanduser().resolve().parent / "engine"
+        if (candidate / "release-manifest.json").is_file():
+            return candidate
+    return engine_root
 
 
 def _parser(engine_root: Path) -> argparse.ArgumentParser:
@@ -2473,14 +2443,11 @@ def _parser(engine_root: Path) -> argparse.ArgumentParser:
     install = commands.add_parser("install")
     install.add_argument("--config", type=Path, required=True)
     install.add_argument("--state", type=Path)
-    install.add_argument("--source", type=Path, default=engine_root)
+    install.add_argument("--source", type=Path, default=None)
     install.add_argument("--artifact-manifest", type=Path)
     install.add_argument("--confirm-private-remote", action="store_true")
     install.add_argument("--apply", action="store_true")
     install.add_argument("--plan-hash")
-    uninstall = commands.add_parser("uninstall")
-    uninstall.add_argument("--config", type=Path, required=True)
-    uninstall.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -2496,16 +2463,30 @@ def main(
                 raise ConfigError("FAIL_PLAN_HASH", "install plan hash requires --apply")
             if args.apply and not args.plan_hash:
                 raise ConfigError("FAIL_PLAN_HASH", "install --apply requires a reviewed plan hash")
-            lines = apply_install(
-                root, args.config, args.state, args.source, args.artifact_manifest,
-                force=False, confirm_private_remote=args.confirm_private_remote,
-                plan_hash=args.plan_hash,
-            ) if args.apply else plan_install(
-                root, args.config, args.state, args.source, args.artifact_manifest,
-                confirm_private_remote=args.confirm_private_remote,
-            )
-        else:
-            lines = apply_uninstall(args.config) if args.apply else plan_uninstall(args.config)
+            source_root = _resolve_source(root, args.config, args.state, args.source)
+            if args.apply:
+                lines = apply_install(
+                    root, args.config, args.state, source_root, args.artifact_manifest,
+                    force=False, confirm_private_remote=args.confirm_private_remote,
+                    plan_hash=args.plan_hash,
+                )
+            else:
+                lines, plan_hash = _plan_install(
+                    root, args.config, args.state, source_root, args.artifact_manifest,
+                    confirm_private_remote=args.confirm_private_remote,
+                )
+                print(*lines, sep="\n")
+                if plan_hash is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
+                    return 0
+                print("确认执行？[y/N] ", end="", flush=True)
+                if sys.stdin.readline().strip().lower() not in {"y", "yes"}:
+                    print("CANCELLED writes=0")
+                    return 1
+                lines = apply_install(
+                    root, args.config, args.state, source_root, args.artifact_manifest,
+                    force=False, confirm_private_remote=args.confirm_private_remote,
+                    plan_hash=plan_hash,
+                )
         print(*lines, sep="\n")
         return 0
     except ConfigError as exc:

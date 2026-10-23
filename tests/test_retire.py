@@ -11,7 +11,6 @@ import pytest
 
 from agent_core.cli import main as cli_main
 from agent_core.config import ConfigError
-from agent_core.promote import plan_advance
 from agent_core.retire import inspect_lifecycle, verify_receipt
 
 
@@ -254,13 +253,15 @@ def test_lessons_retire_cli_succeeds_and_frozen_promote_preserves_state(tmp_path
         for path in evidence_root.rglob("*") if path.is_file()
     } if evidence_root.exists() else {}
 
-    assert cli_main([
-        "promote", "--state", str(alpha), "--control-root", str(control),
-        "--advance", "L-1", "--evidence-receipt", str(receipt), "--apply",
-    ]) == 2
-    frozen = capsys.readouterr()
-    assert frozen.out == ""
-    assert frozen.err == "FAIL_COMMAND_FROZEN promote\n"
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main([
+            "promote", "--state", str(alpha), "--control-root", str(control),
+            "--advance", "L-1", "--evidence-receipt", str(receipt), "--apply",
+        ])
+    assert exc_info.value.code == 2
+    rejected = capsys.readouterr()
+    assert rejected.out == ""
+    assert "invalid choice: 'promote'" in rejected.err
     assert git(alpha, "rev-parse", "HEAD").stdout.strip() == before_head
     assert ledger.read_bytes() == before_ledger
     after_evidence = {
@@ -268,61 +269,3 @@ def test_lessons_retire_cli_succeeds_and_frozen_promote_preserves_state(tmp_path
         for path in evidence_root.rglob("*") if path.is_file()
     } if evidence_root.exists() else {}
     assert after_evidence == before_evidence
-
-
-def test_advance_rejects_tampered_receipt_before_transaction(tmp_path: Path) -> None:
-    alpha, _beta, _remote = init_remote_state(tmp_path)
-    control = tmp_path / "control"
-    receipt = verify_once(alpha, control)
-    receipt.write_text(receipt.read_text(encoding="utf-8") + " ", encoding="utf-8")
-    with pytest.raises(ConfigError, match="FAIL_EVIDENCE_HASH"):
-        plan_advance(alpha, control, "L-1", receipt)
-
-
-def test_advance_rejects_status_mismatch(tmp_path: Path) -> None:
-    alpha, _beta, _remote = init_remote_state(tmp_path)
-    control = tmp_path / "control"
-    receipt = verify_once(alpha, control)
-    ledger = alpha / "experience" / "LESSONS.md"
-    ledger.write_text(
-        ledger.read_text(encoding="utf-8").replace("[checklist·通用]", "[pending·通用]", 1),
-        encoding="utf-8",
-    )
-    git(alpha, "add", "experience/LESSONS.md")
-    git(alpha, "commit", "-q", "-m", "change lesson status")
-    git(alpha, "push", "-q", "origin", "main")
-    assert verify_receipt(
-        alpha, receipt, expected_lesson_id="L-1", expected_hash=receipt.stem,
-    ).fresh
-    with pytest.raises(ConfigError, match="FAIL_EVIDENCE_STATUS"):
-        plan_advance(alpha, control, "L-1", receipt)
-
-
-def test_advance_rejects_verifier_mismatch(tmp_path: Path) -> None:
-    alpha, _beta, _remote = init_remote_state(tmp_path)
-    control = tmp_path / "control"
-    manifest = alpha / "enforcement" / "verifiers.json"
-    payload = json.loads(manifest.read_text(encoding="utf-8"))
-    alternate = dict(payload["verifiers"][0])
-    alternate["id"] = "alternate-contract"
-    payload["verifiers"].append(alternate)
-    manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    git(alpha, "add", "enforcement/verifiers.json")
-    git(alpha, "commit", "-q", "-m", "add alternate verifier")
-    git(alpha, "push", "-q", "origin", "main")
-    receipt = verify_once(alpha, control)
-    ledger = alpha / "experience" / "LESSONS.md"
-    ledger.write_text(
-        ledger.read_text(encoding="utf-8").replace(
-            "verifier: synthetic-contract", "verifier: alternate-contract", 1,
-        ),
-        encoding="utf-8",
-    )
-    git(alpha, "add", "experience/LESSONS.md")
-    git(alpha, "commit", "-q", "-m", "change lesson verifier")
-    git(alpha, "push", "-q", "origin", "main")
-    assert verify_receipt(
-        alpha, receipt, expected_lesson_id="L-1", expected_hash=receipt.stem,
-    ).fresh
-    with pytest.raises(ConfigError, match="FAIL_EVIDENCE_VERIFIER"):
-        plan_advance(alpha, control, "L-1", receipt)

@@ -13,21 +13,6 @@ from .sync import execute as execute_sync
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]
-FROZEN_TOP_LEVEL_COMMANDS = frozenset({
-    "candidate",
-    "check",
-    "docs",
-    "fingerprint",
-    "manifest",
-    "migrate",
-    "parity",
-    "privacy",
-    "promote",
-    "recover",
-    "rollback",
-    "state",
-    "uninstall",
-})
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -63,12 +48,6 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    frozen_command = "engine upgrade" if argv[:2] == ["engine", "upgrade"] else (
-        argv[0] if argv and argv[0] in FROZEN_TOP_LEVEL_COMMANDS else None
-    )
-    if frozen_command is not None:
-        print(f"FAIL_COMMAND_FROZEN {frozen_command}", file=sys.stderr)
-        return 2
     if argv[:2] == ["lessons", "retire"]:
         return retire.main(argv[2:])
     if argv[:2] == ["lessons", "capture"]:

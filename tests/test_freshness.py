@@ -11,8 +11,9 @@ from agent_core import freshness as freshness_module
 from agent_core.config import ConfigError
 from agent_core.doctor import check_remote_parity, run as run_doctor
 from agent_core.freshness import migrate_legacy_remote_state, record_remote_head, require_fresh
-from agent_core.promote import operation_lock
+from agent_core.lock import operation_lock
 from agent_core.sync import execute as execute_sync
+from tests.engine_fixture import create_engine_repo
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -310,8 +311,8 @@ def test_schema_valid_untracked_inbox_is_the_only_dirty_exception(tmp_path: Path
         require_fresh(clone, "promote", control)
 
 
-def test_offline_sync_apply_is_rejected(tmp_path: Path) -> None:
-    root = Path(__file__).resolve().parents[1]
+def test_offline_sync_apply_is_rejected(standalone_engine: Path, tmp_path: Path) -> None:
+    root = standalone_engine
     fixtures = root / "tests" / "fixtures" / "ac1"
     state = tmp_path / "state"
     shutil.copytree(fixtures / "state", state)
@@ -339,8 +340,8 @@ def test_offline_sync_apply_is_rejected(tmp_path: Path) -> None:
         execute_sync(root, config, state, apply=True, plan_hash=token)
 
 
-def test_product_sync_rejects_an_unversioned_state(tmp_path: Path) -> None:
-    root = Path(__file__).resolve().parents[1]
+def test_product_sync_rejects_an_unversioned_state(standalone_engine: Path, tmp_path: Path) -> None:
+    root = standalone_engine
     fixtures = root / "tests" / "fixtures" / "ac1"
     state = tmp_path / "state"
     shutil.copytree(fixtures / "state", state)
@@ -358,7 +359,7 @@ def test_product_sync_rejects_an_unversioned_state(tmp_path: Path) -> None:
 
 
 def test_sync_and_doctor_consume_healthy_remote_parity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = create_engine_repo(tmp_path / "engine")
     fixtures = root / "tests" / "fixtures" / "ac1"
     state = tmp_path / "state"
     shutil.copytree(fixtures / "state", state)
@@ -383,13 +384,15 @@ def test_sync_and_doctor_consume_healthy_remote_parity(tmp_path: Path, monkeypat
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
 
     assert any(line.startswith("APPLIED ") for line in reviewed_sync(root, config, state))
-    lines = run_doctor(root, config, state, state / "manifest.yaml")
+    lines = run_doctor(root, config, state, state / "manifest.yaml", workspace=tmp_path)
     assert any(line.startswith("PASS git_remote_parity=") for line in lines)
 
 
-def test_sync_reviewed_remote_revision_drift_writes_nothing(tmp_path: Path) -> None:
+def test_sync_reviewed_remote_revision_drift_writes_nothing(
+    standalone_engine: Path, tmp_path: Path,
+) -> None:
     _remote, seed, clone = repository(tmp_path)
-    root = Path(__file__).resolve().parents[1]
+    root = standalone_engine
     fixtures = root / "tests" / "fixtures" / "ac1"
     shutil.copytree(fixtures / "state", clone, dirs_exist_ok=True)
     shutil.copy2(fixtures / "manifests" / "valid-state.json", clone / "manifest.yaml")

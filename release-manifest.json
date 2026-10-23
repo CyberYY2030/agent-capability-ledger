@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "Zh5ToTIpNLs0T4hmcVaLlZVk936gNR6mUo0VayKaThc",
+  "artifact_sha256": "nM9rCezdJzoRnrQ8iTYpEqgkG4o-oWuu3YRV8spf-jg",
   "files": [
     {
       "path": "LICENSE",
@@ -11,31 +11,27 @@
     },
     {
       "path": "agent_core/__init__.py",
-      "sha256": "qe533swggxaTiqRzVU8d1QeHSW_KLxPN6evg5ebWKAI"
+      "sha256": "y3snwf1Ab5OI_ueQg-RdsGFWkDnQkD6UXTuZQ_cGow8"
+    },
+    {
+      "path": "agent_core/candidates.py",
+      "sha256": "P97vR9p2vea7qKzpcaWbOvTLoIlw4DEKyr65Qma1pRc"
     },
     {
       "path": "agent_core/capture.py",
-      "sha256": "jCz0BRgXIF-Y6nksf7g_MMtg8EsAR7F8u5J_YoVbh3w"
+      "sha256": "ZPDjLrAFo_UFbcBxepM47CkK2SrWzDqpzBU1hketo8o"
     },
     {
       "path": "agent_core/cli.py",
-      "sha256": "h7eueCFAHk4KoqXehlvKGaTdv7Fb8CGOanVlhb2oVc4"
+      "sha256": "ihUM0YswyDZNx3r0whQC_aSbYQ_-ooYZcDenEwJIR4M"
     },
     {
       "path": "agent_core/config.py",
       "sha256": "9CFJR5dTpIUk6m2InbT1ohVqu1Jo6oDfov8U0yyen7A"
     },
     {
-      "path": "agent_core/docs_contract.py",
-      "sha256": "ysYn4XZwQ73uQQJ99BUVnCLlsqQrC9X9NA-uhlxrE6o"
-    },
-    {
       "path": "agent_core/doctor.py",
       "sha256": "MrPj6AQfXpatCYqad9hhcJoUi9K6NsUSbY2va-kMRkg"
-    },
-    {
-      "path": "agent_core/fingerprint.py",
-      "sha256": "zwrHLWlrfFvDfIbEvEMMlgyuNZFYqgvbvORp1SZwwVA"
     },
     {
       "path": "agent_core/freshness.py",
@@ -43,15 +39,23 @@
     },
     {
       "path": "agent_core/installer.py",
-      "sha256": "d-vsaJAzlIMDqMq4xCKZCFxlOD-o4qBHHDlIPV6r4DI"
+      "sha256": "6RJ3DoTPsyWKVtBL_9EIX0T6hGB3eOb_FprqAhDJSEw"
     },
     {
       "path": "agent_core/launcher.py",
-      "sha256": "6FIj1mapT9_ts7qN0i8nktHgc_8shyKwXH7w6RPvPLQ"
+      "sha256": "kyyaSQlhCDjIvW_ec1EwU4XLgYy-QrmMUdrlZw0hbf0"
     },
     {
       "path": "agent_core/ledger.py",
       "sha256": "bTp92mrXScZNHQ_SgDPdDiHd0qcpq77DQu29BGLivow"
+    },
+    {
+      "path": "agent_core/local_promote.py",
+      "sha256": "NZBd8rGrDw0sksP2EBL70YPuy-OOND23VHzPjW_jzaE"
+    },
+    {
+      "path": "agent_core/lock.py",
+      "sha256": "5FEQ88mcaftxh5OgmeLbyW0cUkAvJf7WygVSz__SrFE"
     },
     {
       "path": "agent_core/match.py",
@@ -59,15 +63,11 @@
     },
     {
       "path": "agent_core/materializer.py",
-      "sha256": "84CddfFUPxRM3HAFg4ONGvjKVshayHWlNFYE46aGDgE"
-    },
-    {
-      "path": "agent_core/migrate.py",
-      "sha256": "fPIrTYPpmd14dRHtKR9RQgPskfbTM1oxjKJzj_7lYFw"
+      "sha256": "3ckQ9dhNsktl6mrzNyqkw2Fq5BI_UvsdL_qH7CJ9nFc"
     },
     {
       "path": "agent_core/privacy.py",
-      "sha256": "BBTAa9B6S61vpmY1OwX5snd9inEzaiCa1-_EvxwQAOQ"
+      "sha256": "_ziGtQ4Pu3ImqQushPHiSOczXyAFeMt_kGkfLrFlMRY"
     },
     {
       "path": "agent_core/project.py",
@@ -75,19 +75,15 @@
     },
     {
       "path": "agent_core/project_promote.py",
-      "sha256": "YHdkZpxFnY8yZynMBCRpiUBDrSQwOexUoYkj2S4mOW0"
-    },
-    {
-      "path": "agent_core/promote.py",
-      "sha256": "zlTyQvHG7MO7_zVTPyQUszqCjzDESen6m1m0xP7XRMs"
+      "sha256": "vdAz-LkEbFE51b_Mss8Qae9Hi3P9T_Eg7EPnrG8gzFY"
     },
     {
       "path": "agent_core/provenance.py",
-      "sha256": "ILRApDqK5XnupQJ04L_MwxnyanQnym9KeCsmWB74MVQ"
+      "sha256": "B7O3tjLn3K9SL2VVw8xd26FtWPaJ_z0Z0piJnVswQpY"
     },
     {
       "path": "agent_core/reject.py",
-      "sha256": "fvvmrnm5OuoRamZNMl2d7cu1_3h-IbP6W7uTnRGQJBo"
+      "sha256": "aUUjToYXh3TSWDNWRlgwnOUiieqnHq8-wYDqNljl1dY"
     },
     {
       "path": "agent_core/repository.py",
@@ -95,11 +91,11 @@
     },
     {
       "path": "agent_core/retire.py",
-      "sha256": "aZh54FEbycRmVwKeFmLgAEAcA4CrGts8mGrD2_9WLLE"
+      "sha256": "wDr2aEgzWo7avk61ZpS-uigcD-1ATILojV3m-10Mnzo"
     },
     {
       "path": "agent_core/runtime_config.py",
-      "sha256": "7x3CTmndd9f0Ug8D1LW9Qbopof7IzqRbwP_2tt22v5s"
+      "sha256": "PPXus9mxxx54O5D53DXzyPMLiNET09otKIvdINBy8t8"
     },
     {
       "path": "agent_core/schema/agent-core-lock-1.json",
@@ -108,10 +104,6 @@
     {
       "path": "agent_core/schema/agent-core.config-1.json",
       "sha256": "R97Ia_n0lqC37siGYNb6P0-pVDFyU1wJocPs8vZU1qQ"
-    },
-    {
-      "path": "agent_core/schema/capability-fingerprint-1.json",
-      "sha256": "v_F1L0Zf6Ybh7CJbHGcTOiVMeHl0U3GAGW9YPqaRrDQ"
     },
     {
       "path": "agent_core/schema/capability-manifest-1.json",
@@ -167,7 +159,7 @@
     },
     {
       "path": "agent_core/state.py",
-      "sha256": "NmmTnqNlYYedu_xBS5CmU65F9Zs4pEIAAYPunjqOBj4"
+      "sha256": "cbmDvtmjkYFBECO7_NvgIk4949Kn6ICkQrFoqqjpSYc"
     },
     {
       "path": "agent_core/stopwords.txt",
@@ -175,11 +167,7 @@
     },
     {
       "path": "agent_core/sync.py",
-      "sha256": "iZPV2k4C0HEbwgZA2BCFI3n1dMO1aog6zDyzH-hH95o"
-    },
-    {
-      "path": "agent_core/upgrade.py",
-      "sha256": "h6N2TMqMpL-qn1i73k869jq-Uhu-YojcmdtbCsridz8"
+      "sha256": "YTKB4ESEOo5il0pa2u0816BhNXnPPzKOG6YEKOq4ppI"
     },
     {
       "path": "enforcement/check_active_ledger_roundtrip.py",
@@ -199,7 +187,7 @@
     },
     {
       "path": "examples/prepare_private.py",
-      "sha256": "DrGy7MEaKigvBkSR997u_APvoD6GPP9151VHMUkvSdQ"
+      "sha256": "c9rrKRTnH69uiwuvveYP-FaKZJ_9eTucEltWAUla3xc"
     },
     {
       "path": "examples/rules.global.example.md",
@@ -223,7 +211,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "w9GfPzcPLD5exneMk9n_4XHxN42Vi9UVS92Dtzlxhok"
+      "sha256": "mVveTxe8OXmyUOp-yUwfWGXkqHy2tEmqTPVjifNWlbE"
     },
     {
       "path": "runtimes/claude-code/head.md",
@@ -311,5 +299,5 @@
     }
   ],
   "schema": "release-manifest/1",
-  "version": "0.1.0.dev12"
+  "version": "0.2.0"
 }

@@ -8,15 +8,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_no_remote_submodule_or_symlink() -> None:
-    remotes = subprocess.run(
-        ["git", "-c", f"safe.directory={ROOT.resolve().as_posix()}", "-C", str(ROOT), "remote"],
+def test_engine_payload_has_no_submodule_or_symlink() -> None:
+    indexed = subprocess.run(
+        ["git", "-c", f"safe.directory={ROOT.resolve().as_posix()}", "-C", str(ROOT),
+         "ls-files", "--stage", "-z", "--", "."],
         capture_output=True,
         text=True,
         encoding="utf-8",
         check=True,
     )
-    assert remotes.stdout.strip() == ""
+    assert all(
+        entry.split(" ", 1)[0] not in {"160000", "120000"}
+        for entry in indexed.stdout.split("\0") if entry
+    )
     assert not (ROOT / ".gitmodules").exists()
     assert not [path for path in ROOT.rglob("*") if path.is_symlink()]
 
