@@ -256,6 +256,8 @@ def test_reject_revalidates_same_bytes_identity_and_index_before_move(tmp_path: 
     item, source = make_candidate(repo, state, "identity")
     raw = source.read_bytes()
     plan = plan_local_reject(repo, None, item, state_root=state, config_path=config)
+    # Keep the old inode allocated so the recreated file cannot reuse it (ext4 does).
+    os.link(source, tmp_path / "hold")
     source.unlink()
     source.write_bytes(raw)
     with pytest.raises(ConfigError, match="FAIL_INPUT_CHANGED"):
