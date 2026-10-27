@@ -20,11 +20,13 @@ from .repository import RepositoryContext, _is_reparse_alias, resolve_repository
 
 CANDIDATE_SCHEMA = "candidate/1"
 CANDIDATE_V2_SCHEMA = "candidate/2"
+DIRECTORY_CANDIDATE_SCHEMA = "candidate/3"
 CANDIDATE_FIELDS = {
     "schema", "id", "created_utc", "host", "agent", "base_revision",
     "rule", "trigger", "cost", "sink", "scope_hint", "evidence",
 }
 CANDIDATE_V2_FIELDS = {*CANDIDATE_FIELDS, "when"}
+DIRECTORY_CANDIDATE_FIELDS = (CANDIDATE_V2_FIELDS - {"base_revision"}) | {"source_kind"}
 CANDIDATE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-\d{8}T\d{6}Z-[0-9a-f]{32}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -74,7 +76,13 @@ def _git(repo: Path, *args: str, timeout: int = 10) -> subprocess.CompletedProce
             check=False, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
             env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        if args[0] == "fetch":
+            return subprocess.CompletedProcess(
+                exc.cmd, 124, "", f"fetch timed out after {timeout} seconds",
+            )
+        raise ConfigError("FAIL_GIT", f"{args[0]}: {exc}") from exc
+    except OSError as exc:
         raise ConfigError("FAIL_GIT", f"{args[0]}: {exc}") from exc
 
 
@@ -82,15 +90,19 @@ def _required_git(repo: Path, *args: str) -> str:
     result = _git(repo, *args)
     if result.returncode != 0:
         raise ConfigError("FAIL_GIT", _git_failure(args, result))
-    return result.stdout.strip()
+    return result.stdout if args[0] == "status" else result.stdout.strip()
 
 
-def _git_failure(args: tuple[str, ...], result: subprocess.CompletedProcess[str]) -> str:
+def _git_failure(
+    args: tuple[str, ...], result: subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes],
+) -> str:
     command = " ".join(args[:2])
     output = result.stderr.strip() or result.stdout.strip() or "git command failed"
-    first_line = output.splitlines()[0][:240]
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    first_line = output.splitlines()[0]
     safe = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@", r"\1***@", first_line)
-    return f"git {command}: {safe}"
+    return f"git {command}: {safe[:240]}"
 
 
 def _confirmed_offline(result: subprocess.CompletedProcess[str]) -> bool:
@@ -105,7 +117,8 @@ def is_repository(repo: Path) -> bool:
     return _git(repo, "rev-parse", "--git-dir").returncode == 0
 
 
-def parse_candidate_bytes(raw: bytes, candidate_id: str, *, allow_project: bool = False) -> dict[str, str]:
+def parse_candidate_bytes(raw: bytes, candidate_id: str, *, allow_project: bool = False,
+                          allow_directory: bool = False) -> dict[str, str]:
     """Validate candidate bytes against their already trusted logical identity."""
     try:
         payload: Any = json.loads(raw.decode("utf-8"))
@@ -114,7 +127,10 @@ def parse_candidate_bytes(raw: bytes, candidate_id: str, *, allow_project: bool 
     if not isinstance(payload, dict):
         raise ConfigError("FAIL_CANDIDATE", "candidate fields mismatch")
     schema = payload.get("schema")
+    if schema == DIRECTORY_CANDIDATE_SCHEMA and not (allow_directory and allow_project):
+        raise ConfigError("FAIL_CANDIDATE", "directory candidates are capture-only; promotion unsupported")
     expected_fields = {
+        DIRECTORY_CANDIDATE_SCHEMA: DIRECTORY_CANDIDATE_FIELDS,
         CANDIDATE_SCHEMA: CANDIDATE_FIELDS,
         CANDIDATE_V2_SCHEMA: CANDIDATE_V2_FIELDS,
     }.get(schema)
@@ -124,7 +140,7 @@ def parse_candidate_bytes(raw: bytes, candidate_id: str, *, allow_project: bool 
         raise ConfigError("FAIL_CANDIDATE", f"{schema} fields mismatch")
     if not all(isinstance(value, str) and value for value in payload.values()):
         raise ConfigError("FAIL_CANDIDATE", f"all {schema} fields must be non-empty strings")
-    if schema == CANDIDATE_V2_SCHEMA:
+    if schema in {CANDIDATE_V2_SCHEMA, DIRECTORY_CANDIDATE_SCHEMA}:
         try:
             parse_when(payload["when"], source="candidate when")
         except MatchError as exc:
@@ -135,9 +151,13 @@ def parse_candidate_bytes(raw: bytes, candidate_id: str, *, allow_project: bool 
         raise ConfigError("FAIL_CANDIDATE", "candidate filename and id differ")
     if not HOST_LABEL_RE.fullmatch(payload["host"]) or not payload["id"].startswith(payload["host"] + "-"):
         raise ConfigError("FAIL_CANDIDATE", "candidate host and id differ")
-    base = payload["base_revision"].removesuffix(" unverified")
-    if not SHA_RE.fullmatch(base):
-        raise ConfigError("FAIL_CANDIDATE", "base_revision must contain a Git sha")
+    if schema == DIRECTORY_CANDIDATE_SCHEMA:
+        if payload["source_kind"] != "directory" or not payload["scope_hint"].startswith("project:"):
+            raise ConfigError("FAIL_CANDIDATE", "directory candidates require directory source and project scope")
+    else:
+        base = payload["base_revision"].removesuffix(" unverified")
+        if not SHA_RE.fullmatch(base):
+            raise ConfigError("FAIL_CANDIDATE", "base_revision must contain a Git sha")
     project = payload["scope_hint"].removeprefix("project:")
     project_allowed = (
         allow_project
@@ -153,13 +173,14 @@ def parse_candidate_bytes(raw: bytes, candidate_id: str, *, allow_project: bool 
     return payload
 
 
-def load_candidate(path: Path, *, allow_project: bool = False) -> dict[str, str]:
+def load_candidate(path: Path, *, allow_project: bool = False,
+                   allow_directory: bool = False) -> dict[str, str]:
     """Safely load a candidate file, then apply the pure bytes validator."""
     try:
         raw = path.read_bytes()
     except OSError as exc:
         raise ConfigError("FAIL_CANDIDATE", f"cannot read {path}: {exc}") from exc
-    return parse_candidate_bytes(raw, path.stem, allow_project=allow_project)
+    return parse_candidate_bytes(raw, path.stem, allow_project=allow_project, allow_directory=allow_directory)
 
 
 def _candidate_allowed(context: RepositoryContext, state_relative: str | None) -> bool:

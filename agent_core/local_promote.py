@@ -372,7 +372,10 @@ def _assert_local_index_clean(repo: Path, paths: tuple[Path, ...], operation: st
     relative = tuple(path.relative_to(repo).as_posix() for path in paths)
     result = _git(repo, "diff", "--cached", "--quiet", "--", *relative, check=False)
     if result.returncode == 1:
-        raise ConfigError("FAIL_INDEX_CONFLICT", f"{operation} paths")
+        raise ConfigError(
+            "FAIL_INDEX_CONFLICT",
+            f"{operation} paths; NEXT commit the paths staged by the previous apply, then preview again",
+        )
     if result.returncode != 0:
         raise ConfigError("FAIL_INDEX_CONFLICT", f"{operation} index")
 
@@ -922,7 +925,9 @@ def apply_local_promote(workspace: Path, control_root: Path | None, plan: Plan, 
         reviewed = plan_local_promote(workspace, control, plan.candidate_id,
                                       scope_override=(plan.payload["target_scope"] if plan.payload["target_scope"] == "global" else f"{plan.payload['target_scope']}:{plan.payload['target_store']}"),
                                       supersedes=plan.payload.get("supersedes"),
-                                      force_new=plan.payload.get("choice") == "force-new",
+                                      # A supersedes plan records choice=force-new; replan it as the
+                                      # preview did, with supersedes alone.
+                                      force_new=plan.payload.get("choice") == "force-new" and not plan.payload.get("supersedes"),
                                       update=(f"{plan.payload['target_scope']}:{plan.payload['target_store']}:{plan.payload['update']}" if plan.payload.get("choice") == "update" else None),
                                       when=plan.payload.get("effective_when"),
                                       state_root=state_root, config_path=bound_config)

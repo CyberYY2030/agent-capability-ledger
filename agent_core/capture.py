@@ -16,7 +16,7 @@ from . import ledger, privacy
 from .config import ConfigError, default_config_path, load_config
 from .freshness import load_candidate
 from .match import MatchError, parse_when
-from .project import resolve_project_context
+from .project import ProjectContext, check_directory_paths, resolve_capture_project
 from .candidates import _similarities, create_candidate
 from .lock import operation_lock
 
@@ -66,8 +66,8 @@ def _state_root(config: dict, explicit: Path | None) -> Path:
     return Path(value).expanduser().resolve()
 
 
-def _project_identity(workspace: Path) -> tuple[Path, str]:
-    return resolve_project_context(workspace)
+def _project_identity(workspace: Path, *, allow_directory: bool = True) -> ProjectContext:
+    return resolve_capture_project(workspace, allow_directory=allow_directory)
 
 
 def _local_head(root: Path) -> str:
@@ -90,7 +90,7 @@ def _missing(value: str, field: str) -> None:
 
 
 def _validate_rule(rule: str, *, strict: bool) -> str | None:
-    """Reject inline markdown always; require the executable form only for candidate/2.
+    """Reject inline markdown always; require the executable form for candidates with a when predicate.
 
     Inline `**` truncates the rendered rule mid-sentence, so it is rejected on every
     path. The `当 ...，先 ...` form is enforced only when the capture carries a `when`
@@ -153,9 +153,13 @@ def _similarity_lines(root: Path, scope_hint: str, rule: str) -> tuple[str, ...]
 
 def _project_capture_sources(
     config: dict, explicit_state: Path | None, project_root: Path, project_id: str,
+    *, directory_project: bool = False,
 ) -> tuple[tuple[str, str, str], ...]:
     """Resolve project capture stores without turning an offline project into a state operation."""
-    project_only = (("project", project_id, str(project_root / ".agents" / "LESSONS.md")),)
+    project_ledger = project_root / ".agents" / "LESSONS.md"
+    project_only = (("project", project_id, str(project_ledger)),)
+    if directory_project and not project_ledger.is_file():
+        project_only = ()
     try:
         state = _state_root(config, explicit_state)
     except ConfigError as exc:
@@ -188,7 +192,7 @@ def capture(
     workspace: Path, agent: str, rule: str, trigger: str, cost: str,
     sink: str, scope: str, evidence: str, when: str | None = None,
     require_state_freshness: bool = True, base_revision: str | None = None,
-    include_advisories: bool = True,
+    include_advisories: bool = True, allow_directory: bool = True,
 ) -> tuple[Path, tuple[str, ...]]:
     for field, value in (("trigger", trigger), ("cost", cost), ("sink", sink)):
         _missing(value, field)
@@ -199,8 +203,13 @@ def capture(
     project_scope = scope == "auto" or scope.startswith("project:")
     project_root: Path | None = None
     project_id: str | None = None
+    directory_project = False
     if project_scope:
-        project_root, project_id = _project_identity(workspace)
+        context = _project_identity(workspace, allow_directory=allow_directory)
+        project_root, project_id = context.root, context.project_id
+        directory_project = context.directory
+        if directory_project and when is None:
+            raise ConfigError("REJECTED", "when required for directory capture; RETRY --when <canonical-json>")
         expected_scope = f"project:{project_id}"
         if scope not in {"auto", expected_scope}:
             raise ConfigError("REJECTED", f"scope project_identity_mismatch expected={expected_scope}")
@@ -228,8 +237,12 @@ def capture(
         assert project_root is not None and project_id is not None
         forbidden = {str(project_root), str(project_root).replace("\\", "/")}
         _reject_private_values(private_values, (), tuple(forbidden))
-        base_revision = f"{_local_head(project_root)} unverified"
-        sources = _project_capture_sources(config, explicit_state, project_root, project_id)
+        base_revision = None if directory_project else f"{_local_head(project_root)} unverified"
+        if directory_project:
+            check_directory_paths(project_root)
+        sources = _project_capture_sources(
+            config, explicit_state, project_root, project_id, directory_project=directory_project,
+        )
         lines = list(_resolved_similarity_lines(sources, rule))
         path = create_candidate(
             project_root, control_root, host=host, agent=agent, rule=rule,
@@ -237,7 +250,7 @@ def capture(
             evidence=evidence, base_revision=base_revision,
             inbox_path=project_root / ".agents" / "inbox",
             require_state_freshness=False, allow_project=True,
-            when=when,
+            when=when, directory_project=directory_project,
         )
         if rule_warning:
             lines.insert(0, rule_warning)
@@ -454,7 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=default_config_path(ENGINE_ROOT))
     parser.add_argument("--state", type=Path)
     parser.add_argument("--control-root", type=Path, default=Path.home() / ".agent-core")
-    parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    parser.add_argument("--workspace", type=Path, help="project root; required explicitly for directory projects")
     parser.add_argument("--agent", required=True)
     parser.add_argument("--rule", required=True)
     parser.add_argument("--trigger", required=True)
@@ -471,9 +484,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         path, lines = capture(
             config_path=args.config, explicit_state=args.state,
-            control_root=args.control_root, workspace=args.workspace,
+            control_root=args.control_root, workspace=args.workspace or Path.cwd(),
             agent=args.agent, rule=args.rule, trigger=args.trigger, cost=args.cost,
             sink=args.sink, scope=args.scope, evidence=args.evidence, when=args.when,
+            allow_directory=args.workspace is not None,
         )
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)

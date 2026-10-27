@@ -32,16 +32,38 @@ def test_top_level_help_only_lists_v01_product_commands(capsys: pytest.CaptureFi
         assert command not in output
 
 
+@pytest.mark.parametrize("help_flag", ("--help", "-h"))
 def test_lessons_help_discovers_all_public_and_retrieval_commands(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, help_flag: str,
 ) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("overview help must not invoke mutation handlers")
+
+    for module in (cli.capture, cli.project_promote, cli.reject, cli.retire):
+        monkeypatch.setattr(module, "main", forbidden)
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(["lessons", "--help"])
+        cli.main(["lessons", help_flag])
 
     assert exc_info.value.code == 0
-    output = capsys.readouterr().out
-    assert "{match,eval,hook}" in output
-    assert "public commands routed by agent-core: capture, promote, reject, retire" in output
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    # The actual caller retained only five lines and missed the old epilog.
+    first_five = "\n".join(captured.out.splitlines()[:5])
+    assert "{capture,promote,reject,retire,match,eval,hook}" in first_five
+    for command in ("capture", "promote", "reject", "retire", "match", "eval", "hook"):
+        assert any(line.strip().startswith(command + " ") for line in captured.out.splitlines())
+
+
+@pytest.mark.parametrize("command", ("capture", "promote", "reject", "retire", "match", "eval", "hook"))
+def test_lessons_subcommand_help_keeps_its_real_parser(
+    capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["lessons", command, "--help"])
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith(f"usage: agent-core lessons {command} ")
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("argv", (["install", "--help"], ["sync", "--help"], ["doctor", "--help"]))
@@ -164,3 +186,32 @@ def test_wrapper_version_from_temporary_cwd(tmp_path: Path) -> None:
     result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == __version__
+
+
+@pytest.mark.parametrize("help_flag", ("--help", "-h"))
+def test_launcher_preserves_lessons_overview_help(help_flag: str, tmp_path: Path) -> None:
+    argv = ["lessons", help_flag]
+    assert launcher._inject_state(argv, tmp_path / "state") == argv
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX wrapper; not Windows execution evidence")
+@pytest.mark.parametrize("help_flag", ("--help", "-h"))
+def test_lessons_wrapper_help_with_ascii_initial_stdout(help_flag: str, tmp_path: Path) -> None:
+    env = {**os.environ, "AGENT_CORE_PYTHON": os.sys.executable,
+           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "ascii",
+           "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
+    # Verify that the child actually starts with the strict output encoding.
+    probe = subprocess.run(
+        [os.sys.executable, "-c", "import sys; print(sys.stdout.encoding)"],
+        cwd=tmp_path, env=env, capture_output=True, timeout=20,
+    )
+    assert probe.returncode == 0 and probe.stdout.strip() == b"ascii"
+    result = subprocess.run(
+        ["sh", str(ROOT / "agent-core"), "lessons", help_flag],
+        cwd=tmp_path, env=env, capture_output=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    output = result.stdout.decode("utf-8")
+    assert "{capture,promote,reject,retire,match,eval,hook}" in "\n".join(output.splitlines()[:5])
+    assert "保存待审核的经验候选" in output
+    assert result.stderr == b""

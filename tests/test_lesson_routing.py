@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from agent_core import ledger
 
 
@@ -110,6 +112,19 @@ class TestLessonRouting:
     def test_no_config_loads_only_global(self) -> None:
         sources, errors, _warns = ledger.resolve_sources(str(self.global_path), str(self.workspace))
         assert errors == [] and [item[0] for item in sources] == ["global"]
+
+    def test_missing_workspace_loads_only_global_with_warning(self) -> None:
+        missing = self.root / "removed-worktree"
+        sources, errors, warns = ledger.resolve_sources(str(self.global_path), str(missing))
+        assert errors == [] and [item[0] for item in sources] == ["global"]
+        assert warns == [f"workspace 无 git root:{missing};只加载 global"]
+
+    def test_git_probe_failure_in_existing_workspace_still_rejects(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fail(*_args: object, **_kwargs: object) -> None:
+            raise OSError("missing git")
+        monkeypatch.setattr(ledger.subprocess, "run", fail)
+        _sources, errors, _warns = ledger.resolve_sources(str(self.global_path), str(self.workspace))
+        assert errors == ["REJECTED scope project_identity_unavailable git_probe_failed"]
 
     def test_declared_profile_and_project_load_in_order(self) -> None:
         self.config(["example-domain"])

@@ -73,6 +73,12 @@ def test_privacy_workflow_and_public_export_boundary() -> None:
     assert "这个公开仓库只有程序本身：它是作者私有仓库里 `engine/` 目录的导出，不含私有状态、本机配置、凭据、会话、缓存或本机路径，运行时也不依赖它。" in readme
 
 
+def test_privacy_workflow_tests_supported_python_versions() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "privacy.yml").read_text(encoding="utf-8")
+    assert re.search(r'python-version:\s*\["3\.11",\s*"3\.12"\]', workflow)
+    assert 'python-version: ${{ matrix.python-version }}' in workflow
+
+
 @pytest.mark.parametrize(("pattern", "positive", "negative"), (
     (CHINESE_SUPPORT_PATTERNS[0], "Windows 已验证。", "Windows 上的完整流程还没有实测。"),
     (CHINESE_SUPPORT_PATTERNS[1], "兼容 macOS。", "下面的命令适用于 macOS 和 Linux。"),

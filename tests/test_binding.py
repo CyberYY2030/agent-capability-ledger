@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from agent_core import state as state_module
 from agent_core.config import ConfigError
 from agent_core.freshness import require_fresh
@@ -44,6 +46,32 @@ def host_config(root: Path) -> Path:
     path = root / "host.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+@pytest.mark.parametrize("wrapper", ("text", "bytes"))
+@pytest.mark.parametrize("token_repeats", (1, 40))
+def test_binding_exit_includes_bounded_redacted_stderr(
+    tmp_path: Path, wrapper: str, token_repeats: int,
+) -> None:
+    credential_url = "https://user:" + "fake-token-" * token_repeats + "@example.invalid/repo.git"
+    stderr = f"fatal: unable to access '{credential_url}': " + "x" * 300 + "\nsecond-line-private"
+    if wrapper == "text":
+        result = subprocess.CompletedProcess(["git", "ls-remote"], 128, "", stderr)
+        patch = mock.patch.object(state_module, "_git", return_value=result)
+        invoke = state_module._binding_git
+    else:
+        result = subprocess.CompletedProcess(["git", "ls-remote"], 128, b"", stderr.encode())
+        patch = mock.patch.object(subprocess, "run", return_value=result)
+        invoke = state_module._binding_git_bytes
+    with patch, pytest.raises(ConfigError) as raised:
+        invoke(tmp_path, "ls-remote", "origin")
+    message = str(raised.value)
+    assert raised.value.code == "FAIL_STATE_BINDING"
+    assert "op=ls-remote stage=exit rc=128" in message
+    assert "fatal: unable to access 'https://***@example.invalid/repo.git'" in message
+    assert "fake-token" not in message and "user:" not in message
+    assert "second-line-private" not in message
+    assert len(message.split("git ls-remote: ", 1)[1]) <= 240
 
 
 class BindingTests(unittest.TestCase):
@@ -469,7 +497,8 @@ class BindingTests(unittest.TestCase):
                 self.assertNotIn(secret, message)
                 self.assertNotIn(str(repo), message)
 
-        text_exit = subprocess.CompletedProcess(["git", secret], 128, "", secret)
+        exit_stderr = secret.replace("://", "://user:fake-token@")
+        text_exit = subprocess.CompletedProcess(["git", secret], 128, "", exit_stderr)
         with mock.patch.object(state_module, "_git", return_value=text_exit):
             with self.assertRaises(ConfigError) as raised:
                 state_module._binding_git(repo, "status", secret)
@@ -490,7 +519,7 @@ class BindingTests(unittest.TestCase):
                 self.assertNotIn(secret, message)
                 self.assertNotIn(str(repo), message)
 
-        byte_exit = subprocess.CompletedProcess(["git", secret], 7, b"", secret.encode())
+        byte_exit = subprocess.CompletedProcess(["git", secret], 7, b"", exit_stderr.encode())
         with mock.patch.object(subprocess, "run", return_value=byte_exit):
             with self.assertRaises(ConfigError) as raised:
                 state_module._binding_git_bytes(repo, "rev-parse", secret)

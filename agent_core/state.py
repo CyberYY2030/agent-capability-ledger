@@ -18,6 +18,7 @@ from . import __version__, ledger
 from .config import ConfigError, load_config, load_manifest
 from .freshness import (
     SHA_RE,
+    _git_failure,
     inspect as inspect_freshness,
     is_repository,
     migrate_legacy_remote_state,
@@ -222,7 +223,8 @@ def _binding_git(repo: Path, *args: str) -> str:
         _binding_fail(f"git identity check failed op={verb} stage={stage}", exc)
     if result.returncode != 0:
         _binding_fail(
-            f"git identity check failed op={verb} stage=exit rc={result.returncode}",
+            f"git identity check failed op={verb} stage=exit rc={result.returncode}; "
+            f"{_git_failure((verb,), result)}",
         )
     return result.stdout
 
@@ -244,7 +246,8 @@ def _binding_git_bytes(repo: Path, *args: str) -> bytes:
         _binding_fail(f"git identity check failed op={verb} stage=spawn", exc)
     if result.returncode != 0:
         _binding_fail(
-            f"git identity check failed op={verb} stage=exit rc={result.returncode}",
+            f"git identity check failed op={verb} stage=exit rc={result.returncode}; "
+            f"{_git_failure((verb,), result)}",
         )
     return result.stdout
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -260,6 +261,24 @@ def test_project_promote_cli_requires_and_applies_exact_plan_hash(
     assert "PASS project_promoted=SAMPLE-2" in output
 
 
+def test_project_promote_requires_commit_before_next_preview(tmp_path: Path) -> None:
+    repo, control = setup_project(tmp_path)
+    first = project_candidate(repo, control, "first", when='{"text":["first"]}')
+    second = project_candidate(repo, control, "second", when='{"text":["second"]}')
+    plan = plan_local_promote(repo, control, first, force_new=True)
+    apply_local_promote(repo, control, plan, plan.plan_hash)
+    before = git(repo, "diff", "--cached", "--binary").stdout
+
+    with pytest.raises(ConfigError) as raised:
+        plan_local_promote(repo, control, second, force_new=True)
+    assert raised.value.code == "FAIL_INDEX_CONFLICT"
+    assert "commit the paths staged by the previous apply, then preview again" in raised.value.detail
+    assert git(repo, "diff", "--cached", "--binary").stdout == before
+
+    git(repo, "commit", "-q", "-m", "commit first promotion")
+    assert plan_local_promote(repo, control, second, force_new=True).candidate_id == second
+
+
 def test_project_promote_cli_reports_concrete_state_cross_scope_advisory(
         tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     repo, control = setup_project(tmp_path)
@@ -419,6 +438,37 @@ def test_local_promote_supersedes_preview_shows_archive_move(tmp_path: Path) -> 
     assert any("- **L-1 " in line for line in removed)
     assert any("- **L-1 " in line and "superseded_by: L-2." in line for line in added)
     assert any(f"from: {item}. supersedes: L-1." in line for line in added)
+
+
+def test_local_promote_supersedes_cli_apply_consumes_previewed_plan_hash(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo, config, control = setup_unified_local(tmp_path)
+    item = local_state_candidate(repo, control, "apply-supersedes", rule="Replacement with archive")
+    source_relative = f"inbox/{item}.md"
+    git(repo, "add", source_relative)
+    git(repo, "commit", "-q", "-m", "track local candidate")
+    args = ["--workspace", str(repo), "--config", str(config), "--id", item,
+            "--scope", "global", "--supersedes", "L-1"]
+    assert project_promote_main(args) == 0
+    preview = capsys.readouterr().out.splitlines()
+    plan_hash = next(line.split()[1] for line in preview if line.startswith("PLAN_HASH "))
+    expected_postimage = next(line.split()[1] for line in preview if line.startswith("EXPECTED_POSTIMAGE_SHA256 "))
+    assert project_promote_main(args + ["--apply", "--plan-hash", plan_hash]) == 0
+    applied = capsys.readouterr()
+    assert "FAIL_" not in applied.err and "PASS project_promoted=L-2" in applied.out
+    ledger_path = repo / "experience" / "LESSONS.md"
+    assert hashlib.sha256(ledger_path.read_bytes()).hexdigest() == expected_postimage
+    active, archived = ledger_path.read_text(encoding="utf-8").split("\n## 归档\n")
+    assert "- **L-1 " not in active
+    assert "- **L-2 [pending·通用] Replacement with archive.** " in active
+    assert f"from: {item}. supersedes: L-1." in active
+    assert "- **L-1 " in archived and "superseded_by: L-2." in archived
+    consumed_relative = f"inbox/consumed/{item}.md"
+    assert not (repo / source_relative).exists() and (repo / consumed_relative).is_file()
+    assert {line.split()[1] for line in applied.out.splitlines() if line.startswith("STAGED ")} == {
+        "experience/LESSONS.md", consumed_relative, source_relative}
+    assert set(git(repo, "diff", "--cached", "--name-only", "--no-renames").stdout.split()) == {
+        "experience/LESSONS.md", consumed_relative, source_relative}
 
 
 def test_local_promote_payload_key_set_is_frozen(tmp_path: Path) -> None:

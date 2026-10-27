@@ -1,29 +1,51 @@
-"""Shared project routing identity resolution."""
+"""Project identity adapters for candidate capture and Git-only mutations."""
 
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import ledger
 from .config import ConfigError
 
 
-def resolve_project_context(workspace: Path) -> tuple[Path, str]:
-    root_text = ledger.find_git_root(str(workspace))
-    if not root_text:
-        raise ConfigError("REJECTED", "scope project_identity_unavailable no_git_root")
-    root = Path(root_text).resolve()
-    config_path = root / ".agents" / "lessons.json"
+@dataclass(frozen=True)
+class ProjectContext:
+    root: Path
+    project_id: str
+    directory: bool
+
+
+def check_directory_paths(root: Path) -> None:
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ConfigError(
-            "REJECTED", f"scope project_identity_unavailable lessons_config:{exc}"
-        ) from exc
-    if payload.get("schema") != ledger.ROUTING_SCHEMA:
-        raise ConfigError("REJECTED", "scope project_identity_unavailable invalid_schema")
-    project_id = payload.get("project_id")
-    if not isinstance(project_id, str) or not ledger.PROFILE_RE.fullmatch(project_id):
-        raise ConfigError("REJECTED", "scope project_identity_unavailable invalid_project_id")
-    return root, project_id
+        ledger.check_directory_paths(root)
+    except ledger.ProjectRoutingError as exc:
+        raise ConfigError("REJECTED", str(exc)) from exc
+
+
+def resolve_capture_project(workspace: Path, *, allow_directory: bool = True) -> ProjectContext:
+    try:
+        root, directory = ledger.project_location(workspace)
+        if directory and not (root / ".agents" / "lessons.json").exists():
+            raise ledger.ProjectRoutingError("scope project_identity_unavailable no_git_root")
+        payload = ledger.read_routing(root, strict=directory)
+        if directory:
+            ledger.validate_directory_routing(payload)
+            if not allow_directory:
+                raise ledger.ProjectRoutingError("scope directory_capture_requires_explicit_workspace")
+        elif payload.get("schema") != ledger.ROUTING_SCHEMA:
+            raise ledger.ProjectRoutingError("scope project_identity_unavailable invalid_schema")
+        project_id = payload.get("project_id")
+        if not isinstance(project_id, str) or not ledger.PROFILE_RE.fullmatch(project_id):
+            raise ledger.ProjectRoutingError("scope project_identity_unavailable invalid_project_id")
+    except ledger.ProjectRoutingError as exc:
+        raise ConfigError("REJECTED", str(exc)) from exc
+    return ProjectContext(root, project_id, directory)
+
+
+def resolve_project_context(workspace: Path) -> tuple[Path, str]:
+    """The existing mutation consumers remain Git-only."""
+    context = resolve_capture_project(workspace)
+    if context.directory:
+        raise ConfigError("REJECTED", "scope directory_candidates_capture_only; promotion unsupported")
+    return context.root, context.project_id

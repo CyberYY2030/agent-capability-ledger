@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "UvfFQokKkQRb9fL5GeZzSRjVnisFFdp9mwatHCBDgM0",
+  "artifact_sha256": "hloeF0UjypSyXSUSU3BA9DpNoQ-BSLylCszWZ91JC4U",
   "files": [
     {
       "path": "LICENSE",
@@ -11,19 +11,19 @@
     },
     {
       "path": "agent_core/__init__.py",
-      "sha256": "0hDsjczMfPVV1V_EGGeApv4PerzqUnpw0gNfwW0Ek3Q"
+      "sha256": "eTdct995vBQmSoBsvBzCXJ6STzdUDMaWA6yuExeYPBQ"
     },
     {
       "path": "agent_core/candidates.py",
-      "sha256": "P97vR9p2vea7qKzpcaWbOvTLoIlw4DEKyr65Qma1pRc"
+      "sha256": "5HFbiW40VrxdBtyilbjQtuYXkPQ1VsApD8D7qL5KFBw"
     },
     {
       "path": "agent_core/capture.py",
-      "sha256": "ZPDjLrAFo_UFbcBxepM47CkK2SrWzDqpzBU1hketo8o"
+      "sha256": "hweH5sMhf3sNcU1U_Bel8BE_6e1uETrQKHCrsypo6ZY"
     },
     {
       "path": "agent_core/cli.py",
-      "sha256": "ihUM0YswyDZNx3r0whQC_aSbYQ_-ooYZcDenEwJIR4M"
+      "sha256": "NsJvWHNdHmmW6ljCMR6jw6KAUnF33dz1psj1ADNVA40"
     },
     {
       "path": "agent_core/config.py",
@@ -35,7 +35,7 @@
     },
     {
       "path": "agent_core/freshness.py",
-      "sha256": "GEBzFYBWl1kHO3UYVx6MNwGQJIy29gNudLlByfLYFBc"
+      "sha256": "EYzxPdD0M15jg5fv-8ITy3vl_yo3pzfMmUvbN5zCQxQ"
     },
     {
       "path": "agent_core/installer.py",
@@ -47,11 +47,11 @@
     },
     {
       "path": "agent_core/ledger.py",
-      "sha256": "bTp92mrXScZNHQ_SgDPdDiHd0qcpq77DQu29BGLivow"
+      "sha256": "mslNxZXqRudpnAtF1QyWbWsZ4nSzuQMMiIErYrTWsVA"
     },
     {
       "path": "agent_core/local_promote.py",
-      "sha256": "NZBd8rGrDw0sksP2EBL70YPuy-OOND23VHzPjW_jzaE"
+      "sha256": "dUC7J9pqUyZtCJxDkKMmqWFgkcWtW9UfcP8WLVnG9G0"
     },
     {
       "path": "agent_core/lock.py",
@@ -71,7 +71,7 @@
     },
     {
       "path": "agent_core/project.py",
-      "sha256": "SNTAHb8dYSNlkqJXDgnDsVmu711FViiErYc1PcH3Qh8"
+      "sha256": "w_Q-7hnOapV5nvY6NeR112HVeau2Fey1ER_sWJ6Hb5I"
     },
     {
       "path": "agent_core/project_promote.py",
@@ -159,7 +159,7 @@
     },
     {
       "path": "agent_core/state.py",
-      "sha256": "cbmDvtmjkYFBECO7_NvgIk4949Kn6ICkQrFoqqjpSYc"
+      "sha256": "pxe9iF9zd4O1Q4jLaMvDixChgyS_yLsRYoAxfHNvNyA"
     },
     {
       "path": "agent_core/stopwords.txt",
@@ -211,7 +211,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "0bGzjb-6YD-2wqB4n5bIAY0soryocdhxKUW-y-wpL1o"
+      "sha256": "-bXcYogHOdxkNvl75YGtRkmsZmuAyX5lKR9ybbMTleU"
     },
     {
       "path": "runtimes/claude-code/head.md",
@@ -299,5 +299,5 @@
     }
   ],
   "schema": "release-manifest/1",
-  "version": "0.2.1"
+  "version": "0.2.4"
 }

@@ -118,6 +118,43 @@ def test_remote_rewind_and_offline_fail_closed(tmp_path: Path) -> None:
         check_remote_parity(clone, control)
 
 
+def test_dirty_first_unstaged_record_keeps_complete_path(tmp_path: Path) -> None:
+    _remote, _seed, clone = repository(tmp_path)
+    git(clone, "mv", "experience/LESSONS.md", "README.md")
+    git(clone, "commit", "-q", "-m", "track readme")
+    (clone / "README.md").write_text("dirty\n", encoding="utf-8")
+    assert git(clone, "status", "--porcelain=v1", "-z").stdout == " M README.md\0"
+
+    with pytest.raises(ConfigError) as captured:
+        require_fresh(clone, "capture", tmp_path / "control", fetch=False)
+    assert captured.value.code == "FAIL_DIRTY"
+    assert captured.value.detail == "README.md"
+
+
+@pytest.mark.parametrize(("operation", "code"), (
+    ("doctor", "FAIL_REMOTE_FETCH"), ("promote", "REMOTE_REQUIRED"),
+))
+def test_fetch_timeout_uses_remote_failure_without_confirming_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, code: str,
+) -> None:
+    _remote, _seed, clone = repository(tmp_path)
+    run = subprocess.run
+
+    def timeout_fetch(command, *args, **kwargs):
+        if "fetch" in command:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", timeout_fetch)
+    control = tmp_path / "control"
+    with pytest.raises(ConfigError, match=rf"{code}.*fetch.*timed out"):
+        require_fresh(clone, operation, control)
+    state = freshness_module.inspect(clone, control)
+    assert state.remote_issue == "fetch-failed"
+    assert state.offline is False
+    assert require_fresh(clone, "capture", control).offline is False
+
+
 def test_doctor_remote_failures_keep_distinct_actionable_causes(tmp_path: Path) -> None:
     control = tmp_path / "control"
 

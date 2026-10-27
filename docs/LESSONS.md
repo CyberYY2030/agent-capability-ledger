@@ -39,12 +39,30 @@
 
 选择最小适用范围：
 
-- `--scope auto`：默认写入当前项目的 inbox；`--workspace` 必须是已声明项目身份的 Git 项目。
+- `--scope auto`：默认写入当前项目的 inbox；Git 项目沿用 `.agents/lessons.json` 的 `lessons-routing/1` 声明和有效 HEAD；非 Git 项目须使用下述显式目录声明。
 - `--scope project:<current-project-id>`：显式选择当前项目，ID 必须与 `.agents/lessons.json` 中的声明一致。
 - `--scope profile:<declared-profile>`：选择当前 workspace 声明的领域。
 - `--scope global`：写入绑定的私有状态 inbox；host 配置无法给出有效路径时，用 `--state` 指定私有仓库的 `state` 目录。
 
 `--when` 的格式见上面的字段说明。带 `--when` 时，程序会强制检查上述规则句式。
+
+## 非 Git 项目：仅捕获候选
+
+必须显式传入 `--workspace <项目根目录>`，并在该目录的 `.agents/lessons.json` 声明：
+
+```json
+{"schema":"lessons-routing/2","workspace_kind":"directory","project_id":"example-project","profiles":[]}
+```
+
+目录声明只适用于 Git 仓库之外的项目；不向父目录寻找目录身份，不借用父 Git 项目的身份。声明、`.agents`、inbox 和已有项目台账必须是本项目内的普通路径，不接受符号链接或目录联接。未声明、身份冲突、Git 探测失败或路径不安全时拒绝，不改投其他 scope。
+
+Git 子目录按普通 JSON 解析当前目录的配置，以最后一个同名键为准。只有有效对象明确包含 `workspace_kind: "directory"`，或 `schema` 是 `lessons-routing/` 开头且不等于 `lessons-routing/1`，才视为与 Git 归属冲突的声明并拒绝。无法读取或解析、非对象、无关配置及旧 `/1` 子目录配置继续沿用 Git 根身份，不把它们作为子项目身份校验。Git 根配置继续走原有 schema 校验，并保留普通 JSON 的重复键处理；非 Git 声明仍严格拒绝重复键。
+
+此路径必须提供合法的 `--when`，只向本项目 `.agents/inbox` 写入 `candidate/3`。新格式保留 `candidate/2` 的其他字段，以 `source_kind: "directory"` 替代 `base_revision`，明确没有 Git 修订证据；不生成假 SHA。非 Git 首次捕获不要求已有 `.agents/LESSONS.md`；Git 项目保留原有台账读取要求。声明的 profile 只参与来源读取，不改变候选的项目归属。
+
+`candidate/3` 仅供候选检查，不能晋升；复制到 Git 项目或覆盖目标 scope 也不会使它可晋升。Git 的 `candidate/1`、`candidate/2` 仍强制校验 Git SHA。
+
+显式 CLI 捕获使用新 UUID 和独占创建，保护已有候选，但不保证按内容去重。提交前检查本项目 inbox；结果不明时先核对返回路径和已有候选，不盲目重试。自动捕获路径不在此目录模式的支持范围内。
 
 ## 入库
 
@@ -74,6 +92,8 @@
 入库默认沿用候选范围。可以用 `--scope global`、`--scope profile:<declared-profile>` 或 `--scope project:<current-project-id>` 覆盖，但候选与目标台账必须属于同一个 Git 仓库。跨仓库覆盖会零写入拒绝；请在目标仓库的 inbox 重新采集。
 
 计划哈希绑定候选字节、目标范围和路径、台账原内容、动作与结果 ID。执行时加锁复核，只写目标台账、归档候选并暂存相关路径；不会自动提交、推送或 sync。若台账已写入而后续步骤中断，重新预览并按新计划执行即可收敛。
+
+每次 apply 后，先提交这次暂存的路径，再预览下一条候选的入库计划。上一条 apply 的暂存改动会阻塞下一条入库，并报 `FAIL_INDEX_CONFLICT`。
 
 Claude Code 的 Stop 自动采集是漏掉显式采集时的后备。它当前生成通用范围、没有 `when` 的候选。审核时，在预览和执行两条入库命令里加上同一个 `--when`，例如 `--when '{"paths":["**/*.sh"]}'`。自动采集不授权入库。
 

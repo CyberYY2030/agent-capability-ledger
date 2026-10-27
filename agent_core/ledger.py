@@ -9,6 +9,7 @@ import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -242,6 +243,106 @@ def find_git_root(workspace):
     return os.path.abspath(result.stdout.strip()) if result.returncode == 0 else None
 
 
+DIRECTORY_ROUTING_SCHEMA = "lessons-routing/2"
+DIRECTORY_FIELDS = {"schema", "workspace_kind", "project_id", "profiles"}
+
+
+class ProjectRoutingError(ValueError):
+    """Shared routing refusal, also usable by the standalone checker."""
+
+
+def _routing_alias(path: Path) -> bool:
+    junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or (callable(junction) and junction())
+
+
+def check_directory_paths(root: Path) -> None:
+    """Refuse aliases at the explicit root and every directory-owned endpoint."""
+    paths = (root, root / ".agents", root / ".agents" / "lessons.json",
+             root / ".agents" / "inbox", root / ".agents" / "LESSONS.md")
+    for path in paths:
+        if _routing_alias(path) or not path.resolve().is_relative_to(root.resolve()):
+            raise ProjectRoutingError("scope directory_path_alias")
+        if path.exists():
+            directory = path in (root, root / ".agents", root / ".agents" / "inbox")
+            if (directory and not path.is_dir()) or (not directory and not path.is_file()):
+                raise ProjectRoutingError("scope directory_path_type")
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate routing key")
+        result[key] = value
+    return result
+
+
+def read_routing(root: Path, *, strict: bool = True) -> dict:
+    try:
+        payload = json.loads((root / ".agents" / "lessons.json").read_text(encoding="utf-8"),
+                             object_pairs_hook=_unique_object if strict else None)
+        if not isinstance(payload, dict):
+            raise ValueError("routing must be an object")
+        return payload
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ProjectRoutingError("scope project_identity_unavailable lessons_config") from exc
+
+
+def project_location(workspace: Path) -> tuple[Path, bool]:
+    """Directory roots are explicit; Git discovery failures never enable directory mode."""
+    requested = workspace.absolute()
+    environment = os.environ.copy()
+    if any(environment.get(key) for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")):
+        raise ProjectRoutingError("scope project_identity_unavailable git_environment")
+    environment["LC_ALL"] = "C"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={requested.as_posix()}", "-C", str(requested),
+             "rev-parse", "--show-toplevel"],
+            check=False, capture_output=True, text=True, encoding="utf-8", timeout=10,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProjectRoutingError("scope project_identity_unavailable git_probe_failed") from exc
+    if result.returncode == 0 and result.stdout.strip():
+        root = Path(result.stdout.strip()).resolve()
+        local_config = requested / ".agents" / "lessons.json"
+        if requested.resolve() != root and local_config.is_file():
+            # A child config is only a declaration probe, not a new Git identity.
+            # Preserve legacy JSON parsing and ignore unreadable/unrelated configs.
+            try:
+                local = read_routing(requested, strict=False)
+            except ProjectRoutingError:
+                local = {}
+            schema = local.get("schema")
+            if (local.get("workspace_kind") == "directory"
+                    or (isinstance(schema, str) and schema.startswith("lessons-routing/")
+                        and schema != ROUTING_SCHEMA)):
+                raise ProjectRoutingError("scope directory_inside_git")
+        return root, False
+    if (result.returncode != 128 or "not a git repository" not in result.stderr.lower()
+            or any(os.path.lexists(parent / ".git") for parent in (requested, *requested.parents))):
+        raise ProjectRoutingError("scope project_identity_unavailable git_probe_failed")
+    check_directory_paths(requested)
+    return requested.resolve(), True
+
+
+def validate_directory_routing(payload: dict) -> None:
+    if (set(payload) != DIRECTORY_FIELDS or payload.get("schema") != DIRECTORY_ROUTING_SCHEMA
+            or payload.get("workspace_kind") != "directory"):
+        raise ProjectRoutingError("scope project_identity_unavailable invalid_directory_schema")
+    project_id = payload.get("project_id")
+    if not isinstance(project_id, str) or not PROFILE_RE.fullmatch(project_id):
+        raise ProjectRoutingError("scope project_identity_unavailable invalid_project_id")
+    profiles = payload.get("profiles")
+    if (not isinstance(profiles, list)
+            or any(not isinstance(item, str) or not PROFILE_RE.fullmatch(item) for item in profiles)
+            or len(profiles) != len(set(profiles))):
+        raise ProjectRoutingError("scope project_identity_unavailable invalid_profiles")
+
+
 def _profile_root(global_ledger):
     parent = os.path.dirname(os.path.abspath(global_ledger))
     if os.path.basename(parent) == 'experience':
@@ -264,21 +365,28 @@ def resolve_sources(global_ledger, workspace=None, all_profiles=False):
         return sources, errors, warns
     if not workspace:
         return sources, errors, warns
-    root = find_git_root(workspace)
-    if not root:
+    if not os.path.isdir(workspace):
+        # A missing workspace (e.g. a removed worktree) keeps the legacy
+        # global-only retrieval; it cannot name a Git or directory project.
         warns.append(f'workspace 无 git root:{workspace};只加载 global')
         return sources, errors, warns
-    config_path = os.path.join(root, '.agents', 'lessons.json')
-    if not os.path.isfile(config_path):
-        return sources, errors, warns
     try:
-        config = json.loads(read_text(config_path))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        errors.append(f'无法解析 {config_path}:{exc}')
+        location, directory = project_location(Path(workspace))
+        root = str(location)
+        config_path = os.path.join(root, '.agents', 'lessons.json')
+        if not os.path.isfile(config_path):
+            if directory:
+                warns.append(f'workspace 无 git root:{workspace};只加载 global')
+            return sources, errors, warns
+        config = read_routing(location, strict=directory)
+        if directory:
+            validate_directory_routing(config)
+    except ProjectRoutingError as exc:
+        errors.append(f'REJECTED {exc}')
         return sources, errors, warns
     project_id = config.get('project_id')
     profiles = config.get('profiles')
-    if config.get('schema') != ROUTING_SCHEMA:
+    if not directory and config.get('schema') != ROUTING_SCHEMA:
         errors.append(f'{config_path}:schema 必须是 {ROUTING_SCHEMA}')
     if not isinstance(project_id, str) or not PROFILE_RE.fullmatch(project_id):
         errors.append(f'{config_path}:project_id 必须是稳定 kebab-case 字符串')

@@ -46,8 +46,27 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _lessons_help_parser() -> argparse.ArgumentParser:
+    """Describe the complete public surface, including commands routed above match."""
+    parser = argparse.ArgumentParser(prog="agent-core lessons")
+    commands = parser.add_subparsers(dest="lessons_command")
+    for name, description in (
+        ("capture", "保存待审核的经验候选"),
+        ("promote", "预览或应用已审核候选的晋升"),
+        ("reject", "拒绝候选"),
+        ("retire", "退役正式经验"),
+        ("match", "检索匹配的正式经验"),
+        ("eval", "评估检索夹具"),
+        ("hook", "运行宿主检索钩子"),
+    ):
+        commands.add_parser(name, help=description)
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv in (["lessons", "--help"], ["lessons", "-h"]):
+        _lessons_help_parser().parse_args(argv[1:])
     if argv[:2] == ["lessons", "retire"]:
         return retire.main(argv[2:])
     if argv[:2] == ["lessons", "capture"]:
